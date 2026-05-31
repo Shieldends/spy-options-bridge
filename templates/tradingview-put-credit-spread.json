@@ -1,0 +1,10 @@
+{
+  "ticker": "SPY",
+  "strategy": "put_credit_spread",
+  "signalPrice": "{{close}}",
+  "quantity": 1,
+  "strikeOffsetShort": -2,
+  "strikeOffsetLong": -3,
+  "limitCredit": 0.50,
+  "expiration": "0dte"
+}

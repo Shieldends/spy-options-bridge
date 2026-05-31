@@ -1,0 +1,14 @@
+{
+  "ticker": "SPY",
+  "action": "exit",
+  "orderType": "market",
+  "quantity": 1,
+  "signalPrice": "{{close}}",
+  "optionContract": {
+    "underlying": "SPY",
+    "expiration": "0dte",
+    "strategy": "put_credit_spread",
+    "strikeOffsetShort": -2,
+    "strikeOffsetLong": -3
+  }
+}

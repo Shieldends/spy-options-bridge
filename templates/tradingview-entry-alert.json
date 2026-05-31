@@ -1,0 +1,11 @@
+{
+  "webhookSecret": "change-me-to-a-long-random-string",
+  "ticker": "SPY",
+  "action": "PUT_CREDIT_SPREAD",
+  "signalPrice": "{{close}}",
+  "dteFilter": "0dte",
+  "strikeOffsetShort": -2,
+  "strikeOffsetLong": -3,
+  "quantity": 1,
+  "limitCredit": 0.50
+}
