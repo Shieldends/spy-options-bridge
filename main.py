@@ -1,5 +1,5 @@
 """
-spy-options-bridge v5.2.0 — ALPACA PAPER (default broker)
+spy-options-bridge v5.3.0 — ALPACA PAPER (default broker)
 
 TradingView webhook → Render → Alpaca multi-leg SPY put credit spreads.
 
@@ -26,7 +26,9 @@ Endpoints:
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from datetime import datetime, timedelta
 from enum import Enum
 from functools import lru_cache
@@ -35,7 +37,7 @@ from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -70,12 +72,14 @@ class Settings(BaseSettings):
     tastytrade_sandbox_username: str = Field(default="", alias="TASTYTRADE_SANDBOX_USERNAME")
     tastytrade_sandbox_password: str = Field(default="", alias="TASTYTRADE_SANDBOX_PASSWORD")
 
-    auto_take_profit: bool = Field(default=False, alias="AUTO_TAKE_PROFIT")
+    auto_take_profit: bool = Field(default=True, alias="AUTO_TAKE_PROFIT")
     take_profit_pct: float = Field(default=0.50, alias="TAKE_PROFIT_PCT")
-    auto_stop_loss: bool = Field(default=False, alias="AUTO_STOP_LOSS")
+    auto_stop_loss: bool = Field(default=True, alias="AUTO_STOP_LOSS")
     stop_loss_multiplier: float = Field(default=2.0, alias="STOP_LOSS_MULTIPLIER")
     danger_zone_pct: float = Field(default=0.01, alias="DANGER_ZONE_PCT")
     default_dte_filter: str = Field(default="weekly", alias="DEFAULT_DTE_FILTER")
+    alpaca_exit_fill_timeout: int = Field(default=600, alias="ALPACA_EXIT_FILL_TIMEOUT")
+    alpaca_exit_poll_seconds: float = Field(default=3.0, alias="ALPACA_EXIT_POLL_SECONDS")
 
     discord_webhook_url: str = Field(default="", alias="DISCORD_WEBHOOK_URL")
     telegram_bot_token: str = Field(default="", alias="TELEGRAM_BOT_TOKEN")
@@ -765,6 +769,130 @@ async def submit_order(settings: Settings, payload: dict, *, dry_run: bool) -> O
     return await submit_tastytrade_order(settings, payload, dry_run=dry_run)
 
 
+def _alpaca_headers(settings: Settings) -> dict[str, str]:
+    return {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "Apca-Api-Key-Id": settings.alpaca_key,
+        "Apca-Api-Secret-Key": settings.alpaca_secret,
+    }
+
+
+async def fetch_alpaca_order(settings: Settings, order_id: str) -> dict[str, Any]:
+    base = settings.apca_api_base_url.rstrip("/")
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.get(f"{base}/v2/orders/{order_id}", headers=_alpaca_headers(settings))
+    if not r.is_success:
+        logger.warning("Alpaca order lookup %s failed (%s): %s", order_id, r.status_code, r.text[:200])
+        return {}
+    try:
+        return r.json()
+    except Exception:
+        return {"raw": r.text}
+
+
+async def wait_for_alpaca_entry_fill(
+    settings: Settings,
+    order_id: str,
+    *,
+    max_wait_sec: int,
+    poll_sec: float,
+) -> dict[str, Any] | None:
+    """
+    Poll until entry fills — only for placing GTC exits, not ongoing position tracking.
+    Matches master plan: brief wait, then resting orders on broker.
+    """
+    terminal = {"canceled", "expired", "rejected", "failed", "done_for_day"}
+    deadline = time.monotonic() + max_wait_sec
+    while time.monotonic() < deadline:
+        order = await fetch_alpaca_order(settings, order_id)
+        status = str(order.get("status", "")).lower()
+        if status == "filled":
+            logger.info("Alpaca entry %s filled — placing GTC exits", order_id)
+            return order
+        if status in terminal:
+            logger.warning("Alpaca entry %s stopped as %s — auto exits not placed", order_id, status)
+            return None
+        await asyncio.sleep(poll_sec)
+    logger.warning("Alpaca entry %s not filled within %ss — auto exits not placed", order_id, max_wait_sec)
+    return None
+
+
+def resolve_entry_credit(spread: SpreadPackage, filled_order: dict[str, Any] | None) -> float:
+    credit = float(spread.metadata["limit_credit"])
+    if not filled_order:
+        return credit
+    avg = filled_order.get("filled_avg_price")
+    if avg is not None:
+        try:
+            val = abs(float(avg))
+            if val > 0:
+                return round(val, 2)
+        except (TypeError, ValueError):
+            pass
+    return credit
+
+
+def spread_with_credit(spread: SpreadPackage, credit: float) -> SpreadPackage:
+    return SpreadPackage(
+        qty=spread.qty,
+        legs=spread.legs,
+        metadata={**spread.metadata, "limit_credit": credit},
+    )
+
+
+async def alpaca_place_exits_after_fill(settings: Settings, spread: SpreadPackage, entry_order_id: str) -> None:
+    """Background task: after entry fill, submit GTC take-profit + stop-loss (rest on Alpaca)."""
+    if not settings.is_live or not settings.alpaca_configured:
+        return
+
+    filled = await wait_for_alpaca_entry_fill(
+        settings,
+        entry_order_id,
+        max_wait_sec=settings.alpaca_exit_fill_timeout,
+        poll_sec=settings.alpaca_exit_poll_seconds,
+    )
+    if not filled:
+        await notify(
+            settings,
+            "Auto Exits Not Placed",
+            f"Entry order {entry_order_id} did not fill in time — no GTC TP/SL submitted",
+            "CRITICAL",
+        )
+        return
+
+    spread = spread_with_credit(spread, resolve_entry_credit(spread, filled))
+    ticker = str(spread.metadata.get("underlying", "SPY"))
+
+    if settings.auto_take_profit:
+        tp_payload = build_take_profit_payload(spread, settings.take_profit_pct, settings)
+        tp = await submit_alpaca_order(settings, tp_payload, dry_run=False)
+        if tp.success:
+            meta = tp_payload.get("_meta", {})
+            await notify(
+                settings,
+                "GTC Take-Profit Resting",
+                f"{ticker} close at ${meta.get('close_debit')} debit — locks ~${meta.get('profit_locked')}",
+                "SUCCESS",
+            )
+        else:
+            logger.error("Alpaca take-profit rejected: %s", tp.broker_response)
+
+    if settings.auto_stop_loss:
+        sl_payload = build_stop_loss_payload(spread, settings.stop_loss_multiplier, settings)
+        sl = await submit_alpaca_order(settings, sl_payload, dry_run=False)
+        if sl.success:
+            meta = sl_payload.get("_meta", {})
+            await notify(
+                settings,
+                "GTC Stop-Loss Resting",
+                f"{ticker} close at ${meta.get('close_debit')} debit — caps loss ~${meta.get('max_loss_estimate')}",
+                "SUCCESS",
+            )
+        else:
+            logger.error("Alpaca stop-loss rejected: %s", sl.broker_response)
+
+
 def coerce_signal(payload: dict, settings: Settings) -> TradingViewSignal:
     merged = {
         "strikeOffsetShort": settings.default_strike_offset_short,
@@ -786,8 +914,8 @@ def coerce_signal(payload: dict, settings: Settings) -> TradingViewSignal:
 
 app = FastAPI(
     title="spy-options-bridge",
-    version="5.2.0",
-    description="TradingView → Alpaca Paper multi-leg SPY credit spreads",
+    version="5.3.0",
+    description="TradingView → Alpaca Paper multi-leg SPY credit spreads + auto GTC exits",
 )
 
 
@@ -796,11 +924,13 @@ async def startup_log() -> None:
     s = get_settings()
     broker_label = "Alpaca Paper" if s.use_alpaca else "Tastytrade Cert"
     logger.info(
-        "spy-options-bridge v5.2.0 started | broker=%s (%s) | configured=%s | mode=%s",
+        "spy-options-bridge v5.3.0 started | broker=%s (%s) | configured=%s | mode=%s | auto_tp=%s auto_sl=%s",
         s.broker,
         broker_label,
         s.configured,
         s.execution_mode,
+        s.auto_take_profit,
+        s.auto_stop_loss,
     )
 
 SECRET_BODY_KEYS = ("webhookSecret", "webhook_secret", "secret")
@@ -828,7 +958,9 @@ async def health() -> dict[str, str]:
     broker_name = "alpaca" if s.use_alpaca else s.broker
     return {
         "status": "ok",
-        "version": "5.2.0",
+        "version": "5.3.0",
+        "auto_take_profit": str(s.auto_take_profit),
+        "auto_stop_loss": str(s.auto_stop_loss),
         "broker": broker_name,
         "broker_label": "Alpaca Paper" if s.use_alpaca else "Tastytrade Cert",
         "mode": s.execution_mode,
@@ -843,6 +975,7 @@ async def health() -> dict[str, str]:
 @app.post("/webhook", response_model=EntryResponse)
 async def entry_endpoint(
     request: Request,
+    background_tasks: BackgroundTasks,
     x_webhook_secret: str | None = Header(default=None, alias="X-Webhook-Secret"),
 ) -> EntryResponse:
     """
@@ -889,13 +1022,12 @@ async def entry_endpoint(
         )
 
     take_profit: OrderResult | None = None
-    alpaca_exits_skipped = False
-    if entry.success and settings.auto_take_profit:
-        if settings.use_alpaca:
-            # Alpaca rejects buy_to_close until the entry position exists (limit may be unfilled).
-            alpaca_exits_skipped = True
-            logger.info("Alpaca: skipping GTC take-profit until spread is filled — set exits in Alpaca dashboard")
-        else:
+    stop_loss: OrderResult | None = None
+    exits_scheduled = False
+
+    if entry.success and not settings.use_alpaca:
+        # Tastytrade: submit GTC exits immediately (original master plan).
+        if settings.auto_take_profit:
             tp_payload = build_take_profit_payload(spread, settings.take_profit_pct, settings)
             take_profit = await submit_order(settings, tp_payload, dry_run=dry_run)
             if take_profit.success:
@@ -907,12 +1039,7 @@ async def entry_endpoint(
                     "SUCCESS",
                 )
 
-    stop_loss: OrderResult | None = None
-    if entry.success and settings.auto_stop_loss:
-        if settings.use_alpaca:
-            alpaca_exits_skipped = True
-            logger.info("Alpaca: skipping GTC stop-loss until spread is filled — set exits in Alpaca dashboard")
-        else:
+        if settings.auto_stop_loss:
             sl_payload = build_stop_loss_payload(spread, settings.stop_loss_multiplier, settings)
             stop_loss = await submit_order(settings, sl_payload, dry_run=dry_run)
             if stop_loss.success:
@@ -924,13 +1051,23 @@ async def entry_endpoint(
                     "SUCCESS",
                 )
 
+    elif entry.success and settings.use_alpaca and (settings.auto_take_profit or settings.auto_stop_loss):
+        # Alpaca: must wait for entry fill before buy_to_close — schedule background GTC exits.
+        order_id = (entry.broker_response or {}).get("id")
+        if order_id:
+            background_tasks.add_task(alpaca_place_exits_after_fill, settings, spread, str(order_id))
+            exits_scheduled = True
+            logger.info("Alpaca: scheduled auto GTC exits after fill for order %s", order_id)
+        else:
+            logger.error("Alpaca entry accepted but no order id — cannot schedule auto exits")
+
     msg = entry.message
     if take_profit and take_profit.success:
         msg += " | GTC take-profit submitted"
     if stop_loss and stop_loss.success:
         msg += " | GTC stop-loss submitted"
-    if alpaca_exits_skipped and entry.success:
-        msg += " | Alpaca: entry only (set TP/SL in dashboard after fill)"
+    if exits_scheduled:
+        msg += " | GTC take-profit/stop-loss will auto-submit after entry fills"
 
     result = EntryResponse(
         success=entry.success,
