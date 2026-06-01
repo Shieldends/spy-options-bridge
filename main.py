@@ -56,7 +56,7 @@ class Settings(BaseSettings):
     auto_stop_loss: bool = Field(default=True, alias="AUTO_STOP_LOSS")
     stop_loss_multiplier: float = Field(default=2.0, alias="STOP_LOSS_MULTIPLIER")
     danger_zone_pct: float = Field(default=0.01, alias="DANGER_ZONE_PCT")
-    default_dte_filter: str = Field(default="0dte", alias="DEFAULT_DTE_FILTER")
+    default_dte_filter: str = Field(default="weekly", alias="DEFAULT_DTE_FILTER")
 
     discord_webhook_url: str = Field(default="", alias="DISCORD_WEBHOOK_URL")
     telegram_bot_token: str = Field(default="", alias="TELEGRAM_BOT_TOKEN")
@@ -67,6 +67,8 @@ class Settings(BaseSettings):
     default_strike_offset_short: int = Field(default=-2, alias="DEFAULT_STRIKE_OFFSET_SHORT")
     default_strike_offset_long: int = Field(default=-3, alias="DEFAULT_STRIKE_OFFSET_LONG")
     default_limit_credit: float = Field(default=0.50, alias="DEFAULT_LIMIT_CREDIT")
+    max_quantity: int = Field(default=0, alias="MAX_QUANTITY")
+    # 0 = no cap; set e.g. 10 to limit spreads per alert
 
     @property
     def is_live(self) -> bool:
@@ -127,6 +129,27 @@ class TradingViewSignal(BaseModel):
     @classmethod
     def normalize_action(cls, value: str | None) -> str:
         return str(value or "enter").upper()
+
+    @field_validator("quantity", mode="before")
+    @classmethod
+    def coerce_quantity(cls, value: Any) -> int:
+        """Accept int/float from JSON or TradingView {{strategy.order.contracts}}."""
+        if value is None or value == "":
+            return 1
+        qty = int(float(value))
+        return max(qty, 1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def merge_strategy_quantity(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        merged = dict(data)
+        for key in ("contracts", "strategyOrderContracts", "strategy_order_contracts"):
+            if key in merged and merged.get("quantity") in (None, "", 1):
+                merged["quantity"] = merged[key]
+                break
+        return merged
 
     @model_validator(mode="after")
     def resolve_strategy(self) -> "TradingViewSignal":
@@ -453,7 +476,11 @@ def coerce_signal(payload: dict, settings: Settings) -> TradingViewSignal:
     }
     merged.setdefault("ticker", settings.default_underlying)
     merged.setdefault("quantity", settings.default_quantity)
-    return TradingViewSignal.model_validate(merged)
+    signal = TradingViewSignal.model_validate(merged)
+    if settings.max_quantity > 0 and signal.quantity > settings.max_quantity:
+        logger.warning("Quantity %s capped to MAX_QUANTITY=%s", signal.quantity, settings.max_quantity)
+        signal.quantity = settings.max_quantity
+    return signal
 
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
