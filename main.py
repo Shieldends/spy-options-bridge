@@ -1,5 +1,5 @@
 """
-spy-options-bridge — TradingView → Tastytrade Cert Sandbox
+spy-options-bridge — TradingView → Alpaca Paper (or Tastytrade Cert)
 Single-file cloud bridge for Render deployment.
 
 Endpoints:
@@ -10,7 +10,7 @@ Endpoints:
 
 Auth: X-Webhook-Secret header OR webhookSecret in JSON body (TradingView-friendly).
 
-No streaming. No fill polling. GTC exit orders rest on Tastytrade servers.
+No streaming. No fill polling. GTC exit orders rest on the broker (Alpaca or Tastytrade).
 """
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 
 ET = ZoneInfo("America/New_York")
 CERT_URL = "https://api.cert.tastyworks.com"
+ALPACA_PAPER_URL = "https://paper-api.alpaca.markets"
 
 # ── Settings ──────────────────────────────────────────────────────────────────
 
@@ -42,7 +43,14 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     webhook_secret: str = Field(default="", alias="WEBHOOK_SECRET")
-    execution_mode: str = Field(default="sandbox", alias="EXECUTION_MODE")
+    execution_mode: str = Field(default="production", alias="EXECUTION_MODE")
+    broker: str = Field(default="alpaca", alias="BROKER")
+
+    apca_api_base_url: str = Field(default=ALPACA_PAPER_URL, alias="APCA_API_BASE_URL")
+    apca_api_key_id: str = Field(default="", alias="APCA_API_KEY_ID")
+    apca_api_secret_key: str = Field(default="", alias="APCA_API_SECRET_KEY")
+    alpaca_api_key: str = Field(default="", alias="ALPACA_API_KEY")
+    alpaca_secret_key: str = Field(default="", alias="ALPACA_SECRET_KEY")
 
     tastytrade_api_base_url: str = Field(default=CERT_URL, alias="TASTYTRADE_API_BASE_URL")
     tastytrade_username: str = Field(default="", alias="TASTYTRADE_USERNAME")
@@ -64,15 +72,31 @@ class Settings(BaseSettings):
 
     default_underlying: str = Field(default="SPY", alias="DEFAULT_UNDERLYING")
     default_quantity: int = Field(default=1, alias="DEFAULT_QUANTITY")
-    default_strike_offset_short: int = Field(default=-2, alias="DEFAULT_STRIKE_OFFSET_SHORT")
-    default_strike_offset_long: int = Field(default=-3, alias="DEFAULT_STRIKE_OFFSET_LONG")
-    default_limit_credit: float = Field(default=0.50, alias="DEFAULT_LIMIT_CREDIT")
+    default_strike_offset_short: int = Field(default=-5, alias="DEFAULT_STRIKE_OFFSET_SHORT")
+    default_strike_offset_long: int = Field(default=-8, alias="DEFAULT_STRIKE_OFFSET_LONG")
+    default_limit_credit: float = Field(default=0.35, alias="DEFAULT_LIMIT_CREDIT")
     max_quantity: int = Field(default=0, alias="MAX_QUANTITY")
     # 0 = no cap; set e.g. 10 to limit spreads per alert
 
     @property
     def is_live(self) -> bool:
         return self.execution_mode.lower() == "production"
+
+    @property
+    def use_alpaca(self) -> bool:
+        return self.broker.lower() == "alpaca"
+
+    @property
+    def alpaca_key(self) -> str:
+        return self.apca_api_key_id or self.alpaca_api_key
+
+    @property
+    def alpaca_secret(self) -> str:
+        return self.apca_api_secret_key or self.alpaca_secret_key
+
+    @property
+    def alpaca_configured(self) -> bool:
+        return bool(self.alpaca_key and self.alpaca_secret)
 
     @property
     def username(self) -> str:
@@ -84,6 +108,8 @@ class Settings(BaseSettings):
 
     @property
     def configured(self) -> bool:
+        if self.use_alpaca:
+            return self.alpaca_configured
         return bool(self.username and self.password and self.tastytrade_account_number)
 
     @property
@@ -307,6 +333,7 @@ def build_spread(signal: TradingViewSignal, settings: Settings) -> SpreadPackage
 
 
 def build_entry_payload(spread: SpreadPackage) -> dict:
+    """Tastytrade cert multi-leg entry."""
     credit = float(spread.metadata["limit_credit"])
     qty = int(spread.qty)
     return {
@@ -329,6 +356,64 @@ def build_entry_payload(spread: SpreadPackage) -> dict:
             },
         ],
     }
+
+
+def build_alpaca_mleg_payload(
+    spread: SpreadPackage,
+    *,
+    limit_price: float,
+    time_in_force: str = "day",
+    closing: bool = False,
+) -> dict:
+    """Alpaca paper/live multi-leg options order (order_class=mleg)."""
+    if closing:
+        legs = [
+            {
+                "symbol": spread.legs[0].symbol,
+                "ratio_qty": "1",
+                "side": "buy",
+                "position_intent": "buy_to_close",
+            },
+            {
+                "symbol": spread.legs[1].symbol,
+                "ratio_qty": "1",
+                "side": "sell",
+                "position_intent": "sell_to_close",
+            },
+        ]
+    else:
+        legs = [
+            {
+                "symbol": spread.legs[0].symbol,
+                "ratio_qty": "1",
+                "side": "sell",
+                "position_intent": "sell_to_open",
+            },
+            {
+                "symbol": spread.legs[1].symbol,
+                "ratio_qty": "1",
+                "side": "buy",
+                "position_intent": "buy_to_open",
+            },
+        ]
+
+    return {
+        "order_class": "mleg",
+        "qty": spread.qty,
+        "type": "limit",
+        "limit_price": f"{limit_price:.2f}",
+        "time_in_force": time_in_force,
+        "legs": legs,
+    }
+
+
+def build_alpaca_entry_payload(spread: SpreadPackage) -> dict:
+    credit = float(spread.metadata["limit_credit"])
+    return build_alpaca_mleg_payload(spread, limit_price=credit, time_in_force="day", closing=False)
+
+
+def build_alpaca_close_payload(spread: SpreadPackage, close_debit: float) -> dict:
+    return build_alpaca_mleg_payload(spread, limit_price=close_debit, time_in_force="gtc", closing=True)
 
 
 def build_close_spread_payload(spread: SpreadPackage, close_debit: float) -> dict:
@@ -355,10 +440,13 @@ def build_close_spread_payload(spread: SpreadPackage, close_debit: float) -> dic
     }
 
 
-def build_take_profit_payload(spread: SpreadPackage, take_profit_pct: float) -> dict:
+def build_take_profit_payload(spread: SpreadPackage, take_profit_pct: float, settings: Settings) -> dict:
     credit = float(spread.metadata["limit_credit"])
     close_debit = round(credit * take_profit_pct, 2)
-    payload = build_close_spread_payload(spread, close_debit)
+    if settings.use_alpaca:
+        payload = build_alpaca_close_payload(spread, close_debit)
+    else:
+        payload = build_close_spread_payload(spread, close_debit)
     payload["_meta"] = {
         "entry_credit": credit,
         "close_debit": close_debit,
@@ -367,7 +455,7 @@ def build_take_profit_payload(spread: SpreadPackage, take_profit_pct: float) -> 
     return payload
 
 
-def build_stop_loss_payload(spread: SpreadPackage, stop_loss_multiplier: float) -> dict:
+def build_stop_loss_payload(spread: SpreadPackage, stop_loss_multiplier: float, settings: Settings) -> dict:
     """
     GTC stop-loss safety net: buy back spread at N× entry credit (default 2×).
 
@@ -375,7 +463,10 @@ def build_stop_loss_payload(spread: SpreadPackage, stop_loss_multiplier: float) 
     """
     credit = float(spread.metadata["limit_credit"])
     close_debit = round(credit * stop_loss_multiplier, 2)
-    payload = build_close_spread_payload(spread, close_debit)
+    if settings.use_alpaca:
+        payload = build_alpaca_close_payload(spread, close_debit)
+    else:
+        payload = build_close_spread_payload(spread, close_debit)
     payload["_meta"] = {
         "entry_credit": credit,
         "stop_loss_multiplier": stop_loss_multiplier,
@@ -419,7 +510,7 @@ async def notify(settings: Settings, title: str, body: str, level: str = "INFO")
     return results
 
 
-# ── Tastytrade cert broker ────────────────────────────────────────────────────
+# ── Broker adapters ───────────────────────────────────────────────────────────
 
 
 async def tastytrade_login(client: httpx.AsyncClient, settings: Settings) -> str:
@@ -434,7 +525,7 @@ async def tastytrade_login(client: httpx.AsyncClient, settings: Settings) -> str
     return token
 
 
-async def submit_order(settings: Settings, payload: dict, *, dry_run: bool) -> OrderResult:
+async def submit_tastytrade_order(settings: Settings, payload: dict, *, dry_run: bool) -> OrderResult:
     clean = {k: v for k, v in payload.items() if not k.startswith("_")}
     account = settings.tastytrade_account_number
     path = f"/accounts/{account}/orders/dry-run" if dry_run else f"/accounts/{account}/orders"
@@ -463,7 +554,65 @@ async def submit_order(settings: Settings, payload: dict, *, dry_run: bool) -> O
     if r.is_success:
         return OrderResult(success=True, message=f"Accepted at {path}", dry_run=dry_run, payload=clean, broker_response=body)
 
-    return OrderResult(success=False, message=f"Rejected ({r.status_code})", payload=clean, broker_response=body)
+    return OrderResult(success=False, message=f"Rejected ({r.status_code})", dry_run=dry_run, payload=clean, broker_response=body)
+
+
+async def submit_alpaca_order(settings: Settings, payload: dict, *, dry_run: bool) -> OrderResult:
+    clean = {k: v for k, v in payload.items() if not k.startswith("_")}
+
+    if dry_run:
+        return OrderResult(
+            success=True,
+            message="Sandbox mode — Alpaca order packaged but not sent",
+            dry_run=True,
+            payload=clean,
+        )
+
+    if not settings.alpaca_configured:
+        return OrderResult(
+            success=False,
+            message="Alpaca credentials missing — set APCA_API_KEY_ID and APCA_API_SECRET_KEY",
+            dry_run=False,
+            payload=clean,
+        )
+
+    base = settings.apca_api_base_url.rstrip("/")
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "Apca-Api-Key-Id": settings.alpaca_key,
+        "Apca-Api-Secret-Key": settings.alpaca_secret,
+    }
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.post(f"{base}/v2/orders", headers=headers, json=clean)
+
+    try:
+        body = r.json()
+    except Exception:
+        body = {"raw": r.text}
+
+    if r.is_success:
+        return OrderResult(
+            success=True,
+            message="Alpaca paper order accepted",
+            dry_run=False,
+            payload=clean,
+            broker_response=body,
+        )
+
+    return OrderResult(
+        success=False,
+        message=f"Alpaca rejected ({r.status_code})",
+        dry_run=False,
+        payload=clean,
+        broker_response=body,
+    )
+
+
+async def submit_order(settings: Settings, payload: dict, *, dry_run: bool) -> OrderResult:
+    if settings.use_alpaca:
+        return await submit_alpaca_order(settings, payload, dry_run=dry_run)
+    return await submit_tastytrade_order(settings, payload, dry_run=dry_run)
 
 
 def coerce_signal(payload: dict, settings: Settings) -> TradingViewSignal:
@@ -485,7 +634,7 @@ def coerce_signal(payload: dict, settings: Settings) -> TradingViewSignal:
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 
-app = FastAPI(title="spy-options-bridge", version="4.0.1")
+app = FastAPI(title="spy-options-bridge", version="5.0.0")
 
 SECRET_BODY_KEYS = ("webhookSecret", "webhook_secret", "secret")
 
@@ -511,9 +660,10 @@ async def health() -> dict[str, str]:
     s = get_settings()
     return {
         "status": "ok",
+        "broker": s.broker,
         "mode": s.execution_mode,
         "configured": str(s.configured),
-        "api": s.tastytrade_api_base_url,
+        "api": s.apca_api_base_url if s.use_alpaca else s.tastytrade_api_base_url,
         "dte_filter_default": s.default_dte_filter,
     }
 
@@ -553,7 +703,7 @@ async def entry_endpoint(
         if danger and risk_msg:
             notifications["risk"] = await notify(settings, "Entry Near Danger Zone", risk_msg, "CRITICAL")
 
-    entry_payload = build_entry_payload(spread)
+    entry_payload = build_alpaca_entry_payload(spread) if settings.use_alpaca else build_entry_payload(spread)
     entry = await submit_order(settings, entry_payload, dry_run=dry_run)
 
     if entry.success:
@@ -566,7 +716,7 @@ async def entry_endpoint(
 
     take_profit: OrderResult | None = None
     if entry.success and settings.auto_take_profit:
-        tp_payload = build_take_profit_payload(spread, settings.take_profit_pct)
+        tp_payload = build_take_profit_payload(spread, settings.take_profit_pct, settings)
         take_profit = await submit_order(settings, tp_payload, dry_run=dry_run)
         if take_profit.success:
             meta = tp_payload.get("_meta", {})
@@ -579,7 +729,7 @@ async def entry_endpoint(
 
     stop_loss: OrderResult | None = None
     if entry.success and settings.auto_stop_loss:
-        sl_payload = build_stop_loss_payload(spread, settings.stop_loss_multiplier)
+        sl_payload = build_stop_loss_payload(spread, settings.stop_loss_multiplier, settings)
         stop_loss = await submit_order(settings, sl_payload, dry_run=dry_run)
         if stop_loss.success:
             meta = sl_payload.get("_meta", {})
@@ -608,8 +758,9 @@ async def entry_endpoint(
         stop_loss=stop_loss,
         notifications=notifications,
     )
+    # Return 200 so TradingView marks webhook delivered (broker errors stay in JSON body).
     if not entry.success:
-        return JSONResponse(status_code=422, content=result.model_dump())  # type: ignore[return-value]
+        return JSONResponse(status_code=200, content=result.model_dump())  # type: ignore[return-value]
     return result
 
 
