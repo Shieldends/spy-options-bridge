@@ -1,16 +1,27 @@
 """
-spy-options-bridge — TradingView → Alpaca Paper (or Tastytrade Cert)
-Single-file cloud bridge for Render deployment.
+spy-options-bridge v5.2.0 — ALPACA PAPER (default broker)
+
+TradingView webhook → Render → Alpaca multi-leg SPY put credit spreads.
+
+>>> DEPLOY THIS FILE TO GITHUB / RENDER:
+>>>   C:\\Users\\Shiel\\spy-options-bridge\\main.py
+>>> NOT app\\main.py (old Tastytrade module — not used by Render)
+
+Render start command:  uvicorn main:app --host 0.0.0.0 --port $PORT
+
+Required Render env vars:
+  BROKER=alpaca
+  APCA_API_KEY_ID=<your paper key>
+  APCA_API_SECRET_KEY=<your paper secret>
+  APCA_API_BASE_URL=https://paper-api.alpaca.markets
+  EXECUTION_MODE=production
+  WEBHOOK_SECRET=<your secret>
 
 Endpoints:
-  GET  /health   — status check
-  POST /entry    — multi-leg credit spread entry + GTC take-profit + GTC stop-loss
+  GET  /health   — shows broker=alpaca when configured
+  POST /entry    — Alpaca mleg entry + GTC take-profit + GTC stop-loss
+  POST /webhook  — alias for /entry
   POST /warning  — danger-zone alert only (no orders)
-  POST /webhook  — alias for /entry (TradingView default)
-
-Auth: X-Webhook-Secret header OR webhookSecret in JSON body (TradingView-friendly).
-
-No streaming. No fill polling. GTC exit orders rest on the broker (Alpaca or Tastytrade).
 """
 
 from __future__ import annotations
@@ -59,9 +70,9 @@ class Settings(BaseSettings):
     tastytrade_sandbox_username: str = Field(default="", alias="TASTYTRADE_SANDBOX_USERNAME")
     tastytrade_sandbox_password: str = Field(default="", alias="TASTYTRADE_SANDBOX_PASSWORD")
 
-    auto_take_profit: bool = Field(default=True, alias="AUTO_TAKE_PROFIT")
+    auto_take_profit: bool = Field(default=False, alias="AUTO_TAKE_PROFIT")
     take_profit_pct: float = Field(default=0.50, alias="TAKE_PROFIT_PCT")
-    auto_stop_loss: bool = Field(default=True, alias="AUTO_STOP_LOSS")
+    auto_stop_loss: bool = Field(default=False, alias="AUTO_STOP_LOSS")
     stop_loss_multiplier: float = Field(default=2.0, alias="STOP_LOSS_MULTIPLIER")
     danger_zone_pct: float = Field(default=0.01, alias="DANGER_ZONE_PCT")
     default_dte_filter: str = Field(default="weekly", alias="DEFAULT_DTE_FILTER")
@@ -84,7 +95,8 @@ class Settings(BaseSettings):
 
     @property
     def use_alpaca(self) -> bool:
-        return self.broker.lower() == "alpaca"
+        """Alpaca unless BROKER is explicitly set to tastytrade."""
+        return self.broker.lower().strip() != "tastytrade"
 
     @property
     def alpaca_key(self) -> str:
@@ -135,8 +147,8 @@ class TradingViewSignal(BaseModel):
     strategy: SpreadStrategy | None = None
     signal_price: float | None = Field(default=None, alias="signalPrice")
     quantity: int = 1
-    strike_offset_short: int = Field(default=-2, alias="strikeOffsetShort")
-    strike_offset_long: int = Field(default=-3, alias="strikeOffsetLong")
+    strike_offset_short: int = Field(default=-5, alias="strikeOffsetShort")
+    strike_offset_long: int = Field(default=-8, alias="strikeOffsetLong")
     short_strike: float | None = Field(default=None, alias="short_strike")
     long_strike: float | None = Field(default=None, alias="long_strike")
     limit_credit: float | None = Field(default=None, alias="limitCredit")
@@ -358,6 +370,142 @@ def build_entry_payload(spread: SpreadPackage) -> dict:
     }
 
 
+def format_alpaca_limit_price(amount: float, *, is_credit: bool) -> str:
+    """
+    Alpaca mleg limit_price sign convention:
+      negative = credit received (sell spread)
+      positive = debit paid (buy spread back)
+    """
+    value = round(abs(amount), 2)
+    return f"{-value:.2f}" if is_credit else f"{value:.2f}"
+
+
+async def fetch_alpaca_option_strikes(
+    settings: Settings,
+    underlying: str,
+    expiration: str,
+    option_type: str,
+) -> list[float]:
+    """Return sorted strike prices listed on Alpaca for one expiration."""
+    base = settings.apca_api_base_url.rstrip("/")
+    headers = {
+        "Apca-Api-Key-Id": settings.alpaca_key,
+        "Apca-Api-Secret-Key": settings.alpaca_secret,
+    }
+    params = {
+        "underlying_symbols": underlying.upper(),
+        "expiration_date": expiration,
+        "type": option_type,
+        "limit": 1000,
+    }
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.get(f"{base}/v2/options/contracts", headers=headers, params=params)
+    if not r.is_success:
+        logger.warning("Alpaca strike lookup failed (%s): %s", r.status_code, r.text[:200])
+        return []
+
+    data = r.json()
+    contracts = data.get("option_contracts") or []
+    strikes: list[float] = []
+    for row in contracts:
+        if not isinstance(row, dict):
+            continue
+        strike = row.get("strike_price")
+        if strike is not None:
+            strikes.append(float(strike))
+    return sorted(set(strikes))
+
+
+def snap_put_credit_strikes(short_target: float, long_target: float, available: list[float]) -> tuple[float, float]:
+    """Map computed strikes to Alpaca-listed puts (long strike must be below short)."""
+    if not available:
+        return short_target, long_target
+
+    short_candidates = [s for s in available if s <= short_target]
+    short = max(short_candidates) if short_candidates else min(available, key=lambda s: abs(s - short_target))
+
+    long_candidates = [s for s in available if s < short and s <= long_target]
+    if long_candidates:
+        long = max(long_candidates)
+    else:
+        below_short = [s for s in available if s < short]
+        if not below_short:
+            raise ValueError(f"No Alpaca put strike below short strike {short}")
+        long = max(below_short)
+
+    return short, long
+
+
+def snap_call_credit_strikes(short_target: float, long_target: float, available: list[float]) -> tuple[float, float]:
+    """Map computed strikes to Alpaca-listed calls (long strike must be above short)."""
+    if not available:
+        return short_target, long_target
+
+    short_candidates = [s for s in available if s >= short_target]
+    short = min(short_candidates) if short_candidates else min(available, key=lambda s: abs(s - short_target))
+
+    long_candidates = [s for s in available if s > short and s >= long_target]
+    if long_candidates:
+        long = min(long_candidates)
+    else:
+        above_short = [s for s in available if s > short]
+        if not above_short:
+            raise ValueError(f"No Alpaca call strike above short strike {short}")
+        long = min(above_short)
+
+    return short, long
+
+
+async def align_spread_to_alpaca(settings: Settings, spread: SpreadPackage, signal: TradingViewSignal) -> SpreadPackage:
+    """Snap strikes to Alpaca-listed contracts and rebuild OCC symbols."""
+    if signal.uses_explicit_strikes:
+        short_strike = float(signal.short_strike)  # type: ignore[arg-type]
+        long_strike = float(signal.long_strike)  # type: ignore[arg-type]
+    else:
+        short_strike = float(spread.metadata["short_strike"])
+        long_strike = float(spread.metadata["long_strike"])
+
+    expiration = str(spread.metadata["expiration"])
+    underlying = str(spread.metadata["underlying"])
+    option_type = "put" if signal.strategy == SpreadStrategy.PUT_CREDIT_SPREAD else "call"
+    available = await fetch_alpaca_option_strikes(settings, underlying, expiration, option_type)
+    if not available:
+        logger.warning("No Alpaca strikes returned for %s %s — using computed strikes", underlying, expiration)
+        return spread
+
+    original = (short_strike, long_strike)
+    if option_type == "put":
+        short_strike, long_strike = snap_put_credit_strikes(short_strike, long_strike, available)
+    else:
+        short_strike, long_strike = snap_call_credit_strikes(short_strike, long_strike, available)
+
+    if (short_strike, long_strike) != original:
+        logger.info(
+            "Snapped %s strikes for Alpaca: short %.2f→%.2f long %.2f→%.2f",
+            underlying,
+            original[0],
+            short_strike,
+            original[1],
+            long_strike,
+        )
+
+    short_sym = format_occ_symbol(underlying, expiration, option_type, short_strike)
+    long_sym = format_occ_symbol(underlying, expiration, option_type, long_strike)
+    return SpreadPackage(
+        qty=spread.qty,
+        legs=[
+            SpreadLeg(symbol=short_sym, side="sell", position_intent="sell_to_open"),
+            SpreadLeg(symbol=long_sym, side="buy", position_intent="buy_to_open"),
+        ],
+        metadata={
+            **spread.metadata,
+            "short_strike": short_strike,
+            "long_strike": long_strike,
+            "strikes_snapped": (short_strike, long_strike) != original,
+        },
+    )
+
+
 def build_alpaca_mleg_payload(
     spread: SpreadPackage,
     *,
@@ -381,6 +529,7 @@ def build_alpaca_mleg_payload(
                 "position_intent": "sell_to_close",
             },
         ]
+        signed_limit = format_alpaca_limit_price(limit_price, is_credit=False)
     else:
         legs = [
             {
@@ -396,12 +545,13 @@ def build_alpaca_mleg_payload(
                 "position_intent": "buy_to_open",
             },
         ]
+        signed_limit = format_alpaca_limit_price(limit_price, is_credit=True)
 
     return {
         "order_class": "mleg",
         "qty": spread.qty,
         "type": "limit",
-        "limit_price": f"{limit_price:.2f}",
+        "limit_price": signed_limit,
         "time_in_force": time_in_force,
         "legs": legs,
     }
@@ -634,7 +784,24 @@ def coerce_signal(payload: dict, settings: Settings) -> TradingViewSignal:
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 
-app = FastAPI(title="spy-options-bridge", version="5.0.0")
+app = FastAPI(
+    title="spy-options-bridge",
+    version="5.2.0",
+    description="TradingView → Alpaca Paper multi-leg SPY credit spreads",
+)
+
+
+@app.on_event("startup")
+async def startup_log() -> None:
+    s = get_settings()
+    broker_label = "Alpaca Paper" if s.use_alpaca else "Tastytrade Cert"
+    logger.info(
+        "spy-options-bridge v5.2.0 started | broker=%s (%s) | configured=%s | mode=%s",
+        s.broker,
+        broker_label,
+        s.configured,
+        s.execution_mode,
+    )
 
 SECRET_BODY_KEYS = ("webhookSecret", "webhook_secret", "secret")
 
@@ -658,13 +825,17 @@ def extract_webhook_secret(payload: dict[str, Any], header: str | None) -> tuple
 @app.get("/health")
 async def health() -> dict[str, str]:
     s = get_settings()
+    broker_name = "alpaca" if s.use_alpaca else s.broker
     return {
         "status": "ok",
-        "broker": s.broker,
+        "version": "5.2.0",
+        "broker": broker_name,
+        "broker_label": "Alpaca Paper" if s.use_alpaca else "Tastytrade Cert",
         "mode": s.execution_mode,
         "configured": str(s.configured),
         "api": s.apca_api_base_url if s.use_alpaca else s.tastytrade_api_base_url,
         "dte_filter_default": s.default_dte_filter,
+        "deploy_file": "main.py (root — NOT app/main.py)",
     }
 
 
@@ -688,6 +859,8 @@ async def entry_endpoint(
 
     signal = coerce_signal(payload, settings)
     spread = build_spread(signal, settings)
+    if settings.use_alpaca:
+        spread = await align_spread_to_alpaca(settings, spread, signal)
     expiration = spread.metadata["expiration"]
 
     # Danger check on entry (informational — does not block order)
@@ -704,6 +877,7 @@ async def entry_endpoint(
             notifications["risk"] = await notify(settings, "Entry Near Danger Zone", risk_msg, "CRITICAL")
 
     entry_payload = build_alpaca_entry_payload(spread) if settings.use_alpaca else build_entry_payload(spread)
+    logger.info("Submitting %s entry order", "Alpaca mleg" if settings.use_alpaca else "Tastytrade")
     entry = await submit_order(settings, entry_payload, dry_run=dry_run)
 
     if entry.success:
@@ -715,36 +889,48 @@ async def entry_endpoint(
         )
 
     take_profit: OrderResult | None = None
+    alpaca_exits_skipped = False
     if entry.success and settings.auto_take_profit:
-        tp_payload = build_take_profit_payload(spread, settings.take_profit_pct, settings)
-        take_profit = await submit_order(settings, tp_payload, dry_run=dry_run)
-        if take_profit.success:
-            meta = tp_payload.get("_meta", {})
-            notifications["take_profit"] = await notify(
-                settings,
-                "GTC Take-Profit Resting",
-                f"{signal.ticker} close at ${meta.get('close_debit')} debit — locks ~${meta.get('profit_locked')}",
-                "SUCCESS",
-            )
+        if settings.use_alpaca:
+            # Alpaca rejects buy_to_close until the entry position exists (limit may be unfilled).
+            alpaca_exits_skipped = True
+            logger.info("Alpaca: skipping GTC take-profit until spread is filled — set exits in Alpaca dashboard")
+        else:
+            tp_payload = build_take_profit_payload(spread, settings.take_profit_pct, settings)
+            take_profit = await submit_order(settings, tp_payload, dry_run=dry_run)
+            if take_profit.success:
+                meta = tp_payload.get("_meta", {})
+                notifications["take_profit"] = await notify(
+                    settings,
+                    "GTC Take-Profit Resting",
+                    f"{signal.ticker} close at ${meta.get('close_debit')} debit — locks ~${meta.get('profit_locked')}",
+                    "SUCCESS",
+                )
 
     stop_loss: OrderResult | None = None
     if entry.success and settings.auto_stop_loss:
-        sl_payload = build_stop_loss_payload(spread, settings.stop_loss_multiplier, settings)
-        stop_loss = await submit_order(settings, sl_payload, dry_run=dry_run)
-        if stop_loss.success:
-            meta = sl_payload.get("_meta", {})
-            notifications["stop_loss"] = await notify(
-                settings,
-                "GTC Stop-Loss Resting",
-                f"{signal.ticker} close at ${meta.get('close_debit')} debit — caps loss ~${meta.get('max_loss_estimate')}",
-                "SUCCESS",
-            )
+        if settings.use_alpaca:
+            alpaca_exits_skipped = True
+            logger.info("Alpaca: skipping GTC stop-loss until spread is filled — set exits in Alpaca dashboard")
+        else:
+            sl_payload = build_stop_loss_payload(spread, settings.stop_loss_multiplier, settings)
+            stop_loss = await submit_order(settings, sl_payload, dry_run=dry_run)
+            if stop_loss.success:
+                meta = sl_payload.get("_meta", {})
+                notifications["stop_loss"] = await notify(
+                    settings,
+                    "GTC Stop-Loss Resting",
+                    f"{signal.ticker} close at ${meta.get('close_debit')} debit — caps loss ~${meta.get('max_loss_estimate')}",
+                    "SUCCESS",
+                )
 
     msg = entry.message
     if take_profit and take_profit.success:
         msg += " | GTC take-profit submitted"
     if stop_loss and stop_loss.success:
         msg += " | GTC stop-loss submitted"
+    if alpaca_exits_skipped and entry.success:
+        msg += " | Alpaca: entry only (set TP/SL in dashboard after fill)"
 
     result = EntryResponse(
         success=entry.success,
