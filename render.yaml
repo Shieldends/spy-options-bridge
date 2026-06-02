@@ -1,0 +1,42 @@
+services:
+  - type: web
+    name: spy-options-bridge
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: BROKER
+        value: alpaca
+      - key: EXECUTION_MODE
+        value: production
+      - key: APCA_API_BASE_URL
+        value: https://paper-api.alpaca.markets
+      - key: DEFAULT_DTE_FILTER
+        value: weekly
+      - key: DEFAULT_STRIKE_OFFSET_SHORT
+        value: "-5"
+      - key: DEFAULT_STRIKE_OFFSET_LONG
+        value: "-6"
+      - key: DEFAULT_LIMIT_CREDIT
+        value: "0.55"
+      - key: AUTO_TAKE_PROFIT
+        value: true
+      - key: TAKE_PROFIT_PCT
+        value: "0.4"
+      - key: AUTO_STOP_LOSS
+        value: true
+      - key: STOP_LOSS_MULTIPLIER
+        value: "1.5"
+      - key: DANGER_ZONE_PCT
+        value: "0.01"
+      - key: ALPACA_EXIT_FILL_TIMEOUT
+        value: "600"
+      - key: ALPACA_EXIT_POLL_SECONDS
+        value: "3"
+      - key: APCA_API_KEY_ID
+        sync: false
+      - key: APCA_API_SECRET_KEY
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false

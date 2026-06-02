@@ -1,0 +1,6 @@
+{
+  "webhookSecret": "change-me-to-a-long-random-string",
+  "ticker": "SPY",
+  "signalPrice": "{{close}}",
+  "short_strike": 579
+}

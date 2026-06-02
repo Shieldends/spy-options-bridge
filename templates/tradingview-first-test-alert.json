@@ -1,0 +1,10 @@
+{
+  "ticker": "SPY",
+  "action": "PUT_CREDIT_SPREAD",
+  "signalPrice": "{{close}}",
+  "short_strike": 579,
+  "long_strike": 578,
+  "expiration": "260603",
+  "quantity": 1,
+  "limitCredit": 0.50
+}
