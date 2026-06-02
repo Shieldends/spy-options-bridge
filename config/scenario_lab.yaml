@@ -1,0 +1,41 @@
+# Scenario Lab — unattended validation (paper only)
+max_live_scenarios: 6
+delay_between_scenarios_sec: 5
+fill_wait_sec: 120
+exit_wait_sec: 90
+
+# Run market-analyzer autopilot before live scenarios (historical + prelaunch)
+run_autopilot_first: true
+
+# Reminder file on Desktop (pause TradingView ENTRY during lab)
+write_tv_pause_reminder: true
+
+bridge_url: https://spy-options-bridge.onrender.com
+
+scenarios:
+  S1_pytest_health:
+    enabled: true
+    needs_market: false
+  S2_auth_reject:
+    enabled: true
+    needs_market: false
+  S3_entry_exercise_fill:
+    enabled: true
+    needs_market: true
+    fill_mode: exercise
+  S4_gtc_exits:
+    enabled: true
+    needs_market: true
+  S5_warning_notify:
+    enabled: true
+    needs_market: true
+  S6_warning_close:
+    enabled: true
+    needs_market: true
+  S7_entry_aggressive:
+    enabled: true
+    needs_market: true
+    fill_mode: aggressive
+  S8_account_flat:
+    enabled: true
+    needs_market: false
