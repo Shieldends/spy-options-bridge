@@ -31,6 +31,24 @@ def test_aggressive_credit_from_bid_ask():
     assert meta["quote_source"] == "bid_ask_aggressive"
 
 
+def test_exercise_mode_below_aggressive():
+    spread = SpreadPackage(
+        qty="1",
+        legs=[
+            SpreadLeg(symbol="SPY260605P00752000", side="sell", position_intent="sell_to_open"),
+            SpreadLeg(symbol="SPY260605P00751000", side="buy", position_intent="buy_to_open"),
+        ],
+        metadata={},
+    )
+    quotes = {
+        "SPY260605P00752000": {"bid": 0.80, "ask": 0.85},
+        "SPY260605P00751000": {"bid": 0.20, "ask": 0.25},
+    }
+    agg, _ = estimate_credit_from_quotes(spread, quotes, mode="aggressive", cap=0.55)
+    ex, _ = estimate_credit_from_quotes(spread, quotes, mode="exercise", cap=0.55)
+    assert ex <= agg
+
+
 def test_cap_limits_high_fixed():
     spread = SpreadPackage(
         qty="1",

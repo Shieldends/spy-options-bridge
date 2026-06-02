@@ -1,5 +1,5 @@
 """
-spy-options-bridge v5.4.0 — ALPACA PAPER (default broker)
+spy-options-bridge v5.5.0 — ALPACA PAPER (default broker)
 
 TradingView webhook → Render → Alpaca multi-leg SPY put credit spreads.
 
@@ -493,6 +493,8 @@ def _normalize_fill_mode(mode: str | None, settings: Settings) -> str:
         return "auto"
     if raw in {"aggressive", "fast", "fill"}:
         return "aggressive"
+    if raw in {"exercise", "expedite", "probe", "system_test"}:
+        return "exercise"
     return "fixed"
 
 
@@ -568,6 +570,10 @@ def estimate_credit_from_quotes(
     if mode == "aggressive":
         credit = max(natural * 0.97 - 0.01, 0.05)
         meta["quote_source"] = "bid_ask_aggressive"
+    elif mode == "exercise":
+        # System validation: lean below market credit for faster paper fills (not for live profit tuning).
+        credit = max(natural * 0.80 - 0.03, 0.05)
+        meta["quote_source"] = "bid_ask_exercise"
     else:
         credit = max(min(natural, mid_credit), 0.05)
         meta["quote_source"] = "bid_ask_auto"
@@ -1271,7 +1277,7 @@ def coerce_signal(payload: dict, settings: Settings) -> TradingViewSignal:
 
 app = FastAPI(
     title="spy-options-bridge",
-    version="5.4.0",
+    version="5.5.0",
     description="TradingView → Alpaca Paper multi-leg SPY credit spreads + auto GTC exits",
 )
 
@@ -1315,7 +1321,7 @@ async def health() -> dict[str, str]:
     broker_name = "alpaca" if s.use_alpaca else s.broker
     return {
         "status": "ok",
-        "version": "5.4.0",
+        "version": "5.5.0",
         "auto_take_profit": str(s.auto_take_profit),
         "auto_stop_loss": str(s.auto_stop_loss),
         "broker": broker_name,
