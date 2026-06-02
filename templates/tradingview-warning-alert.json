@@ -1,6 +1,8 @@
 {
-  "webhookSecret": "change-me-to-a-long-random-string",
-  "ticker": "SPY",
-  "signalPrice": "{{close}}",
-  "short_strike": 579
+  "webhookSecret": "my-bridge-secret-2026",
+  "ticker": "{{ticker}}",
+  "signalPrice": {{close}},
+  "strikeOffsetShort": -5,
+  "strikeOffsetLong": -6,
+  "overrideAutoClose": false
 }

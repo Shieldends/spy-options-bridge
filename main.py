@@ -21,7 +21,7 @@ Endpoints:
   GET  /health   — shows broker=alpaca when configured
   POST /entry    — Alpaca mleg entry + GTC take-profit + GTC stop-loss
   POST /webhook  — alias for /entry
-  POST /warning  — danger-zone alert only (no orders)
+  POST /warning  — danger zone: notify + optional auto-close spread (override in JSON)
 """
 
 from __future__ import annotations
@@ -77,6 +77,9 @@ class Settings(BaseSettings):
     auto_stop_loss: bool = Field(default=True, alias="AUTO_STOP_LOSS")
     stop_loss_multiplier: float = Field(default=2.0, alias="STOP_LOSS_MULTIPLIER")
     danger_zone_pct: float = Field(default=0.01, alias="DANGER_ZONE_PCT")
+    auto_close_on_warning: bool = Field(default=True, alias="AUTO_CLOSE_ON_WARNING")
+    warning_close_multiplier: float = Field(default=1.2, alias="WARNING_CLOSE_MULTIPLIER")
+    warning_cancel_resting_exits: bool = Field(default=True, alias="WARNING_CANCEL_RESTING_EXITS")
     default_dte_filter: str = Field(default="weekly", alias="DEFAULT_DTE_FILTER")
     alpaca_exit_fill_timeout: int = Field(default=600, alias="ALPACA_EXIT_FILL_TIMEOUT")
     alpaca_exit_poll_seconds: float = Field(default=3.0, alias="ALPACA_EXIT_POLL_SECONDS")
@@ -215,10 +218,26 @@ class TradingViewSignal(BaseModel):
 class WarningSignal(BaseModel):
     ticker: str
     signal_price: float = Field(alias="signalPrice")
-    short_strike: float = Field(alias="short_strike")
+    short_strike: float | None = Field(default=None, alias="short_strike")
     long_strike: float | None = Field(default=None, alias="long_strike")
+    strike_offset_short: int | None = Field(default=None, alias="strikeOffsetShort")
+    strike_offset_long: int | None = Field(default=None, alias="strikeOffsetLong")
+    override_auto_close: bool = Field(default=False, alias="overrideAutoClose")
+    force_auto_close: bool = Field(default=False, alias="forceAutoClose")
+    close_debit: float | None = Field(default=None, alias="closeDebit")
 
     model_config = {"populate_by_name": True}
+
+    @model_validator(mode="after")
+    def resolve_strikes(self) -> "WarningSignal":
+        atm = _round_strike(self.signal_price)
+        if self.short_strike is None and self.strike_offset_short is not None:
+            self.short_strike = atm + self.strike_offset_short
+        if self.long_strike is None and self.strike_offset_long is not None:
+            self.long_strike = atm + self.strike_offset_long
+        if self.short_strike is None:
+            raise ValueError("short_strike or strikeOffsetShort required for /warning")
+        return self
 
 
 class SpreadLeg(BaseModel):
@@ -259,6 +278,11 @@ class WarningResponse(BaseModel):
     danger_zone: bool
     risk_warning: str | None = None
     distance_pct: float | None = None
+    action_taken: str = "none"
+    survival_odds_expire_otm: float | None = None
+    protocol_notes: list[str] = Field(default_factory=list)
+    close_order: OrderResult | None = None
+    positions_matched: int = 0
     notifications: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -642,6 +666,199 @@ def check_danger(underlying: float, short_strike: float, danger_pct: float, tick
     return False, "", distance_pct
 
 
+def parse_occ_symbol(symbol: str) -> dict[str, Any] | None:
+    """Parse compact OCC e.g. SPY260605P00585000."""
+    sym = symbol.strip().upper()
+    idx = next((i for i, ch in enumerate(sym) if ch.isdigit()), None)
+    if idx is None or idx < 1:
+        return None
+    underlying = sym[:idx]
+    rest = sym[idx:]
+    if len(rest) < 7:
+        return None
+    exp = rest[:6]
+    opt = rest[6]
+    strike_raw = rest[7:]
+    try:
+        exp_date = datetime.strptime(exp, "%y%m%d").strftime("%Y-%m-%d")
+        strike = int(strike_raw) / 1000.0
+    except ValueError:
+        return None
+    return {
+        "underlying": underlying,
+        "expiration": exp_date,
+        "option_type": "call" if opt == "C" else "put",
+        "strike": strike,
+        "symbol": sym,
+    }
+
+
+def estimate_survival_odds_put_credit(
+    underlying: float,
+    short_strike: float,
+    long_strike: float | None,
+    *,
+    danger_pct: float,
+) -> tuple[float, list[str]]:
+    """
+    Heuristic probability SPY put credit spread expires OTM (keep premium).
+    Uses distance to short strike; flags pin/gamma when inside danger band.
+    """
+    notes: list[str] = []
+    if short_strike <= 0:
+        return 0.5, notes
+
+    pct_above_short = (underlying - short_strike) / short_strike
+    if underlying <= short_strike:
+        survival = max(0.05, 0.25 + pct_above_short * 2)
+        notes.append("Price at/below short put — assignment/exercise risk elevated")
+    elif pct_above_short <= danger_pct:
+        survival = min(0.75, 0.35 + (pct_above_short / danger_pct) * 0.4)
+        notes.append("Inside danger band — 0DTE/dealer pin may accelerate moves")
+    else:
+        survival = min(0.95, 0.72 + pct_above_short * 2)
+
+    if long_strike is not None and underlying <= long_strike:
+        survival = min(survival, 0.15)
+        notes.append("Below long strike — max-loss zone for put credit spread")
+
+    notes.append(
+        "Crowded strikes: other traders' stops may amplify moves near short strike (safety-net exercise)"
+    )
+    return round(max(0.0, min(1.0, survival)), 4), notes
+
+
+def spread_from_put_credit_position(
+    short_pos: dict[str, Any],
+    long_pos: dict[str, Any],
+    *,
+    qty: int,
+    credit: float,
+) -> SpreadPackage:
+    short_meta = parse_occ_symbol(str(short_pos.get("symbol", ""))) or {}
+    long_meta = parse_occ_symbol(str(long_pos.get("symbol", ""))) or {}
+    return SpreadPackage(
+        qty=str(qty),
+        legs=[
+            SpreadLeg(
+                symbol=str(short_pos["symbol"]),
+                side="sell",
+                position_intent="sell_to_open",
+            ),
+            SpreadLeg(
+                symbol=str(long_pos["symbol"]),
+                side="buy",
+                position_intent="buy_to_open",
+            ),
+        ],
+        metadata={
+            "underlying": short_meta.get("underlying", "SPY"),
+            "strategy": "put_credit_spread",
+            "expiration": short_meta.get("expiration"),
+            "short_strike": short_meta.get("strike"),
+            "long_strike": long_meta.get("strike"),
+            "limit_credit": credit,
+        },
+    )
+
+
+def find_put_credit_spreads_in_positions(
+    positions: list[dict[str, Any]],
+    ticker: str,
+    *,
+    short_strike: float | None = None,
+    long_strike: float | None = None,
+    strike_tolerance: float = 0.51,
+) -> list[SpreadPackage]:
+    """Match open put credit spreads from Alpaca option positions."""
+    ticker = ticker.upper()
+    puts: list[dict[str, Any]] = []
+    for p in positions:
+        sym = str(p.get("symbol", ""))
+        meta = parse_occ_symbol(sym)
+        if not meta or meta["underlying"] != ticker or meta["option_type"] != "put":
+            continue
+        try:
+            qty = int(float(p.get("qty", 0)))
+        except (TypeError, ValueError):
+            continue
+        if qty == 0:
+            continue
+        puts.append({**p, "_meta": meta, "_qty": qty})
+
+    shorts = [p for p in puts if p["_qty"] < 0]
+    longs = [p for p in puts if p["_qty"] > 0]
+    spreads: list[SpreadPackage] = []
+
+    for sp in shorts:
+        sm = sp["_meta"]
+        for lp in longs:
+            lm = lp["_meta"]
+            if sm["expiration"] != lm["expiration"]:
+                continue
+            if sm["strike"] <= lm["strike"]:
+                continue
+            if short_strike is not None and abs(sm["strike"] - short_strike) > strike_tolerance:
+                continue
+            if long_strike is not None and abs(lm["strike"] - long_strike) > strike_tolerance:
+                continue
+            qty = min(abs(sp["_qty"]), lp["_qty"])
+            credit = float(sp.get("avg_entry_price") or 0) + float(lp.get("avg_entry_price") or 0)
+            if credit <= 0:
+                credit = 0.35
+            spreads.append(spread_from_put_credit_position(sp, lp, qty=qty, credit=abs(credit)))
+    return spreads
+
+
+async def fetch_alpaca_positions(settings: Settings) -> list[dict[str, Any]]:
+    base = settings.apca_api_base_url.rstrip("/")
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.get(f"{base}/v2/positions", headers=_alpaca_headers(settings))
+    if not r.is_success:
+        logger.warning("Alpaca positions fetch failed: %s", r.text[:200])
+        return []
+    data = r.json()
+    return data if isinstance(data, list) else []
+
+
+async def cancel_alpaca_open_orders_for_symbols(settings: Settings, symbols: set[str]) -> int:
+    """Cancel resting TP/SL before emergency warning close."""
+    base = settings.apca_api_base_url.rstrip("/")
+    canceled = 0
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.get(f"{base}/v2/orders?status=open&limit=100", headers=_alpaca_headers(settings))
+        if not r.is_success:
+            return 0
+        body = r.json()
+        orders = body if isinstance(body, list) else []
+        for order in orders:
+            legs = order.get("legs") or []
+            leg_syms = {str(leg.get("symbol", "")) for leg in legs}
+            if order.get("symbol") in symbols:
+                leg_syms.add(str(order["symbol"]))
+            if not leg_syms.intersection(symbols):
+                continue
+            oid = order.get("id")
+            if not oid:
+                continue
+            cr = await client.delete(f"{base}/v2/orders/{oid}", headers=_alpaca_headers(settings))
+            if cr.is_success:
+                canceled += 1
+    return canceled
+
+
+def resolve_warning_close_debit(
+    spread: SpreadPackage,
+    settings: Settings,
+    *,
+    override_debit: float | None = None,
+) -> float:
+    if override_debit is not None and override_debit > 0:
+        return round(override_debit, 2)
+    credit = float(spread.metadata.get("limit_credit", settings.default_limit_credit))
+    return round(credit * settings.warning_close_multiplier, 2)
+
+
 # ── Notifications ─────────────────────────────────────────────────────────────
 
 
@@ -967,6 +1184,8 @@ async def health() -> dict[str, str]:
         "configured": str(s.configured),
         "api": s.apca_api_base_url if s.use_alpaca else s.tastytrade_api_base_url,
         "dte_filter_default": s.default_dte_filter,
+        "auto_close_on_warning": str(s.auto_close_on_warning),
+        "warning_close_multiplier": str(s.warning_close_multiplier),
         "deploy_file": "main.py (root — NOT app/main.py)",
     }
 
@@ -1123,10 +1342,15 @@ async def warning_endpoint(
     x_webhook_secret: str | None = Header(default=None, alias="X-Webhook-Secret"),
 ) -> WarningResponse:
     """
-    WARNING endpoint — danger zone check + alert only. No orders placed.
-    Use a separate TradingView alert at your risk threshold price.
+    WARNING endpoint — danger zone protocol.
+
+    - Always evaluates survival odds + risk message.
+    - Default: AUTO_CLOSE_ON_WARNING=true submits multi-leg buy-to-close on Alpaca.
+    - Set overrideAutoClose=true in JSON for notify-only (no close).
+    - Set forceAutoClose=true to close even if AUTO_CLOSE_ON_WARNING=false.
     """
     settings = get_settings()
+    dry_run = not settings.is_live
 
     payload = await request.json()
     provided, payload = extract_webhook_secret(payload, x_webhook_secret)
@@ -1141,13 +1365,147 @@ async def warning_endpoint(
         warning.ticker,
     )
 
+    survival, protocol_notes = estimate_survival_odds_put_credit(
+        warning.signal_price,
+        warning.short_strike,
+        warning.long_strike,
+        danger_pct=settings.danger_zone_pct,
+    )
+
     notifications: dict = {}
+    action_taken = "no_danger"
+    close_order: OrderResult | None = None
+    positions_matched = 0
+
     if danger and msg:
-        notifications["warning"] = await notify(settings, "DANGER — Price Near Short Strike", msg, "CRITICAL")
+        notify_body = (
+            f"{msg}\nSurvival odds (expire OTM / keep premium): **{survival * 100:.1f}%**\n"
+            + "\n".join(f"- {n}" for n in protocol_notes)
+        )
+        notifications["warning"] = await notify(
+            settings,
+            "DANGER — Warning Protocol",
+            notify_body,
+            "CRITICAL",
+        )
+
+    if not danger:
+        return WarningResponse(
+            danger_zone=False,
+            risk_warning=None,
+            distance_pct=round(distance * 100, 3),
+            action_taken=action_taken,
+            survival_odds_expire_otm=survival,
+            protocol_notes=protocol_notes,
+            notifications=notifications,
+        )
+
+    if warning.override_auto_close:
+        action_taken = "notify_only_override"
+        await notify(
+            settings,
+            "Warning — Override Active",
+            f"{msg}\nAuto-close SKIPPED (overrideAutoClose=true). Survival odds: {survival * 100:.1f}%",
+            "WARNING",
+        )
+        return WarningResponse(
+            danger_zone=True,
+            risk_warning=msg,
+            distance_pct=round(distance * 100, 3),
+            action_taken=action_taken,
+            survival_odds_expire_otm=survival,
+            protocol_notes=protocol_notes,
+            notifications=notifications,
+        )
+
+    should_close = warning.force_auto_close or settings.auto_close_on_warning
+    if not should_close:
+        action_taken = "notify_only_disabled"
+        return WarningResponse(
+            danger_zone=True,
+            risk_warning=msg,
+            distance_pct=round(distance * 100, 3),
+            action_taken=action_taken,
+            survival_odds_expire_otm=survival,
+            protocol_notes=protocol_notes,
+            notifications=notifications,
+        )
+
+    if not settings.use_alpaca or not settings.alpaca_configured:
+        action_taken = "notify_only_no_broker"
+        return WarningResponse(
+            danger_zone=True,
+            risk_warning=msg,
+            distance_pct=round(distance * 100, 3),
+            action_taken=action_taken,
+            survival_odds_expire_otm=survival,
+            protocol_notes=protocol_notes,
+            notifications=notifications,
+        )
+
+    positions = await fetch_alpaca_positions(settings)
+    spreads = find_put_credit_spreads_in_positions(
+        positions,
+        warning.ticker,
+        short_strike=warning.short_strike,
+        long_strike=warning.long_strike,
+    )
+    positions_matched = len(spreads)
+
+    if not spreads:
+        action_taken = "danger_no_matching_position"
+        await notify(
+            settings,
+            "Warning — No Spread Found",
+            f"{msg}\nNo open put credit spread matched short strike ${warning.short_strike:.2f}.",
+            "WARNING",
+        )
+        return WarningResponse(
+            danger_zone=True,
+            risk_warning=msg,
+            distance_pct=round(distance * 100, 3),
+            action_taken=action_taken,
+            survival_odds_expire_otm=survival,
+            protocol_notes=protocol_notes,
+            positions_matched=0,
+            notifications=notifications,
+        )
+
+    spread = spreads[0]
+    close_debit = resolve_warning_close_debit(spread, settings, override_debit=warning.close_debit)
+    leg_syms = {leg.symbol for leg in spread.legs}
+
+    if settings.warning_cancel_resting_exits and not dry_run:
+        n = await cancel_alpaca_open_orders_for_symbols(settings, leg_syms)
+        if n:
+            protocol_notes.append(f"Canceled {n} resting order(s) on spread legs before emergency close")
+
+    close_payload = build_alpaca_close_payload(spread, close_debit)
+    close_payload["time_in_force"] = "day"
+    close_payload["_meta"] = {
+        "warning_close": True,
+        "close_debit": close_debit,
+        "survival_odds": survival,
+    }
+
+    await notify(
+        settings,
+        "Warning — Auto-Close Submitting",
+        f"{msg}\nClosing spread at ${close_debit:.2f} debit (multi-leg). Survival odds were {survival * 100:.1f}%.",
+        "CRITICAL",
+    )
+
+    close_order = await submit_alpaca_order(settings, close_payload, dry_run=dry_run)
+    action_taken = "auto_close_submitted" if close_order.success else "auto_close_failed"
 
     return WarningResponse(
-        danger_zone=danger,
-        risk_warning=msg or None,
+        danger_zone=True,
+        risk_warning=msg,
         distance_pct=round(distance * 100, 3),
+        action_taken=action_taken,
+        survival_odds_expire_otm=survival,
+        protocol_notes=protocol_notes,
+        close_order=close_order,
+        positions_matched=positions_matched,
         notifications=notifications,
     )

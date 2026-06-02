@@ -30,6 +30,12 @@ services:
         value: "1.5"
       - key: DANGER_ZONE_PCT
         value: "0.01"
+      - key: AUTO_CLOSE_ON_WARNING
+        value: true
+      - key: WARNING_CLOSE_MULTIPLIER
+        value: "1.2"
+      - key: WARNING_CANCEL_RESTING_EXITS
+        value: true
       - key: ALPACA_EXIT_FILL_TIMEOUT
         value: "600"
       - key: ALPACA_EXIT_POLL_SECONDS
