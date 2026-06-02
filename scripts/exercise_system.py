@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-End-to-end system exercise: Render bridge + Alpaca paper + warning path.
-Designed for validation (not profit). Run via Desktop RUN-SYSTEM-EXERCISE.bat.
+Complete system exercise: bridge + Alpaca + entry fill + TP/SL + warning close + undo.
 
-  python exercise_system.py          # full run + auto undo at end
-  python exercise_system.py --undo   # cancel orders + close exercise spreads only
+  python exercise_system.py            # complete test (default)
+  python exercise_system.py --quick    # shorter test (no live close)
+  python exercise_system.py --undo     # cleanup only
 """
 from __future__ import annotations
 
 import argparse
-import json
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -19,6 +19,9 @@ from zoneinfo import ZoneInfo
 import httpx
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from main import find_put_credit_spreads_in_positions, parse_occ_symbol  # noqa: E402
+
 ENV_PATH = ROOT / ".env"
 DESKTOP_REPORT = Path.home() / "Desktop" / "EXERCISE-RESULT.txt"
 ET = ZoneInfo("America/New_York")
@@ -26,6 +29,7 @@ ET = ZoneInfo("America/New_York")
 BRIDGE = "https://spy-options-bridge.onrender.com"
 POLL_SEC = 2
 FILL_WAIT_SEC = 120
+EXIT_WAIT_SEC = 90
 
 
 def load_env() -> dict[str, str]:
@@ -39,10 +43,32 @@ def load_env() -> dict[str, str]:
     return out
 
 
-def log(lines: list[str], msg: str) -> None:
-    line = f"[{datetime.now(tz=ET).strftime('%H:%M:%S')}] {msg}"
-    print(line)
-    lines.append(line)
+class RunLog:
+    def __init__(self) -> None:
+        self.lines: list[str] = []
+        self.pass_n = 0
+        self.fail_n = 0
+        self.warn_n = 0
+
+    def ok(self, msg: str) -> None:
+        self._write(f"PASS {msg}")
+        self.pass_n += 1
+
+    def fail(self, msg: str) -> None:
+        self._write(f"FAIL {msg}")
+        self.fail_n += 1
+
+    def warn(self, msg: str) -> None:
+        self._write(f"WARN {msg}")
+        self.warn_n += 1
+
+    def info(self, msg: str) -> None:
+        self._write(msg)
+
+    def _write(self, msg: str) -> None:
+        line = f"[{datetime.now(tz=ET).strftime('%H:%M:%S')}] {msg}"
+        print(line)
+        self.lines.append(line)
 
 
 def alpaca_headers(env: dict[str, str]) -> dict[str, str]:
@@ -63,11 +89,7 @@ def market_clock(env: dict[str, str]) -> dict:
 
 def latest_spy(env: dict[str, str]) -> float:
     h = alpaca_headers(env)
-    r = httpx.get(
-        "https://data.alpaca.markets/v2/stocks/SPY/trades/latest",
-        headers=h,
-        timeout=20,
-    )
+    r = httpx.get("https://data.alpaca.markets/v2/stocks/SPY/trades/latest", headers=h, timeout=20)
     if r.is_success:
         p = r.json().get("trade", {}).get("p")
         if p:
@@ -84,12 +106,12 @@ def latest_spy(env: dict[str, str]) -> float:
     return 590.0
 
 
-def cancel_open_mleg(env: dict[str, str], lines: list[str]) -> int:
+def cancel_open_mleg(env: dict[str, str], log: RunLog) -> int:
     base = alpaca_base(env)
     h = alpaca_headers(env)
     r = httpx.get(f"{base}/v2/orders", headers=h, params={"status": "open", "nested": True}, timeout=30)
     if not r.is_success:
-        log(lines, f"FAIL cancel list: HTTP {r.status_code}")
+        log.fail(f"cancel list HTTP {r.status_code}")
         return 0
     n = 0
     for o in r.json():
@@ -101,47 +123,50 @@ def cancel_open_mleg(env: dict[str, str], lines: list[str]) -> int:
         cr = httpx.delete(f"{base}/v2/orders/{oid}", headers=h, timeout=30)
         if cr.is_success:
             n += 1
-            log(lines, f"Canceled order {oid[:8]}… limit={o.get('limit_price')}")
+            log.info(f"Canceled order {oid[:8]} limit={o.get('limit_price')}")
     if n == 0:
-        log(lines, "No open multi-leg orders to cancel")
+        log.info("No open multi-leg orders")
     return n
 
 
-def close_spy_put_spreads_via_warning(env: dict[str, str], secret: str, lines: list[str]) -> int:
-    """Emergency close SPY put spreads via /warning (must use danger-zone price)."""
-    base = alpaca_base(env)
-    h = alpaca_headers(env)
-    r = httpx.get(f"{base}/v2/positions", headers=h, timeout=30)
+def count_spy_option_positions(env: dict[str, str]) -> int:
+    r = httpx.get(f"{alpaca_base(env)}/v2/positions", headers=alpaca_headers(env), timeout=30)
     if not r.is_success:
-        log(lines, "FAIL positions fetch")
-        return 0
-    has_spy_option = any(
-        (p.get("symbol") or "").upper().startswith("SPY") and float(p.get("qty") or 0) != 0
-        for p in r.json()
+        return -1
+    n = 0
+    for p in r.json():
+        sym = (p.get("symbol") or "").upper()
+        if sym.startswith("SPY") and float(p.get("qty") or 0) != 0:
+            n += 1
+    return n
+
+
+def strikes_from_order(env: dict[str, str], order_id: str) -> tuple[float, float] | None:
+    r = httpx.get(
+        f"{alpaca_base(env)}/v2/orders/{order_id}",
+        headers=alpaca_headers(env),
+        params={"nested": True},
+        timeout=30,
     )
-    if not has_spy_option:
-        log(lines, "No SPY option positions to close")
-        return 0
-
-    spot = latest_spy(env)
-    short_est = round(spot) - 5
-    danger_price = short_est * 0.999
-    body = {
-        "webhookSecret": secret,
-        "ticker": "SPY",
-        "signalPrice": danger_price,
-        "strikeOffsetShort": -5,
-        "strikeOffsetLong": -6,
-        "overrideAutoClose": False,
-        "forceAutoClose": True,
-    }
-    wr = httpx.post(f"{BRIDGE}/warning", json=body, timeout=90)
-    data = wr.json() if wr.headers.get("content-type", "").startswith("application/json") else {}
-    log(lines, f"Warning close HTTP {wr.status_code} action={data.get('action_taken')} matched={data.get('positions_matched')}")
-    return 1 if wr.is_success and data.get("action_taken", "").startswith(("closed", "submitted")) else 0
+    if not r.is_success:
+        return None
+    shorts: list[float] = []
+    longs: list[float] = []
+    for leg in r.json().get("legs") or []:
+        parsed = parse_occ_symbol(leg.get("symbol") or "")
+        if not parsed or parsed.get("option_type") != "P":
+            continue
+        strike = float(parsed["strike"])
+        if (leg.get("side") or "").lower() == "sell":
+            shorts.append(strike)
+        else:
+            longs.append(strike)
+    if shorts and longs:
+        return max(shorts), min(longs)
+    return None
 
 
-def poll_order(env: dict[str, str], order_id: str, lines: list[str]) -> str:
+def poll_order(env: dict[str, str], order_id: str, log: RunLog) -> str:
     base = alpaca_base(env)
     h = alpaca_headers(env)
     deadline = time.time() + FILL_WAIT_SEC
@@ -150,7 +175,7 @@ def poll_order(env: dict[str, str], order_id: str, lines: list[str]) -> str:
         r = httpx.get(f"{base}/v2/orders/{order_id}", headers=h, timeout=20)
         if r.is_success:
             last = (r.json().get("status") or "").lower()
-            log(lines, f"Order status: {last}")
+            log.info(f"Order status: {last}")
             if last in {"filled", "partially_filled"}:
                 return last
             if last in {"canceled", "expired", "rejected", "failed"}:
@@ -159,32 +184,124 @@ def poll_order(env: dict[str, str], order_id: str, lines: list[str]) -> str:
     return last or "timeout"
 
 
-def run_exercise(env: dict[str, str], lines: list[str]) -> int:
+def wait_exits(env: dict[str, str], log: RunLog) -> int:
+    deadline = time.time() + EXIT_WAIT_SEC
+    while time.time() < deadline:
+        r = httpx.get(
+            f"{alpaca_base(env)}/v2/orders",
+            headers=alpaca_headers(env),
+            params={"status": "open", "nested": True},
+            timeout=30,
+        )
+        if r.is_success:
+            n = len([o for o in r.json() if o.get("order_class") == "mleg"])
+            if n > 0:
+                log.info(f"GTC exit orders open: {n}")
+                return n
+        time.sleep(3)
+    log.warn("No GTC TP/SL seen within wait window (may still be scheduling)")
+    return 0
+
+
+def warning_post(secret: str, body: dict, log: RunLog, label: str) -> dict:
+    wr = httpx.post(f"{BRIDGE}/warning", json={**body, "webhookSecret": secret}, timeout=90)
+    data = wr.json() if "json" in (wr.headers.get("content-type") or "") else {}
+    action = data.get("action_taken", "?")
+    log.info(f"{label}: HTTP {wr.status_code} action={action}")
+    return data
+
+
+def strikes_from_positions(env: dict[str, str]) -> tuple[float, float] | None:
+    r = httpx.get(f"{alpaca_base(env)}/v2/positions", headers=alpaca_headers(env), timeout=30)
+    if not r.is_success:
+        return None
+    spreads = find_put_credit_spreads_in_positions(r.json(), "SPY")
+    if not spreads:
+        return None
+    meta = spreads[0].metadata
+    return float(meta["short_strike"]), float(meta["long_strike"])
+
+
+def close_spread_warning(env: dict[str, str], secret: str, log: RunLog, strikes: tuple[float, float] | None) -> bool:
+    pos_strikes = strikes_from_positions(env)
+    if pos_strikes:
+        short_s, long_s = pos_strikes
+    elif strikes:
+        short_s, long_s = strikes
+    else:
+        spot = latest_spy(env)
+        short_s, long_s = float(round(spot) - 5), float(round(spot) - 6)
+    danger_price = short_s * 0.999
+    data = warning_post(
+        secret,
+        {
+            "ticker": "SPY",
+            "signalPrice": danger_price,
+            "short_strike": short_s,
+            "long_strike": long_s,
+            "overrideAutoClose": False,
+            "forceAutoClose": True,
+        },
+        log,
+        "WARNING auto-close",
+    )
+    action = data.get("action_taken") or ""
+    if action in {"auto_close_submitted", "closed"}:
+        log.ok(f"warning close ({action})")
+        return True
+    if action == "danger_no_matching_position":
+        log.warn("warning close: no matching position (strikes may differ)")
+        return False
+    log.fail(f"warning close ({action})")
+    return False
+
+
+def run_pytest(log: RunLog) -> None:
+    log.info("UNIT TESTS: pytest…")
+    proc = subprocess.run(
+        [str(ROOT / ".venv" / "Scripts" / "python.exe"), "-m", "pytest", "tests/", "-q", "--tb=line"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode == 0:
+        log.ok("pytest")
+    else:
+        log.fail(f"pytest exit {proc.returncode}")
+        for line in (proc.stdout + proc.stderr).splitlines()[-5:]:
+            log.info(line)
+
+
+def run_complete(env: dict[str, str], log: RunLog, *, quick: bool) -> int:
     secret = env.get("WEBHOOK_SECRET", "")
     if not secret:
-        log(lines, "FAIL: WEBHOOK_SECRET missing in .env")
+        log.fail("WEBHOOK_SECRET missing in .env")
         return 1
+
+    run_pytest(log)
 
     clock = market_clock(env)
     if clock:
-        log(lines, f"Market open={clock.get('is_open')} next_open={clock.get('next_open')}")
+        log.info(f"Market open={clock.get('is_open')}")
         if not clock.get("is_open"):
-            log(lines, "WARN: market closed — fills may not happen (exercise still tests webhooks)")
+            log.warn("Market closed — fill/close steps may fail")
 
     hr = httpx.get(f"{BRIDGE}/health", timeout=30)
+    fill_mode = "aggressive"
     if hr.is_success:
-        h = hr.json()
-        log(lines, f"PASS health version={h.get('version')} broker={h.get('broker_label')}")
+        ver = str(hr.json().get("version") or "")
+        if ver >= "5.5.0":
+            fill_mode = "exercise"
+        log.ok(f"health {ver} fillMode={fill_mode}")
     else:
-        log(lines, f"FAIL health HTTP {hr.status_code}")
+        log.fail(f"health HTTP {hr.status_code}")
         return 1
 
-    log(lines, "UNDO: clearing open orders before exercise…")
-    cancel_open_mleg(env, lines)
+    log.info("Cleanup before test…")
+    cancel_open_mleg(env, log)
 
     spot = latest_spy(env)
-    log(lines, f"SPY spot ≈ {spot:.2f}")
-
+    log.info(f"SPY spot ≈ {spot:.2f}")
     entry_body = {
         "webhookSecret": secret,
         "ticker": "SPY",
@@ -194,89 +311,106 @@ def run_exercise(env: dict[str, str], lines: list[str]) -> int:
         "strikeOffsetShort": -5,
         "strikeOffsetLong": -6,
         "quantity": 1,
-        "fillMode": "exercise",
+        "fillMode": fill_mode,
         "limitCredit": 0.55,
     }
-    log(lines, "ENTRY: POST /entry (fillMode=exercise)…")
-    er = httpx.post(f"{BRIDGE}/entry", json=entry_body, timeout=90)
-    if not er.is_success:
-        log(lines, f"FAIL entry HTTP {er.status_code} {er.text[:200]}")
-        return 1
-    entry = er.json()
-    if not entry.get("success"):
-        log(lines, f"FAIL entry: {entry.get('message')}")
-        return 1
-    br = (entry.get("entry") or {}).get("broker_response") or {}
-    oid = br.get("id")
-    limit = (entry.get("entry") or {}).get("payload", {}).get("limit_price")
-    log(lines, f"PASS entry accepted id={oid} limit={limit}")
 
-    fill_status = "skipped"
-    if oid:
-        fill_status = poll_order(env, oid, lines)
-    if fill_status == "filled":
-        log(lines, "PASS entry FILLED")
-        time.sleep(8)
-        ords = httpx.get(
-            f"{alpaca_base(env)}/v2/orders",
-            headers=alpaca_headers(env),
-            params={"status": "open", "nested": True},
-            timeout=30,
-        )
-        if ords.is_success:
-            n = len([o for o in ords.json() if o.get("order_class") == "mleg"])
-            log(lines, f"Open mleg orders after fill (TP/SL may appear): {n}")
-    elif fill_status in {"new", "pending_new", "accepted", "timeout"}:
-        log(lines, f"WARN entry not filled (status={fill_status}) — limit may be off market")
+    bad = httpx.post(f"{BRIDGE}/webhook", json={**entry_body, "webhookSecret": "invalid"}, timeout=30)
+    if bad.status_code == 401:
+        log.ok("/webhook rejects bad secret")
     else:
-        log(lines, f"WARN entry ended: {fill_status}")
+        log.warn(f"/webhook bad-secret HTTP {bad.status_code}")
+
+    time.sleep(1)
+    log.info("ENTRY via /entry (main fill test)…")
+    er = httpx.post(f"{BRIDGE}/entry", json=entry_body, timeout=90)
+    if not er.is_success or not er.json().get("success"):
+        log.fail(f"/entry {er.status_code} {er.text[:300]}")
+        cancel_open_mleg(env, log)
+        close_spread_warning(env, secret, log, None)
+        return 1
+    oid = ((er.json().get("entry") or {}).get("broker_response") or {}).get("id")
+    log.ok(f"/entry accepted id={str(oid)[:8]}")
+
+    fill_status = poll_order(env, str(oid), log) if oid else "skipped"
+    strikes: tuple[float, float] | None = None
+    if fill_status == "filled":
+        log.ok("entry FILLED")
+        strikes = strikes_from_order(env, str(oid))
+        if strikes:
+            log.info(f"Spread strikes short={strikes[0]} long={strikes[1]}")
+        n = wait_exits(env, log)
+        if n > 0:
+            log.ok(f"GTC exits resting ({n} mleg order(s))")
+    else:
+        log.warn(f"entry not filled ({fill_status})")
 
     short_est = round(spot) - 5
-    danger_price = short_est * 0.999
-    warn_notify = {
-        "webhookSecret": secret,
-        "ticker": "SPY",
-        "signalPrice": danger_price,
-        "strikeOffsetShort": -5,
-        "strikeOffsetLong": -6,
-        "overrideAutoClose": True,
-    }
-    log(lines, "WARNING: POST /warning (overrideAutoClose=true, no close)…")
-    wr = httpx.post(f"{BRIDGE}/warning", json=warn_notify, timeout=90)
-    if wr.is_success and wr.json().get("action_taken"):
-        log(lines, f"PASS warning notify action={wr.json().get('action_taken')}")
+    notify_data = warning_post(
+        secret,
+        {
+            "ticker": "SPY",
+            "signalPrice": short_est * 0.999,
+            "strikeOffsetShort": -5,
+            "strikeOffsetLong": -6,
+            "overrideAutoClose": True,
+        },
+        log,
+        "WARNING notify-only",
+    )
+    if notify_data.get("action_taken") == "notify_only_override":
+        log.ok("warning notify-only")
     else:
-        log(lines, f"WARN warning HTTP {wr.status_code}")
+        log.warn(f"warning notify action={notify_data.get('action_taken')}")
 
-    log(lines, "UNDO: auto cleanup (cancel orders + close spreads)…")
-    cancel_open_mleg(env, lines)
-    close_spy_put_spreads_via_warning(env, secret, lines)
-    cancel_open_mleg(env, lines)
+    if not quick and fill_status == "filled":
+        cancel_open_mleg(env, log)
+        time.sleep(2)
+        if count_spy_option_positions(env) > 0:
+            close_spread_warning(env, secret, log, strikes)
+            time.sleep(5)
+            pos = count_spy_option_positions(env)
+            if pos == 0:
+                log.ok("position flat after warning close")
+            else:
+                log.warn(f"still {pos} SPY option leg(s) open")
 
-    log(lines, "DONE — paper account should be flat for exercise artifacts")
-    return 0
+    log.info("Final cleanup…")
+    cancel_open_mleg(env, log)
+    close_spread_warning(env, secret, log, strikes)
+    cancel_open_mleg(env, log)
+    pos = count_spy_option_positions(env)
+    if pos == 0:
+        log.ok("account flat")
+    elif pos > 0:
+        log.warn(f"{pos} SPY option leg(s) remain — run UNDO-EXERCISE.bat")
+
+    log.info(f"SCORE: PASS={log.pass_n} FAIL={log.fail_n} WARN={log.warn_n}")
+    return 0 if log.fail_n == 0 else 1
 
 
-def undo_only(env: dict[str, str], lines: list[str]) -> int:
-    secret = env.get("WEBHOOK_SECRET", "")
-    cancel_open_mleg(env, lines)
-    if secret:
-        close_spy_put_spreads_via_warning(env, secret, lines)
-    cancel_open_mleg(env, lines)
-    log(lines, "UNDO complete")
+def undo_only(env: dict[str, str], log: RunLog) -> int:
+    cancel_open_mleg(env, log)
+    close_spread_warning(env, env.get("WEBHOOK_SECRET", ""), log, None)
+    cancel_open_mleg(env, log)
+    log.ok("undo complete")
     return 0
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="SPY bridge system exercise")
-    parser.add_argument("--undo", action="store_true", help="Only undo (cancel orders, close spreads)")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--undo", action="store_true")
+    parser.add_argument("--quick", action="store_true", help="Skip live warning-close step")
     args = parser.parse_args()
-    lines: list[str] = []
-    log(lines, "=== SPY OPTIONS BRIDGE — SYSTEM EXERCISE ===")
+    log = RunLog()
+    log.info("=== COMPLETE SYSTEM EXERCISE ===")
     env = load_env()
-    code = undo_only(env, lines) if args.undo else run_exercise(env, lines)
-    DESKTOP_REPORT.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    log(lines, f"Report saved: {DESKTOP_REPORT}")
+    code = undo_only(env, log) if args.undo else run_complete(env, log, quick=args.quick)
+    summary = f"\n{'='*40}\nPASS={log.pass_n} FAIL={log.fail_n} WARN={log.warn_n}\n"
+    log.lines.append(summary.strip())
+    print(summary)
+    DESKTOP_REPORT.write_text("\n".join(log.lines) + "\n", encoding="utf-8")
+    log.info(f"Report: {DESKTOP_REPORT}")
     return code
 
 
