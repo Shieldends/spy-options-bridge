@@ -1,0 +1,12 @@
+{
+  "webhookSecret": "my-bridge-secret-2026",
+  "ticker": "SPY",
+  "action": "PUT_CREDIT_SPREAD",
+  "signalPrice": {{close}},
+  "dteFilter": "weekly",
+  "strikeOffsetShort": -5,
+  "strikeOffsetLong": -6,
+  "quantity": 1,
+  "fillMode": "aggressive",
+  "limitCredit": 0.55
+}

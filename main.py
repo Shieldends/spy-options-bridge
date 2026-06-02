@@ -1,5 +1,5 @@
 """
-spy-options-bridge v5.3.0 — ALPACA PAPER (default broker)
+spy-options-bridge v5.4.0 — ALPACA PAPER (default broker)
 
 TradingView webhook → Render → Alpaca multi-leg SPY put credit spreads.
 
@@ -93,6 +93,8 @@ class Settings(BaseSettings):
     default_strike_offset_short: int = Field(default=-5, alias="DEFAULT_STRIKE_OFFSET_SHORT")
     default_strike_offset_long: int = Field(default=-8, alias="DEFAULT_STRIKE_OFFSET_LONG")
     default_limit_credit: float = Field(default=0.35, alias="DEFAULT_LIMIT_CREDIT")
+    default_fill_mode: str = Field(default="fixed", alias="DEFAULT_FILL_MODE")
+    # fixed | auto | aggressive — auto/aggressive quote real credit from Alpaca (better fills on OTM spreads)
     max_quantity: int = Field(default=0, alias="MAX_QUANTITY")
     # 0 = no cap; set e.g. 10 to limit spreads per alert
 
@@ -159,6 +161,7 @@ class TradingViewSignal(BaseModel):
     short_strike: float | None = Field(default=None, alias="short_strike")
     long_strike: float | None = Field(default=None, alias="long_strike")
     limit_credit: float | None = Field(default=None, alias="limitCredit")
+    fill_mode: str | None = Field(default=None, alias="fillMode")
     expiration: str = "0dte"
     dte_filter: str | None = Field(default=None, alias="dteFilter")
     action: str = "enter"
@@ -482,6 +485,143 @@ def snap_call_credit_strikes(short_target: float, long_target: float, available:
         long = min(above_short)
 
     return short, long
+
+
+def _normalize_fill_mode(mode: str | None, settings: Settings) -> str:
+    raw = (mode or settings.default_fill_mode or "fixed").strip().lower()
+    if raw in {"auto", "market", "mid", "quote"}:
+        return "auto"
+    if raw in {"aggressive", "fast", "fill"}:
+        return "aggressive"
+    return "fixed"
+
+
+async def fetch_option_snapshot_quotes(settings: Settings, symbols: list[str]) -> dict[str, dict[str, float]]:
+    """Latest bid/ask per OCC symbol from Alpaca data API."""
+    if not symbols:
+        return {}
+    headers = {
+        "Apca-Api-Key-Id": settings.alpaca_key,
+        "Apca-Api-Secret-Key": settings.alpaca_secret,
+    }
+    params = {"symbols": ",".join(symbols)}
+    url = "https://data.alpaca.markets/v1beta1/options/snapshots"
+    out: dict[str, dict[str, float]] = {}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.get(url, headers=headers, params=params)
+    if not r.is_success:
+        logger.warning("Option snapshot fetch failed (%s): %s", r.status_code, r.text[:300])
+        return out
+
+    body = r.json()
+    snapshots = body.get("snapshots") or body
+    if not isinstance(snapshots, dict):
+        return out
+
+    for sym, snap in snapshots.items():
+        if not isinstance(snap, dict):
+            continue
+        quote = snap.get("latestQuote") or snap.get("latest_quote") or snap
+        bid = quote.get("bid_price") or quote.get("bp") or quote.get("bid")
+        ask = quote.get("ask_price") or quote.get("ap") or quote.get("ask")
+        try:
+            out[sym.upper()] = {
+                "bid": float(bid) if bid is not None else 0.0,
+                "ask": float(ask) if ask is not None else 0.0,
+            }
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def estimate_credit_from_quotes(
+    spread: SpreadPackage,
+    quotes: dict[str, dict[str, float]],
+    *,
+    mode: str,
+    cap: float | None,
+) -> tuple[float, dict[str, Any]]:
+    """
+    Put/call credit spread entry: sell short leg, buy long leg.
+    Natural credit ≈ short_bid - long_ask (aggressive leans lower for faster fill).
+    """
+    short_sym = spread.legs[0].symbol.upper()
+    long_sym = spread.legs[1].symbol.upper()
+    short_q = quotes.get(short_sym, {})
+    long_q = quotes.get(long_sym, {})
+    short_bid = short_q.get("bid", 0.0)
+    long_ask = long_q.get("ask", 0.0)
+
+    meta: dict[str, Any] = {
+        "short_bid": short_bid,
+        "long_ask": long_ask,
+        "fill_mode": mode,
+    }
+
+    if short_bid <= 0 and long_ask <= 0:
+        fallback = cap if cap is not None else 0.35
+        meta["quote_source"] = "fallback_no_quotes"
+        return fallback, meta
+
+    mid_credit = max((short_bid + short_q.get("ask", short_bid)) / 2 - (long_ask + long_q.get("bid", long_ask)) / 2, 0.05)
+    natural = max(short_bid - long_ask, 0.05)
+    if mode == "aggressive":
+        credit = max(natural * 0.97 - 0.01, 0.05)
+        meta["quote_source"] = "bid_ask_aggressive"
+    else:
+        credit = max(min(natural, mid_credit), 0.05)
+        meta["quote_source"] = "bid_ask_auto"
+
+    credit = round(credit, 2)
+    if cap is not None and cap > 0:
+        credit = min(credit, round(cap, 2))
+        meta["cap_applied"] = cap
+
+    return credit, meta
+
+
+async def resolve_entry_limit_credit(
+    settings: Settings,
+    spread: SpreadPackage,
+    signal: TradingViewSignal,
+) -> SpreadPackage:
+    mode = _normalize_fill_mode(signal.fill_mode, settings)
+    requested = signal.limit_credit if signal.limit_credit is not None else settings.default_limit_credit
+    meta = {"fill_mode_resolved": mode, "limit_credit_requested": requested}
+
+    if mode == "fixed" or not settings.use_alpaca:
+        credit = float(requested)
+        meta["limit_credit_final"] = credit
+        return spread_with_credit(
+            SpreadPackage(
+                qty=spread.qty,
+                legs=spread.legs,
+                metadata={**spread.metadata, **meta},
+            ),
+            credit,
+        )
+
+    quotes = await fetch_option_snapshot_quotes(settings, [leg.symbol for leg in spread.legs])
+    cap = float(requested) if requested else None
+    credit, qmeta = estimate_credit_from_quotes(spread, quotes, mode=mode, cap=cap)
+    meta.update(qmeta)
+    meta["limit_credit_final"] = credit
+    logger.info(
+        "Fill mode %s: credit $%s (requested $%s) short_bid=%s long_ask=%s",
+        mode,
+        credit,
+        requested,
+        meta.get("short_bid"),
+        meta.get("long_ask"),
+    )
+    return spread_with_credit(
+        SpreadPackage(
+            qty=spread.qty,
+            legs=spread.legs,
+            metadata={**spread.metadata, **meta},
+        ),
+        credit,
+    )
 
 
 async def align_spread_to_alpaca(settings: Settings, spread: SpreadPackage, signal: TradingViewSignal) -> SpreadPackage:
@@ -1131,7 +1271,7 @@ def coerce_signal(payload: dict, settings: Settings) -> TradingViewSignal:
 
 app = FastAPI(
     title="spy-options-bridge",
-    version="5.3.0",
+    version="5.4.0",
     description="TradingView → Alpaca Paper multi-leg SPY credit spreads + auto GTC exits",
 )
 
@@ -1175,7 +1315,7 @@ async def health() -> dict[str, str]:
     broker_name = "alpaca" if s.use_alpaca else s.broker
     return {
         "status": "ok",
-        "version": "5.3.0",
+        "version": "5.4.0",
         "auto_take_profit": str(s.auto_take_profit),
         "auto_stop_loss": str(s.auto_stop_loss),
         "broker": broker_name,
@@ -1186,6 +1326,7 @@ async def health() -> dict[str, str]:
         "dte_filter_default": s.default_dte_filter,
         "auto_close_on_warning": str(s.auto_close_on_warning),
         "warning_close_multiplier": str(s.warning_close_multiplier),
+        "default_fill_mode": s.default_fill_mode,
         "deploy_file": "main.py (root — NOT app/main.py)",
     }
 
@@ -1231,6 +1372,7 @@ async def entry_endpoint(
         spread = build_spread(signal, settings)
         if settings.use_alpaca:
             spread = await align_spread_to_alpaca(settings, spread, signal)
+            spread = await resolve_entry_limit_credit(settings, spread, signal)
     except (ValidationError, ValueError) as exc:
         logger.warning("Signal rejected: %s", exc)
         return JSONResponse(  # type: ignore[return-value]
