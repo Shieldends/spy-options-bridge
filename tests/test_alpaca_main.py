@@ -12,6 +12,7 @@ from main import (
     snap_put_credit_strikes,
     SpreadLeg,
     SpreadPackage,
+    webhook_auth_error,
 )
 
 
@@ -72,3 +73,10 @@ def test_build_alpaca_close_payload_uses_positive_debit():
     payload = build_alpaca_close_payload(spread, 0.18)
     assert payload["limit_price"] == "0.18"
     assert payload["legs"][0]["position_intent"] == "buy_to_close"
+
+
+def test_webhook_auth_error_messages():
+    assert webhook_auth_error("secret", "secret") is None
+    assert webhook_auth_error(None, "secret") is not None
+    assert "Missing webhookSecret" in webhook_auth_error(None, "secret")
+    assert webhook_auth_error("wrong", "secret") is not None

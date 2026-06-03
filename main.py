@@ -1,5 +1,5 @@
 """
-spy-options-bridge v5.5.0 — ALPACA PAPER (default broker)
+spy-options-bridge v5.5.1 — ALPACA PAPER (default broker)
 
 TradingView webhook → Render → Alpaca multi-leg SPY put credit spreads.
 
@@ -37,7 +37,7 @@ from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
 import httpx
-from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, Header, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -1256,6 +1256,93 @@ async def alpaca_place_exits_after_fill(settings: Settings, spread: SpreadPackag
             logger.error("Alpaca stop-loss rejected: %s", sl.broker_response)
 
 
+def webhook_auth_error(provided: str | None, expected: str) -> str | None:
+    """Return a user-facing error, or None when auth passes."""
+    if not expected:
+        return None
+    if provided == expected:
+        return None
+    if provided is None:
+        return (
+            "Missing webhookSecret in TradingView alert message — paste full JSON from "
+            "templates/tradingview-entry-autofill.json (includes webhookSecret field)"
+        )
+    return "Invalid webhook secret — must match Render env WEBHOOK_SECRET exactly"
+
+
+async def process_entry_alert(settings: Settings, signal: TradingViewSignal) -> None:
+    """Run Alpaca/Tastytrade entry + exit scheduling (TradingView gets an instant 200 first)."""
+    dry_run = not settings.is_live
+    try:
+        spread = build_spread(signal, settings)
+        if settings.use_alpaca:
+            spread = await align_spread_to_alpaca(settings, spread, signal)
+            spread = await resolve_entry_limit_credit(settings, spread, signal)
+
+        expiration = spread.metadata["expiration"]
+
+        if signal.signal_price is not None:
+            danger, risk_msg, _ = check_danger(
+                signal.signal_price,
+                float(spread.metadata["short_strike"]),
+                settings.danger_zone_pct,
+                signal.ticker,
+            )
+            if danger and risk_msg:
+                await notify(settings, "Entry Near Danger Zone", risk_msg, "CRITICAL")
+
+        entry_payload = build_alpaca_entry_payload(spread) if settings.use_alpaca else build_entry_payload(spread)
+        logger.info("Background: submitting %s entry order", "Alpaca mleg" if settings.use_alpaca else "Tastytrade")
+        entry = await submit_order(settings, entry_payload, dry_run=dry_run)
+
+        if entry.success:
+            await notify(
+                settings,
+                "Entry Submitted",
+                f"{signal.ticker} {spread.metadata['strategy']} exp={expiration} credit=${spread.metadata['limit_credit']}",
+                "SUCCESS" if settings.is_live else "INFO",
+            )
+        else:
+            await notify(settings, "Entry Rejected", entry.message, "CRITICAL")
+            return
+
+        if not settings.use_alpaca:
+            if settings.auto_take_profit:
+                tp_payload = build_take_profit_payload(spread, settings.take_profit_pct, settings)
+                take_profit = await submit_order(settings, tp_payload, dry_run=dry_run)
+                if take_profit.success:
+                    meta = tp_payload.get("_meta", {})
+                    await notify(
+                        settings,
+                        "GTC Take-Profit Resting",
+                        f"{signal.ticker} close at ${meta.get('close_debit')} debit — locks ~${meta.get('profit_locked')}",
+                        "SUCCESS",
+                    )
+
+            if settings.auto_stop_loss:
+                sl_payload = build_stop_loss_payload(spread, settings.stop_loss_multiplier, settings)
+                stop_loss = await submit_order(settings, sl_payload, dry_run=dry_run)
+                if stop_loss.success:
+                    meta = sl_payload.get("_meta", {})
+                    await notify(
+                        settings,
+                        "GTC Stop-Loss Resting",
+                        f"{signal.ticker} close at ${meta.get('close_debit')} debit — caps loss ~${meta.get('max_loss_estimate')}",
+                        "SUCCESS",
+                    )
+
+        elif settings.use_alpaca and (settings.auto_take_profit or settings.auto_stop_loss):
+            order_id = (entry.broker_response or {}).get("id")
+            if order_id:
+                asyncio.create_task(alpaca_place_exits_after_fill(settings, spread, str(order_id)))
+                logger.info("Alpaca: scheduled auto GTC exits after fill for order %s", order_id)
+            else:
+                logger.error("Alpaca entry accepted but no order id — cannot schedule auto exits")
+    except Exception as exc:
+        logger.exception("Background entry processing failed: %s", exc)
+        await notify(settings, "Entry Failed", str(exc), "CRITICAL")
+
+
 def coerce_signal(payload: dict, settings: Settings) -> TradingViewSignal:
     merged = {
         "strikeOffsetShort": settings.default_strike_offset_short,
@@ -1277,7 +1364,7 @@ def coerce_signal(payload: dict, settings: Settings) -> TradingViewSignal:
 
 app = FastAPI(
     title="spy-options-bridge",
-    version="5.5.0",
+    version="5.5.1",
     description="TradingView → Alpaca Paper multi-leg SPY credit spreads + auto GTC exits",
 )
 
@@ -1287,7 +1374,7 @@ async def startup_log() -> None:
     s = get_settings()
     broker_label = "Alpaca Paper" if s.use_alpaca else "Tastytrade Cert"
     logger.info(
-        "spy-options-bridge v5.3.0 started | broker=%s (%s) | configured=%s | mode=%s | auto_tp=%s auto_sl=%s",
+        "spy-options-bridge v5.5.1 started | broker=%s (%s) | configured=%s | mode=%s | auto_tp=%s auto_sl=%s",
         s.broker,
         broker_label,
         s.configured,
@@ -1297,11 +1384,6 @@ async def startup_log() -> None:
     )
 
 SECRET_BODY_KEYS = ("webhookSecret", "webhook_secret", "secret")
-
-
-def _auth(provided: str | None, expected: str) -> None:
-    if expected and provided != expected:
-        raise HTTPException(status_code=401, detail="Invalid webhook secret")
 
 
 def extract_webhook_secret(payload: dict[str, Any], header: str | None) -> tuple[str | None, dict[str, Any]]:
@@ -1321,7 +1403,7 @@ async def health() -> dict[str, str]:
     broker_name = "alpaca" if s.use_alpaca else s.broker
     return {
         "status": "ok",
-        "version": "5.5.0",
+        "version": "5.5.1",
         "auto_take_profit": str(s.auto_take_profit),
         "auto_stop_loss": str(s.auto_stop_loss),
         "broker": broker_name,
@@ -1335,6 +1417,12 @@ async def health() -> dict[str, str]:
         "default_fill_mode": s.default_fill_mode,
         "deploy_file": "main.py (root — NOT app/main.py)",
     }
+
+
+@app.get("/ping")
+async def ping() -> dict[str, str]:
+    """Lightweight keep-alive for cron pings (prevents Render free-tier cold starts)."""
+    return {"status": "ok", "version": "5.5.1"}
 
 
 @app.post("/entry", response_model=EntryResponse)
@@ -1365,20 +1453,34 @@ async def entry_endpoint(
             },
         )
 
-    try:
-        provided, payload = extract_webhook_secret(payload, x_webhook_secret)
-        _auth(provided, settings.webhook_secret)
-    except HTTPException:
-        raise
+    if not isinstance(payload, dict):
+        return JSONResponse(  # type: ignore[return-value]
+            status_code=200,
+            content={
+                "success": False,
+                "message": "Alert body must be a JSON object — paste templates/tradingview-entry-autofill.json",
+                "dry_run": dry_run,
+                "notifications": {},
+            },
+        )
 
-    notifications: dict = {}
+    provided, payload = extract_webhook_secret(payload, x_webhook_secret)
+    auth_err = webhook_auth_error(provided, settings.webhook_secret)
+    if auth_err:
+        logger.warning("Webhook auth failed: %s", auth_err)
+        return JSONResponse(  # type: ignore[return-value]
+            status_code=200,
+            content={
+                "success": False,
+                "message": auth_err,
+                "dry_run": dry_run,
+                "notifications": {},
+            },
+        )
 
     try:
         signal = coerce_signal(payload, settings)
-        spread = build_spread(signal, settings)
-        if settings.use_alpaca:
-            spread = await align_spread_to_alpaca(settings, spread, signal)
-            spread = await resolve_entry_limit_credit(settings, spread, signal)
+        build_spread(signal, settings)
     except (ValidationError, ValueError) as exc:
         logger.warning("Signal rejected: %s", exc)
         return JSONResponse(  # type: ignore[return-value]
@@ -1391,97 +1493,18 @@ async def entry_endpoint(
             },
         )
 
-    expiration = spread.metadata["expiration"]
-
-    # Danger check on entry (informational — does not block order)
-    danger = False
-    risk_msg: str | None = None
-    if signal.signal_price is not None:
-        danger, risk_msg, _ = check_danger(
-            signal.signal_price,
-            float(spread.metadata["short_strike"]),
-            settings.danger_zone_pct,
-            signal.ticker,
-        )
-        if danger and risk_msg:
-            notifications["risk"] = await notify(settings, "Entry Near Danger Zone", risk_msg, "CRITICAL")
-
-    entry_payload = build_alpaca_entry_payload(spread) if settings.use_alpaca else build_entry_payload(spread)
-    logger.info("Submitting %s entry order", "Alpaca mleg" if settings.use_alpaca else "Tastytrade")
-    entry = await submit_order(settings, entry_payload, dry_run=dry_run)
-
-    if entry.success:
-        notifications["entry"] = await notify(
-            settings,
-            "Entry Submitted",
-            f"{signal.ticker} {spread.metadata['strategy']} exp={expiration} credit=${spread.metadata['limit_credit']}",
-            "SUCCESS" if settings.is_live else "INFO",
-        )
-
-    take_profit: OrderResult | None = None
-    stop_loss: OrderResult | None = None
-    exits_scheduled = False
-
-    if entry.success and not settings.use_alpaca:
-        # Tastytrade: submit GTC exits immediately (original master plan).
-        if settings.auto_take_profit:
-            tp_payload = build_take_profit_payload(spread, settings.take_profit_pct, settings)
-            take_profit = await submit_order(settings, tp_payload, dry_run=dry_run)
-            if take_profit.success:
-                meta = tp_payload.get("_meta", {})
-                notifications["take_profit"] = await notify(
-                    settings,
-                    "GTC Take-Profit Resting",
-                    f"{signal.ticker} close at ${meta.get('close_debit')} debit — locks ~${meta.get('profit_locked')}",
-                    "SUCCESS",
-                )
-
-        if settings.auto_stop_loss:
-            sl_payload = build_stop_loss_payload(spread, settings.stop_loss_multiplier, settings)
-            stop_loss = await submit_order(settings, sl_payload, dry_run=dry_run)
-            if stop_loss.success:
-                meta = sl_payload.get("_meta", {})
-                notifications["stop_loss"] = await notify(
-                    settings,
-                    "GTC Stop-Loss Resting",
-                    f"{signal.ticker} close at ${meta.get('close_debit')} debit — caps loss ~${meta.get('max_loss_estimate')}",
-                    "SUCCESS",
-                )
-
-    elif entry.success and settings.use_alpaca and (settings.auto_take_profit or settings.auto_stop_loss):
-        # Alpaca: must wait for entry fill before buy_to_close — schedule background GTC exits.
-        order_id = (entry.broker_response or {}).get("id")
-        if order_id:
-            background_tasks.add_task(alpaca_place_exits_after_fill, settings, spread, str(order_id))
-            exits_scheduled = True
-            logger.info("Alpaca: scheduled auto GTC exits after fill for order %s", order_id)
-        else:
-            logger.error("Alpaca entry accepted but no order id — cannot schedule auto exits")
-
-    msg = entry.message
-    if take_profit and take_profit.success:
-        msg += " | GTC take-profit submitted"
-    if stop_loss and stop_loss.success:
-        msg += " | GTC stop-loss submitted"
-    if exits_scheduled:
-        msg += " | GTC take-profit/stop-loss will auto-submit after entry fills"
-
-    result = EntryResponse(
-        success=entry.success,
-        message=msg,
-        dry_run=dry_run,
-        expiration_resolved=expiration,
-        danger_zone=danger,
-        risk_warning=risk_msg,
-        entry=entry,
-        take_profit=take_profit,
-        stop_loss=stop_loss,
-        notifications=notifications,
+    background_tasks.add_task(process_entry_alert, settings, signal)
+    logger.info("Queued background entry for %s qty=%s", signal.ticker, signal.quantity)
+    return JSONResponse(  # type: ignore[return-value]
+        status_code=200,
+        content={
+            "success": True,
+            "message": f"Alert accepted — processing {signal.ticker} order in background",
+            "dry_run": dry_run,
+            "processing": True,
+            "notifications": {},
+        },
     )
-    # Return 200 so TradingView marks webhook delivered (broker errors stay in JSON body).
-    if not entry.success:
-        return JSONResponse(status_code=200, content=result.model_dump())  # type: ignore[return-value]
-    return result
 
 
 @app.post("/warning", response_model=WarningResponse)
@@ -1500,9 +1523,44 @@ async def warning_endpoint(
     settings = get_settings()
     dry_run = not settings.is_live
 
-    payload = await request.json()
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        logger.warning("Invalid warning webhook JSON: %s", exc)
+        return JSONResponse(  # type: ignore[return-value]
+            status_code=200,
+            content={
+                "danger_zone": False,
+                "action_taken": "invalid_json",
+                "risk_warning": f"Invalid JSON body: {exc}",
+                "notifications": {},
+            },
+        )
+
+    if not isinstance(payload, dict):
+        return JSONResponse(  # type: ignore[return-value]
+            status_code=200,
+            content={
+                "danger_zone": False,
+                "action_taken": "invalid_payload",
+                "risk_warning": "Alert body must be a JSON object",
+                "notifications": {},
+            },
+        )
+
     provided, payload = extract_webhook_secret(payload, x_webhook_secret)
-    _auth(provided, settings.webhook_secret)
+    auth_err = webhook_auth_error(provided, settings.webhook_secret)
+    if auth_err:
+        logger.warning("Warning webhook auth failed: %s", auth_err)
+        return JSONResponse(  # type: ignore[return-value]
+            status_code=200,
+            content={
+                "danger_zone": False,
+                "action_taken": "auth_failed",
+                "risk_warning": auth_err,
+                "notifications": {},
+            },
+        )
 
     warning = WarningSignal.model_validate(payload)
 
