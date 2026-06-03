@@ -121,7 +121,13 @@ def poll_mleg_fill(env: dict[str, str], order_id: str | None, timeout_sec: float
     return False, f"timeout (last status={last_status}); market may be closed"
 
 
-def run_once(base_url: str, env: dict[str, str], *, test_warning: bool) -> int:
+def run_once(
+    base_url: str,
+    env: dict[str, str],
+    *,
+    test_warning: bool,
+    fill_timeout: float = FILL_TIMEOUT_SEC,
+) -> int:
     secret = env.get("WEBHOOK_SECRET", "")
     if not secret:
         print("FAIL: WEBHOOK_SECRET missing in .env")
@@ -141,8 +147,8 @@ def run_once(base_url: str, env: dict[str, str], *, test_warning: bool) -> int:
     health = hr.json()
     ver = health.get("version", "?")
     print(f"health version={ver} configured={health.get('configured')} paper_force={health.get('paper_force_min_fill')}")
-    if ver < "5.5.4":
-        print(f"WARN: expected version >= 5.5.4 (got {ver}) — deploy Render after push")
+    if str(ver) < "5.5.3":
+        print(f"WARN: expected version >= 5.5.3 (got {ver}) — deploy Render after push")
 
     body = {
         "webhookSecret": secret,
@@ -154,19 +160,34 @@ def run_once(base_url: str, env: dict[str, str], *, test_warning: bool) -> int:
         "strikeOffsetLong": -6,
         "quantity": 1,
         "fillMode": "exercise",
+        "limitCredit": 0.55,
     }
-    print(f"POST {base_url}/exercise/entry …")
-    er = httpx.post(f"{base_url}/exercise/entry", json=body, timeout=120)
-    data = er.json()
+    entry_paths = ["/entry", "/exercise/entry"]
+    er = None
+    data: dict = {}
+    for path in entry_paths:
+        print(f"POST {base_url}{path} …")
+        er = httpx.post(f"{base_url}{path}", json=body, timeout=120)
+        if er.status_code == 404 and path != entry_paths[-1]:
+            print(f"  HTTP 404 on {path} — trying next endpoint")
+            continue
+        try:
+            data = er.json()
+        except Exception:
+            data = {}
+        break
+    if er is None:
+        print("FAIL: no entry response")
+        return 1
     print(f"  HTTP {er.status_code} success={data.get('success')} msg={data.get('message')}")
-    order_id = data.get("order_id")
+    order_id = data.get("order_id") or data.get("orderId")
     if order_id:
         print(f"  order_id={order_id}")
     if not data.get("success"):
         print("FAIL: exercise entry rejected")
         fails += 1
     else:
-        ok, msg = poll_mleg_fill(env, str(order_id) if order_id else None, FILL_TIMEOUT_SEC)
+        ok, msg = poll_mleg_fill(env, str(order_id) if order_id else None, fill_timeout)
         if ok:
             print(f"PASS entry fill: {msg}")
         else:
@@ -208,8 +229,7 @@ def main() -> int:
     parser.add_argument("--local", action="store_true", help="Use http://127.0.0.1:8000")
     parser.add_argument("--timeout", type=float, default=FILL_TIMEOUT_SEC, help="Fill poll seconds")
     args = parser.parse_args()
-    global FILL_TIMEOUT_SEC
-    FILL_TIMEOUT_SEC = args.timeout
+    fill_timeout = args.timeout
 
     env = load_env()
     base = "http://127.0.0.1:8000" if args.local else RENDER
@@ -219,7 +239,7 @@ def main() -> int:
     for i in range(args.repeat):
         if args.repeat > 1:
             print(f"\n=== Run {i + 1}/{args.repeat} ===")
-        total_fail += run_once(base, env, test_warning=test_warning)
+        total_fail += run_once(base, env, test_warning=test_warning, fill_timeout=fill_timeout)
         if i + 1 < args.repeat:
             time.sleep(5)
 

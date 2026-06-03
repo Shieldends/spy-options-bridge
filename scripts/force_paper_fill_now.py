@@ -37,18 +37,25 @@ def main() -> int:
         print("WEBHOOK_SECRET missing in .env")
         return 1
 
-    # Live SPY price from Alpaca
     signal_price = 590.0
     if key and sec:
         h = {"Apca-Api-Key-Id": key, "Apca-Api-Secret-Key": sec}
-        try:
-            q = httpx.get(f"{base}/v2/stocks/SPY/quotes/latest", headers=h, timeout=20)
-            if q.is_success:
-                ap = q.json().get("quote", {}).get("ap")
-                if ap:
-                    signal_price = float(ap)
-        except Exception as exc:
-            print("quote fallback:", exc)
+        for url in (
+            f"{base}/v2/stocks/SPY/quotes/latest",
+            "https://data.alpaca.markets/v2/stocks/SPY/trades/latest",
+        ):
+            try:
+                r = httpx.get(url, headers=h, timeout=20)
+                if not r.is_success:
+                    continue
+                j = r.json()
+                p = j.get("quote", {}).get("ap") or j.get("trade", {}).get("p")
+                if p:
+                    signal_price = float(p)
+                    break
+            except Exception as exc:
+                print("quote fallback:", exc)
+    print(f"signalPrice={signal_price:.2f}")
 
     body = {
         "webhookSecret": secret,

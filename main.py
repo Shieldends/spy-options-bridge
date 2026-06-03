@@ -1,5 +1,5 @@
 """
-spy-options-bridge v5.5.4 — ALPACA PAPER (default broker)
+spy-options-bridge v5.5.5 — ALPACA PAPER (default broker)
 
 TradingView webhook → Render → Alpaca multi-leg SPY put credit spreads.
 
@@ -86,8 +86,8 @@ class Settings(BaseSettings):
     auto_chase_entry_fill: bool = Field(default=True, alias="AUTO_CHASE_ENTRY_FILL")
     entry_chase_wait_seconds: float = Field(default=2.0, alias="ENTRY_CHASE_WAIT_SECONDS")
     entry_chase_poll_seconds: float = Field(default=1.5, alias="ENTRY_CHASE_POLL_SECONDS")
-    entry_chase_max_attempts: int = Field(default=15, alias="ENTRY_CHASE_MAX_ATTEMPTS")
-    entry_chase_floor_extra_polls: int = Field(default=8, alias="ENTRY_CHASE_FLOOR_EXTRA_POLLS")
+    entry_chase_max_attempts: int = Field(default=20, alias="ENTRY_CHASE_MAX_ATTEMPTS")
+    entry_chase_floor_extra_polls: int = Field(default=12, alias="ENTRY_CHASE_FLOOR_EXTRA_POLLS")
     entry_min_credit: float = Field(default=0.05, alias="ENTRY_MIN_CREDIT")
     paper_force_min_fill: bool = Field(default=True, alias="PAPER_FORCE_MIN_FILL")
 
@@ -1526,7 +1526,7 @@ def coerce_signal(payload: dict, settings: Settings) -> TradingViewSignal:
 
 app = FastAPI(
     title="spy-options-bridge",
-    version="5.5.4",
+    version="5.5.5",
     description="TradingView → Alpaca Paper multi-leg SPY credit spreads + auto GTC exits",
 )
 
@@ -1536,7 +1536,7 @@ async def startup_log() -> None:
     s = get_settings()
     broker_label = "Alpaca Paper" if s.use_alpaca else "Tastytrade Cert"
     logger.info(
-        "spy-options-bridge v5.5.4 started | broker=%s (%s) | configured=%s | mode=%s | auto_tp=%s auto_sl=%s chase=%s paper_force=%s",
+        "spy-options-bridge v5.5.5 started | broker=%s (%s) | configured=%s | mode=%s | auto_tp=%s auto_sl=%s chase=%s paper_force=%s",
         s.broker,
         broker_label,
         s.configured,
@@ -1567,7 +1567,7 @@ async def health() -> dict[str, str]:
     broker_name = "alpaca" if s.use_alpaca else s.broker
     return {
         "status": "ok",
-        "version": "5.5.4",
+        "version": "5.5.5",
         "auto_take_profit": str(s.auto_take_profit),
         "auto_stop_loss": str(s.auto_stop_loss),
         "broker": broker_name,
@@ -1591,7 +1591,7 @@ async def health() -> dict[str, str]:
 @app.get("/ping")
 async def ping() -> dict[str, str]:
     """Lightweight keep-alive for cron pings (prevents Render free-tier cold starts)."""
-    return {"status": "ok", "version": "5.5.4"}
+    return {"status": "ok", "version": "5.5.5"}
 
 
 @app.post("/exercise/entry")
