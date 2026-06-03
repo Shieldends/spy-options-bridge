@@ -98,26 +98,36 @@ def run_one_cycle(*, fast: bool = True) -> tuple[int, int]:
                     pass
     if proc.returncode != 0 and fail_n == 0:
         fail_n = 1
-    return pass_n, fail_n
+    return pass_n, fail_n, summary
 
 
-def email_on_fail(pass_n: int, fail_n: int) -> None:
-    if fail_n == 0:
-        return
+def _team_email():
     _load_dotenv()
     sys.path.insert(0, str(ROOT))
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from team_email import notify_health_fail  # noqa: E402
-
-    ts = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
-    detail = (
-        f"Redundant test FAIL at {ts}. PASS={pass_n} FAIL={fail_n}. "
-        f"Log: {LOG_PATH}. Results: PRE-OPEN-TEST-RESULTS.txt on Desktop."
+    from team_email import (  # noqa: E402
+        notify_health_fail,
+        notify_redundant_cycle,
+        try_email_final_report_available,
     )
-    if notify_health_fail(detail):
-        log_line("FAIL email sent to EMAIL_TO")
+
+    return notify_redundant_cycle, notify_health_fail, try_email_final_report_available
+
+
+def email_cycle_summary(cycle: int, pass_n: int, fail_n: int, summary: str) -> None:
+    notify_redundant_cycle, notify_health_fail, try_email_final = _team_email()
+    if notify_redundant_cycle(cycle, pass_n, fail_n, summary):
+        log_line("Cycle summary email sent")
     else:
-        log_line("FAIL email skipped (SMTP not configured)")
+        log_line("Cycle summary email skipped (rate limit or SMTP)")
+    if fail_n > 0:
+        ts = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
+        detail = f"Redundant test FAIL at {ts}. PASS={pass_n} FAIL={fail_n}. {summary}"
+        if notify_health_fail(detail):
+            log_line("FAIL alert email sent")
+        else:
+            log_line("FAIL alert email skipped (SMTP not configured)")
+    try_email_final()
 
 
 def main() -> int:
@@ -142,9 +152,8 @@ def main() -> int:
 
             cycle += 1
             log_line(f"--- cycle {cycle} begin ---")
-            pass_n, fail_n = run_one_cycle(fast=True)
-            if fail_n > 0:
-                email_on_fail(pass_n, fail_n)
+            pass_n, fail_n, summary = run_one_cycle(fast=True)
+            email_cycle_summary(cycle, pass_n, fail_n, summary)
 
             if args.once:
                 break

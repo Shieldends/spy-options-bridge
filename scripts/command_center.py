@@ -217,6 +217,16 @@ def main() -> int:
         "auto-run: dual_sync (60s) + bridge_keepalive + redundant_test_loop "
         "until 9:30 ET or STOP file"
     )
+    try:
+        sys.path.insert(0, str(SCRIPTS))
+        from team_email import notify_command_center_started  # noqa: E402
+
+        if notify_command_center_started():
+            log_line("startup email sent")
+        else:
+            log_line("startup email skipped (SMTP not configured)")
+    except Exception as exc:
+        log_line(f"startup email error: {type(exc).__name__}")
 
     try:
         supervise_loop(procs)

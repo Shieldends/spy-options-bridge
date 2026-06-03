@@ -72,7 +72,7 @@ def main() -> int:
             f"URL: {HEALTH_URL}\n\n"
             f"TradingView → Render → Alpaca runs without your PC when Render is up."
         )
-        sent = send_status(body, headline=f"Bridge ready {ver}")
+        sent = send_status(f"Bridge ready {ver}", body)
         print("daily-ready email sent" if sent else "email disabled or failed (see logs)")
         return 0
 

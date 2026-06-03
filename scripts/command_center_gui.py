@@ -105,6 +105,7 @@ class CommandCenterApp(tk.Tk):
             ("WHAT'S LEFT?", self._whats_left),
             ("OPTIONAL: Setup Email", self._setup_email_dialog),
             ("SEND TEST + PERMISSION SAMPLE", self._test_permission_email),
+            ("EMAIL ME LATEST REPORT", self._email_latest_report),
             ("OPEN REPORTS", self._open_reports),
             ("OPEN GROK SYNC", self._open_grok_sync),
             ("THURSDAY BURST (9:31 ET)", self._thursday_burst),
@@ -210,6 +211,7 @@ class CommandCenterApp(tk.Tk):
         self._set_status("START TEAM — 3 workers spawned")
         self._update_live_banner()
         self._start_health_loop()
+        self._email_team_started()
         messagebox.showinfo(
             TITLE,
             "Team started:\n• dual_sync_loop (60s)\n• bridge_keepalive\n• redundant_test_loop (5 min)\n\n"
@@ -283,6 +285,39 @@ class CommandCenterApp(tk.Tk):
             )
 
         ttk.Button(dlg, text="Save", command=save).pack(pady=12)
+
+    def _email_team_started(self) -> None:
+        cc._load_dotenv()
+        sys.path.insert(0, str(SCRIPTS))
+        import team_email as te  # noqa: E402
+
+        def run() -> None:
+            ok = te.notify_command_center_started()
+            msg = "Startup email sent" if ok else "Startup email skipped (setup SMTP first)"
+            self.after(0, lambda: self._set_status(msg))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _email_latest_report(self) -> None:
+        self._set_status("Emailing LIVE-RUN + FINAL audit…")
+        cc._load_dotenv()
+        sys.path.insert(0, str(SCRIPTS))
+        import team_email as te  # noqa: E402
+
+        def run() -> None:
+            ok = te.send_latest_reports_email()
+            msg = (
+                f"Report email sent — check {USER_EMAIL}"
+                if ok
+                else "Report email failed — run OPTIONAL Setup Email first."
+            )
+            self.after(0, lambda: self._set_status(msg))
+            if ok:
+                self.after(0, lambda: messagebox.showinfo(TITLE, msg))
+            else:
+                self.after(0, lambda: messagebox.showwarning(TITLE, msg))
+
+        threading.Thread(target=run, daemon=True).start()
 
     def _test_permission_email(self) -> None:
         self._set_status("Sending test + permission sample…")
