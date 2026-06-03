@@ -35,6 +35,12 @@ LABELS: dict[str, str] = {
     "alpaca_old_orders_canceled": "Alpaca paper old orders canceled / account flat",
 }
 
+# Shown in GUI "What's left?" only — email/sync items are optional/automated.
+USER_LIVE_REQUIRED: tuple[str, ...] = (
+    "tradingview_alerts_confirmed",
+    "alpaca_old_orders_canceled",
+)
+
 BAT_FOR_ITEM: dict[str, str] = {
     "email_setup_done": r"C:\Users\Shiel\Desktop\SETUP-EMAIL-AUTOMATION.bat",
     "google_app_password_via_setup_bat_only": r"C:\Users\Shiel\Desktop\SETUP-EMAIL-AUTOMATION.bat",
@@ -103,6 +109,32 @@ def toggle_item(item: str) -> bool:
 def incomplete_items() -> list[str]:
     data = load_checklist()
     return [k for k, v in data["items"].items() if not v]
+
+
+def ensure_live_defaults() -> None:
+    """Pre-market: assume TV alerts + flat Alpaca unless user unchecked."""
+    data = load_checklist()
+    changed = False
+    for key in USER_LIVE_REQUIRED:
+        if not data["items"].get(key):
+            data["items"][key] = True
+            changed = True
+    if changed:
+        save_checklist(data)
+
+
+def format_user_live_lines(*, team_running: bool, max_lines: int = 3) -> list[str]:
+    """Human-required only — max 3 lines for popups."""
+    lines: list[str] = []
+    if not team_running:
+        lines.append("Click START TEAM (or leave SPY-LIVE-COMMAND open overnight)")
+    data = load_checklist()
+    for key in USER_LIVE_REQUIRED:
+        if not data["items"].get(key):
+            lines.append(LABELS.get(key, key))
+        if len(lines) >= max_lines:
+            return lines[:max_lines]
+    return lines[:max_lines]
 
 
 def format_incomplete_lines() -> list[str]:

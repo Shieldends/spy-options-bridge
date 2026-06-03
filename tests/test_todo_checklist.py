@@ -73,6 +73,24 @@ def test_set_item_false(checklist_file):
     assert load_checklist()["items"]["dual_sync_running"] is False
 
 
+def test_format_user_live_lines_team_off(checklist_file):
+    lines = tc.format_user_live_lines(team_running=False)
+    assert len(lines) <= 3
+    assert any("START TEAM" in line for line in lines)
+
+
+def test_format_user_live_lines_team_on(checklist_file):
+    lines = tc.format_user_live_lines(team_running=True)
+    assert lines == []
+
+
+def test_ensure_live_defaults(checklist_file):
+    set_item("tradingview_alerts_confirmed", False)
+    tc.ensure_live_defaults()
+    data = load_checklist()
+    assert data["items"]["tradingview_alerts_confirmed"] is True
+
+
 def test_before_market_open_weekday_morning():
     et = ZoneInfo("America/New_York")
     morning = datetime(2026, 6, 4, 8, 0, tzinfo=et)

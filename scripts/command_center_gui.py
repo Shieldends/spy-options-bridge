@@ -51,10 +51,13 @@ class CommandCenterApp(tk.Tk):
         self._health_thread: threading.Thread | None = None
         self._check_vars: dict[str, tk.BooleanVar] = {}
         self._status_var = tk.StringVar(value="Ready — click RENDER STATUS or START TEAM")
+        self._live_banner_var = tk.StringVar(value="LIVE RUN: checking…")
 
+        tc.ensure_live_defaults()
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(500, self._refresh_checklist_ui)
+        self.after(600, self._update_live_banner)
 
     def _build_ui(self) -> None:
         notebook = ttk.Notebook(self)
@@ -67,10 +70,19 @@ class CommandCenterApp(tk.Tk):
         notebook.add(checklist, text="Checklist")
         notebook.add(help_tab, text="Help")
 
+        tk.Label(
+            main,
+            textvariable=self._live_banner_var,
+            font=("Segoe UI", 16, "bold"),
+            fg="#0a5",
+            wraplength=520,
+            justify=tk.CENTER,
+        ).grid(row=0, column=0, columnspan=2, pady=(0, 10), sticky="ew")
+
         buttons: list[tuple[str, callable]] = [
             ("START TEAM", self._start_team),
             ("WHAT'S LEFT?", self._whats_left),
-            ("SETUP EMAIL", self._setup_email_dialog),
+            ("OPTIONAL: Setup Email", self._setup_email_dialog),
             ("TEST EMAIL", self._test_email),
             ("OPEN REPORTS", self._open_reports),
             ("OPEN GROK SYNC", self._open_grok_sync),
@@ -79,7 +91,7 @@ class CommandCenterApp(tk.Tk):
             ("RENDER STATUS", self._render_status),
         ]
         for idx, (label, cmd) in enumerate(buttons):
-            row, col = divmod(idx, 2)
+            row, col = divmod(idx + 1, 2)
             ttk.Button(main, text=label, command=cmd, width=22).grid(
                 row=row, column=col, padx=6, pady=6, sticky="ew"
             )
@@ -139,10 +151,21 @@ class CommandCenterApp(tk.Tk):
         ts = datetime.now(ET).strftime("%H:%M:%S ET")
         self._status_var.set(f"{ts} | {msg}")
 
+    def _team_running(self) -> bool:
+        return bool(self.procs) and any(p.poll() is None for p in self.procs.values())
+
+    def _update_live_banner(self) -> None:
+        if self._team_running():
+            self._live_banner_var.set("LIVE RUN: READY")
+        else:
+            self._live_banner_var.set("NEEDS: click START TEAM")
+
     def _refresh_checklist_ui(self) -> None:
+        tc.ensure_live_defaults()
         data = tc.load_checklist()
         for key, var in self._check_vars.items():
             var.set(bool(data["items"].get(key, False)))
+        self._update_live_banner()
 
     def _on_check_toggle(self, key: str) -> None:
         done = self._check_vars[key].get()
@@ -157,6 +180,7 @@ class CommandCenterApp(tk.Tk):
         cc.mark_todo_items()
         self.procs = cc.spawn_all_workers()
         self._set_status("START TEAM — 3 workers spawned")
+        self._update_live_banner()
         self._start_health_loop()
         messagebox.showinfo(
             TITLE,
@@ -179,14 +203,17 @@ class CommandCenterApp(tk.Tk):
         self._health_thread.start()
 
     def _whats_left(self) -> None:
-        txt_path = tc.CHECKLIST_PATH.with_suffix(".txt")
-        tc.write_human_summary(txt_path)
-        cc.open_notepad(tc.CHECKLIST_PATH.with_suffix(".txt"))
-        lines = tc.format_incomplete_lines()
+        before_path = DESKTOP / "BEFORE-MARKET-OPEN.txt"
+        if before_path.exists():
+            cc.open_notepad(before_path)
+        lines = tc.format_user_live_lines(team_running=self._team_running())
         if lines:
-            body = "Still open:\n\n" + "\n".join(lines)
+            body = "You need (max 3):\n\n" + "\n".join(f"• {line}" for line in lines)
         else:
-            body = "All checklist items are done."
+            body = (
+                "Nothing required.\n\n"
+                "Live at 9:30 with zero clicks if this window stayed open after START TEAM."
+            )
         messagebox.showinfo("What's left?", body)
 
     def _setup_email_dialog(self) -> None:
@@ -305,6 +332,7 @@ class CommandCenterApp(tk.Tk):
             cc.kill_worker(proc)
             cc.log_line(f"gui stopped: {name}")
         self.procs.clear()
+        self._update_live_banner()
         self._set_status("STOP ALL — workers killed, STOP file created")
         if not quiet:
             messagebox.showinfo(
