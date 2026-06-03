@@ -7,7 +7,7 @@ Paper fill burst — prove TV→Bridge→Alpaca execution chain.
   python scripts/burst_paper_fills.py --count 5 --local
 
 Logs each attempt: order_id, status, filled yes/no.
-Uses /exercise/entry (sync chase, min $0.05 credit, cancel stale).
+Uses /exercise/entry (sync chase, min $0.01 credit, cancel stale).
 """
 from __future__ import annotations
 
