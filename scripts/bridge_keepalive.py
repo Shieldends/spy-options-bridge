@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
-"""Ping Render /ping every 5 minutes during 9:00–16:00 ET (paper bridge warm)."""
+"""Ping Render /ping every 5 minutes during 8:00–17:00 ET (paper bridge warm)."""
 from __future__ import annotations
 
 import sys
 import time
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import httpx
 
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from email_alerts import send_email_alert  # noqa: E402
+
 RENDER_PING = "https://spy-options-bridge.onrender.com/ping"
 INTERVAL_SEC = 300
+FAIL_EMAIL_THRESHOLD = 3
 ET = ZoneInfo("America/New_York")
 
 
@@ -18,7 +25,7 @@ def in_market_hours() -> bool:
     now = datetime.now(ET)
     if now.weekday() >= 5:
         return False
-    return 9 <= now.hour < 16
+    return 8 <= now.hour < 17
 
 
 def ping_once() -> bool:
@@ -36,15 +43,29 @@ def ping_once() -> bool:
 
 
 def main() -> int:
-    print("bridge_keepalive: /ping every 5 min, active 9:00–16:00 ET Mon–Fri")
+    print("bridge_keepalive: /ping every 5 min, active 8:00–17:00 ET Mon–Fri")
     print(f"target={RENDER_PING}")
+    consecutive_fails = 0
     while True:
         if in_market_hours():
-            ping_once()
+            if ping_once():
+                consecutive_fails = 0
+            else:
+                consecutive_fails += 1
+                if consecutive_fails >= FAIL_EMAIL_THRESHOLD:
+                    ts = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
+                    send_email_alert(
+                        "SPY Bridge keepalive — 3 ping failures",
+                        f"Render /ping failed {consecutive_fails} times in a row.\n"
+                        f"Time: {ts}\nURL: {RENDER_PING}\n"
+                        f"Check Render dashboard or wait for cold-start recovery.",
+                    )
+                    consecutive_fails = 0
             time.sleep(INTERVAL_SEC)
         else:
+            consecutive_fails = 0
             ts = datetime.now(ET).strftime("%H:%M:%S ET")
-            print(f"{ts} outside 9–16 ET — sleep 60s")
+            print(f"{ts} outside 8–17 ET — sleep 60s")
             time.sleep(60)
 
 

@@ -1,5 +1,5 @@
 """
-spy-options-bridge v5.5.6 — ALPACA PAPER (default broker)
+spy-options-bridge v5.5.8 — ALPACA PAPER (default broker)
 
 TradingView webhook → Render → Alpaca multi-leg SPY put credit spreads.
 
@@ -39,6 +39,7 @@ from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
 import httpx
+from email_alerts import send_email_alert
 from fastapi import BackgroundTasks, FastAPI, Header, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
@@ -97,6 +98,14 @@ class Settings(BaseSettings):
     telegram_bot_token: str = Field(default="", alias="TELEGRAM_BOT_TOKEN")
     telegram_chat_id: str = Field(default="", alias="TELEGRAM_CHAT_ID")
 
+    email_enabled: bool = Field(default=False, alias="EMAIL_ENABLED")
+    smtp_host: str = Field(default="", alias="SMTP_HOST")
+    smtp_port: int = Field(default=587, alias="SMTP_PORT")
+    smtp_user: str = Field(default="", alias="SMTP_USER")
+    smtp_password: str = Field(default="", alias="SMTP_PASSWORD")
+    email_from: str = Field(default="", alias="EMAIL_FROM")
+    email_to: str = Field(default="shieldinc850@gmail.com", alias="EMAIL_TO")
+
     default_underlying: str = Field(default="SPY", alias="DEFAULT_UNDERLYING")
     default_quantity: int = Field(default=1, alias="DEFAULT_QUANTITY")
     default_strike_offset_short: int = Field(default=-5, alias="DEFAULT_STRIKE_OFFSET_SHORT")
@@ -149,6 +158,12 @@ class Settings(BaseSettings):
     @property
     def telegram_configured(self) -> bool:
         return bool(self.telegram_bot_token and self.telegram_chat_id)
+
+    @property
+    def email_configured(self) -> bool:
+        return bool(
+            self.email_enabled and self.smtp_host and self.email_from and self.email_to
+        )
 
 
 @lru_cache
@@ -1055,12 +1070,41 @@ def resolve_warning_close_debit(
 # ── Notifications ─────────────────────────────────────────────────────────────
 
 
-async def notify(settings: Settings, title: str, body: str, level: str = "INFO") -> dict:
+_EMAIL_SKIP_TITLES = frozenset({"Chasing Entry Fill"})
+
+
+async def notify(
+    settings: Settings,
+    title: str,
+    body: str,
+    level: str = "INFO",
+    *,
+    send_email: bool = True,
+) -> dict:
     message = f"**[{level}] {title}**\n{body}"
     results: dict = {}
 
+    if (
+        send_email
+        and title not in _EMAIL_SKIP_TITLES
+        and settings.email_configured
+    ):
+        plain = f"[{level}] {title}\n{body}"
+        try:
+            ok = await asyncio.to_thread(
+                send_email_alert,
+                f"SPY Bridge: {title}",
+                plain,
+                settings=settings,
+            )
+            if ok:
+                results["email"] = "sent"
+        except Exception as exc:
+            logger.warning("Email notify failed: %s", exc)
+
     if not settings.discord_webhook_url and not settings.telegram_configured:
-        logger.info("Notify: %s", message)
+        if not results.get("email"):
+            logger.info("Notify: %s", message)
         return results
 
     async with httpx.AsyncClient(timeout=15.0) as client:
@@ -1282,6 +1326,7 @@ async def wait_and_chase_alpaca_entry_fill(
             "Chasing Entry Fill",
             f"Order {order_id[:8]}… repriced to ${credit:.2f} credit (attempt {attempt + 1})",
             "INFO",
+            send_email=False,
         )
 
     logger.warning("Alpaca entry %s not filled after chase — last credit $%s", order_id, credit)
@@ -1369,6 +1414,13 @@ async def alpaca_place_exits_after_fill(
         return
 
     spread = spread_with_credit(spread, resolve_entry_credit(spread, filled))
+    credit = float(spread.metadata["limit_credit"])
+    await notify(
+        settings,
+        "Entry Filled",
+        f"Order {entry_order_id} filled at ${credit:.2f} credit — placing GTC TP/SL",
+        "SUCCESS",
+    )
     ticker = str(spread.metadata.get("underlying", "SPY"))
 
     if settings.auto_take_profit:
@@ -1530,6 +1582,12 @@ async def run_burst_attempts(
             attempt.get("status"),
         )
     filled_count = sum(1 for a in attempts if a.get("filled"))
+    await notify(
+        settings,
+        "Burst Complete",
+        f"Paper burst finished: {filled_count}/{count} filled",
+        "SUCCESS" if filled_count > 0 else "WARNING",
+    )
     return {
         "success": filled_count > 0,
         "burst_count": count,
@@ -1666,7 +1724,7 @@ def coerce_signal(payload: dict, settings: Settings) -> TradingViewSignal:
 
 app = FastAPI(
     title="spy-options-bridge",
-    version="5.5.6",
+    version="5.5.8",
     description="TradingView → Alpaca Paper multi-leg SPY credit spreads + auto GTC exits",
 )
 
@@ -1676,7 +1734,7 @@ async def startup_log() -> None:
     s = get_settings()
     broker_label = "Alpaca Paper" if s.use_alpaca else "Tastytrade Cert"
     logger.info(
-        "spy-options-bridge v5.5.6 started | broker=%s (%s) | configured=%s | mode=%s | auto_tp=%s auto_sl=%s chase=%s paper_force=%s",
+        "spy-options-bridge v5.5.8 started | broker=%s (%s) | configured=%s | mode=%s | auto_tp=%s auto_sl=%s chase=%s paper_force=%s",
         s.broker,
         broker_label,
         s.configured,
@@ -1707,7 +1765,7 @@ async def health() -> dict[str, str]:
     broker_name = "alpaca" if s.use_alpaca else s.broker
     return {
         "status": "ok",
-        "version": "5.5.6",
+        "version": "5.5.8",
         "burst_endpoint": "/exercise/burst",
         "auto_take_profit": str(s.auto_take_profit),
         "auto_stop_loss": str(s.auto_stop_loss),
@@ -1732,7 +1790,7 @@ async def health() -> dict[str, str]:
 @app.get("/ping")
 async def ping() -> dict[str, str]:
     """Lightweight keep-alive for cron pings (prevents Render free-tier cold starts)."""
-    return {"status": "ok", "version": "5.5.6"}
+    return {"status": "ok", "version": "5.5.8"}
 
 
 def _burst_paper_guard(settings: Settings) -> str | None:

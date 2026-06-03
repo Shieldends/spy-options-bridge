@@ -185,8 +185,8 @@ def main() -> int:
     health = hr.json()
     ver = health.get("version", "?")
     print(f"Bridge health version={ver} paper_force={health.get('paper_force_min_fill')}")
-    if str(ver) < "5.5.6":
-        print(f"WARN: deploy v5.5.6+ for burst endpoints (got {ver})")
+    if str(ver) < "5.5.8":
+        print(f"WARN: deploy v5.5.8+ for burst endpoints (got {ver})")
 
     if args.wait_for_open:
         wait_until_market_open(env, after_open_sec=args.after_open_sec)
