@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SPY-LIVE-COMMAND — one-click bridge + Grok sync + Cursor workspace (stdlib only)."""
+"""SPY Live Command Center (console) — bridge + Grok sync + Cursor workspace (stdlib only)."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ LOG_PATH = DESKTOP / "COMMAND-CENTER-LOG.txt"
 DEFAULT_STATUS_EMAIL = "shieldinc850@gmail.com"
 INTERVAL_SEC = 60
 ET = ZoneInfo("America/New_York")
-PROJECT_NAME = "SPY-LIVE-COMMAND"
+PROJECT_NAME = "SPY Live Command Center"
 
 WORKERS = (
     ("dual_sync", "dual_sync_loop.py", []),

@@ -21,7 +21,7 @@ from team_email import (  # noqa: E402
 
 
 def test_subject_prefixes():
-    assert PREFIX == "[SPY-LIVE]"
+    assert PREFIX == "[SPY Command Center]"
     assert SUBJECT_STATUS.startswith(PREFIX)
     assert SUBJECT_PERMISSION.endswith("NEEDED")
     assert "ACTION DONE" in SUBJECT_ACTION_DONE

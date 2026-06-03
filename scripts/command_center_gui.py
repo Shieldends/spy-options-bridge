@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SPY Live Command — tkinter meeting place (stdlib). UX layer on command_center workers."""
+"""SPY Live Command Center — tkinter app (stdlib). UX layer on command_center workers."""
 
 from __future__ import annotations
 
@@ -35,7 +35,8 @@ GROK_PATHS = (
 )
 ET = ZoneInfo("America/New_York")
 BTN_FONT = ("Segoe UI", 11, "bold")
-TITLE = "SPY Live Command"
+APP_NAME = "SPY Live Command Center"
+TITLE = APP_NAME
 USER_EMAIL = email_setup.DEFAULT_TO
 
 
@@ -75,12 +76,20 @@ class CommandCenterApp(tk.Tk):
 
         tk.Label(
             main,
+            text=APP_NAME,
+            font=("Segoe UI", 14, "bold"),
+            wraplength=520,
+            justify=tk.CENTER,
+        ).grid(row=0, column=0, columnspan=2, pady=(0, 4), sticky="ew")
+
+        tk.Label(
+            main,
             textvariable=self._live_banner_var,
             font=("Segoe UI", 16, "bold"),
             fg="#0a5",
             wraplength=520,
             justify=tk.CENTER,
-        ).grid(row=0, column=0, columnspan=2, pady=(4, 4), sticky="ew")
+        ).grid(row=1, column=0, columnspan=2, pady=(4, 4), sticky="ew")
 
         tk.Label(
             main,
@@ -89,7 +98,7 @@ class CommandCenterApp(tk.Tk):
             fg="#036",
             wraplength=520,
             justify=tk.CENTER,
-        ).grid(row=1, column=0, columnspan=2, pady=(0, 8), sticky="ew")
+        ).grid(row=2, column=0, columnspan=2, pady=(0, 8), sticky="ew")
 
         buttons: list[tuple[str, callable]] = [
             ("START TEAM", self._start_team),
@@ -103,7 +112,7 @@ class CommandCenterApp(tk.Tk):
             ("RENDER STATUS", self._render_status),
         ]
         for idx, (label, cmd) in enumerate(buttons):
-            row, col = divmod(idx + 2, 2)
+            row, col = divmod(idx + 3, 2)
             ttk.Button(main, text=label, command=cmd, width=22).grid(
                 row=row, column=col, padx=6, pady=6, sticky="ew"
             )
@@ -140,7 +149,7 @@ class CommandCenterApp(tk.Tk):
         ).pack(pady=6)
 
         help_text = (
-            "SPY Live Command — one window for pre-market ops.\n\n"
+            "SPY Live Command Center — the app (one window).\n\n"
             "• START TEAM — dual sync, bridge keepalive, redundant tests (same as console center).\n"
             "• TradingView → Render → Alpaca Thursday path is unchanged.\n"
             "• Desktop .bat files remain for advanced / single-layer debugging.\n\n"

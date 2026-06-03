@@ -155,7 +155,7 @@ def format_user_live_lines(*, team_running: bool, max_lines: int = 3) -> list[st
     lines: list[str] = []
     data = load_checklist()
     if not team_running:
-        lines.append("Click START TEAM (or leave SPY-LIVE-COMMAND open overnight)")
+        lines.append("Click START TEAM (or leave Command Center open overnight)")
     if data.get("user_wants_email", True) and not data["items"].get("email_setup_done"):
         lines.append("Email: GUI app password + Save → CONFIRM-RENDER-EMAIL.bat once")
     elif data.get("user_wants_email", True) and not data["items"].get("render_email_env"):

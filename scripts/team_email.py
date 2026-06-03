@@ -1,4 +1,4 @@
-"""Team email protocol — [SPY-LIVE] subjects; user replies YES/NO (outbound only, no IMAP).
+"""Team email protocol — [SPY Command Center] subjects; user replies YES/NO (outbound only).
 
 User inbox: shieldinc850@gmail.com — team reads replies manually.
 Do NOT implement Gmail/IMAP read without explicit user permission.
@@ -17,7 +17,7 @@ if str(ROOT) not in sys.path:
 
 from email_alerts import send_email_alert  # noqa: E402
 
-PREFIX = "[SPY-LIVE]"
+PREFIX = "[SPY Command Center]"
 USER_INBOX = "shieldinc850@gmail.com"
 
 SUBJECT_STATUS = f"{PREFIX} STATUS"
@@ -71,7 +71,7 @@ def send_action_done(
 
 def send_permission_sample(*, settings: dict[str, Any] | None = None) -> bool:
     return send_permission(
-        "Sample from SPY Live Command. Reply YES if you received this and can approve "
+        "Sample from SPY Live Command Center. Reply YES if you received this and can approve "
         "team requests by email reply (no forms).",
         headline="Sample permission test",
         settings=settings,
