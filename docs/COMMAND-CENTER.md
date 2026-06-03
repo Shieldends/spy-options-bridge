@@ -1,7 +1,7 @@
 # SPY-LIVE-COMMAND — unified command center
 
 **Project:** `SPY-LIVE-COMMAND` in `C:\Users\Shiel\spy-options-bridge`  
-**One click:** `C:\Users\Shiel\Desktop\SPY-LIVE-COMMAND.bat`
+**One click:** `C:\Users\Shiel\Desktop\SPY-LIVE-COMMAND.bat` → `scripts/command_center_gui.py` (tkinter). Console `command_center.py` is advanced.
 
 ## What starts
 

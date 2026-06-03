@@ -80,12 +80,24 @@ def save_checklist(data: dict[str, Any]) -> None:
 
 
 def mark_done(item: str) -> bool:
+    return set_item(item, True)
+
+
+def set_item(item: str, done: bool) -> bool:
     if item not in DEFAULT_ITEMS:
         raise ValueError(f"Unknown item: {item}")
     data = load_checklist()
-    data["items"][item] = True
+    data["items"][item] = bool(done)
     save_checklist(data)
-    return True
+    return bool(done)
+
+
+def toggle_item(item: str) -> bool:
+    data = load_checklist()
+    new_val = not bool(data["items"][item])
+    data["items"][item] = new_val
+    save_checklist(data)
+    return new_val
 
 
 def incomplete_items() -> list[str]:

@@ -20,6 +20,8 @@ before_market_open = tc.before_market_open
 incomplete_items = tc.incomplete_items
 load_checklist = tc.load_checklist
 mark_done = tc.mark_done
+toggle_item = tc.toggle_item
+set_item = tc.set_item
 
 
 @pytest.fixture
@@ -56,6 +58,19 @@ def test_mark_done(checklist_file):
     data = load_checklist()
     assert data["items"]["email_setup_done"] is True
     assert "email_setup_done" not in incomplete_items()
+
+
+def test_toggle_item(checklist_file):
+    assert toggle_item("email_setup_done") is True
+    assert load_checklist()["items"]["email_setup_done"] is True
+    assert toggle_item("email_setup_done") is False
+    assert load_checklist()["items"]["email_setup_done"] is False
+
+
+def test_set_item_false(checklist_file):
+    mark_done("dual_sync_running")
+    set_item("dual_sync_running", False)
+    assert load_checklist()["items"]["dual_sync_running"] is False
 
 
 def test_before_market_open_weekday_morning():

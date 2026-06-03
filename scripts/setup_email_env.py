@@ -74,6 +74,45 @@ def open_automation_doc() -> None:
         print(f"(Missing) {AUTOMATION_DOC}")
 
 
+def _mark_google_bat_only() -> None:
+    """Checklist: app password entered locally via bat, not chat."""
+    try:
+        scripts = Path(__file__).resolve().parent
+        sys.path.insert(0, str(scripts))
+        import todo_checklist as tc  # noqa: E402
+
+        tc.mark_done("google_app_password_via_setup_bat_only")
+        tc.mark_done("email_setup_done")
+    except Exception:
+        pass
+
+
+def save_gmail_credentials(
+    smtp_user: str,
+    smtp_pass: str,
+    *,
+    email_from: str | None = None,
+    email_to: str = DEFAULT_TO,
+) -> None:
+    """Write Gmail SMTP vars to local .env (caller must not log password)."""
+    smtp_user = smtp_user.strip()
+    smtp_pass = smtp_pass.strip().replace(" ", "")
+    if not smtp_user or not smtp_pass:
+        raise ValueError("Gmail address and app password are required")
+    email_from = (email_from or smtp_user).strip() or smtp_user
+    upsert_env(
+        {
+            "EMAIL_ENABLED": "true",
+            "SMTP_HOST": "smtp.gmail.com",
+            "SMTP_PORT": "587",
+            "SMTP_USER": smtp_user,
+            "SMTP_PASSWORD": smtp_pass,
+            "EMAIL_FROM": email_from,
+            "EMAIL_TO": email_to.strip() or DEFAULT_TO,
+        }
+    )
+
+
 def run_test_send() -> int:
     py = ROOT / ".venv" / "Scripts" / "python.exe"
     if not py.exists():
@@ -117,7 +156,8 @@ def main() -> int:
             "EMAIL_TO": email_to,
         }
     )
-    print(f"\nUpdated {ENV_PATH} (password not shown).")
+    print(f"\nUpdated {ENV_PATH} (SMTP_PASSWORD=*** not shown).")
+    _mark_google_bat_only()
     print("\n--- Also set the SAME vars on Render ---\n")
     print(RENDER_HINT)
 
