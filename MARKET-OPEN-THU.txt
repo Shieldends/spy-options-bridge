@@ -1,0 +1,13 @@
+THURSDAY JUNE 4, 2026 — MARKET OPEN PROOF (paper)
+
+YOU: Keep TradingView alerts ON for SPY (MACD entry + close/warning). Watch Alpaca Paper → Orders/Positions; you do not need to click anything unless something looks stuck.
+
+SUCCESS: Entry alert → Render log "Alert accepted" → Alpaca mleg order → status FILLED → optional GTC TP/SL. Close/warning alert → danger check → auto-close spread (or notify if override).
+
+BEFORE OPEN (optional): Double-click Desktop PREP-MARKET-OPEN.bat or run:
+  C:\Users\Shiel\spy-options-bridge\.venv\Scripts\python.exe scripts\prep_market_open.py
+Expect health version 5.5.4+ and exercise entry accepted; fill may wait until 9:30 ET if tested pre-open.
+
+IF NO FILL: Check Render is awake (health URL), Alpaca paper Orders tab, and that WEBHOOK_SECRET in TV JSON matches Render env.
+
+FRIDAY: Same setup if Thursday misses a fill — no need to wait until Monday.

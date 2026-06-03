@@ -1,5 +1,5 @@
 """
-spy-options-bridge v5.5.3 — ALPACA PAPER (default broker)
+spy-options-bridge v5.5.4 — ALPACA PAPER (default broker)
 
 TradingView webhook → Render → Alpaca multi-leg SPY put credit spreads.
 
@@ -84,9 +84,10 @@ class Settings(BaseSettings):
     alpaca_exit_fill_timeout: int = Field(default=600, alias="ALPACA_EXIT_FILL_TIMEOUT")
     alpaca_exit_poll_seconds: float = Field(default=3.0, alias="ALPACA_EXIT_POLL_SECONDS")
     auto_chase_entry_fill: bool = Field(default=True, alias="AUTO_CHASE_ENTRY_FILL")
-    entry_chase_wait_seconds: float = Field(default=3.0, alias="ENTRY_CHASE_WAIT_SECONDS")
-    entry_chase_poll_seconds: float = Field(default=3.0, alias="ENTRY_CHASE_POLL_SECONDS")
-    entry_chase_max_attempts: int = Field(default=10, alias="ENTRY_CHASE_MAX_ATTEMPTS")
+    entry_chase_wait_seconds: float = Field(default=2.0, alias="ENTRY_CHASE_WAIT_SECONDS")
+    entry_chase_poll_seconds: float = Field(default=1.5, alias="ENTRY_CHASE_POLL_SECONDS")
+    entry_chase_max_attempts: int = Field(default=15, alias="ENTRY_CHASE_MAX_ATTEMPTS")
+    entry_chase_floor_extra_polls: int = Field(default=8, alias="ENTRY_CHASE_FLOOR_EXTRA_POLLS")
     entry_min_credit: float = Field(default=0.05, alias="ENTRY_MIN_CREDIT")
     paper_force_min_fill: bool = Field(default=True, alias="PAPER_FORCE_MIN_FILL")
 
@@ -1211,27 +1212,50 @@ async def wait_and_chase_alpaca_entry_fill(
     floor = round(settings.entry_min_credit, 2)
     max_attempts = settings.entry_chase_max_attempts if settings.auto_chase_entry_fill else 0
 
-    for attempt in range(max_attempts + 1):
+    step = 0.01 if floor <= 0.01 else 0.05
+
+    async def _poll_window() -> dict[str, Any] | None:
         deadline = time.monotonic() + settings.entry_chase_wait_seconds
         while time.monotonic() < deadline:
             order = await fetch_alpaca_order(settings, order_id)
             status = str(order.get("status", "")).lower()
             if status == "filled":
-                logger.info("Alpaca entry %s filled (attempt %s, credit=$%s)", order_id, attempt, credit)
+                logger.info("Alpaca entry %s filled (credit=$%s)", order_id, credit)
                 return order
             if status in terminal:
                 logger.warning("Alpaca entry %s stopped as %s", order_id, status)
                 return None
             await asyncio.sleep(settings.entry_chase_poll_seconds)
+        return {}
+
+    for attempt in range(max_attempts + 1):
+        order = await _poll_window()
+        if order is None:
+            return None
+        if order.get("status", "").lower() == "filled" or order.get("filled_avg_price"):
+            logger.info("Alpaca entry %s filled (attempt %s, credit=$%s)", order_id, attempt, credit)
+            return order
 
         if attempt >= max_attempts:
             break
 
-        new_credit = max(round(credit * 0.75 - 0.02, 2), floor)
+        new_credit = max(round(credit * 0.75 - step, 2), floor)
         if new_credit >= credit:
-            new_credit = max(round(credit - 0.05, 2), floor)
+            new_credit = max(round(credit - step, 2), floor)
         if new_credit >= credit:
-            logger.info("Chase fill: order %s already at floor $%s", order_id, credit)
+            logger.info("Chase fill: order %s at floor $%s — extra polls", order_id, credit)
+            for extra in range(settings.entry_chase_floor_extra_polls):
+                order = await _poll_window()
+                if order is None:
+                    return None
+                if order.get("status", "").lower() == "filled" or order.get("filled_avg_price"):
+                    logger.info(
+                        "Alpaca entry %s filled at floor (extra poll %s, credit=$%s)",
+                        order_id,
+                        extra + 1,
+                        credit,
+                    )
+                    return order
             break
 
         if not await replace_alpaca_order_limit(settings, order_id, new_credit):
@@ -1374,30 +1398,69 @@ def webhook_auth_error(provided: str | None, expected: str) -> str | None:
     return "Invalid webhook secret — must match Render env WEBHOOK_SECRET exactly"
 
 
+async def submit_entry_from_signal(
+    settings: Settings,
+    signal: TradingViewSignal,
+) -> tuple[SpreadPackage, OrderResult, float | None]:
+    """
+    Build spread, resolve credit, submit entry. Returns (spread, result, entry_credit).
+    entry_credit is limit credit used for Alpaca chase scheduling.
+    """
+    dry_run = not settings.is_live
+    spread = build_spread(signal, settings)
+    if settings.use_alpaca:
+        spread = await align_spread_to_alpaca(settings, spread, signal)
+        spread = await resolve_entry_limit_credit(settings, spread, signal)
+
+    if signal.signal_price is not None:
+        danger, risk_msg, _ = check_danger(
+            signal.signal_price,
+            float(spread.metadata["short_strike"]),
+            settings.danger_zone_pct,
+            signal.ticker,
+        )
+        if danger and risk_msg:
+            await notify(settings, "Entry Near Danger Zone", risk_msg, "CRITICAL")
+
+    entry_payload = build_alpaca_entry_payload(spread) if settings.use_alpaca else build_entry_payload(spread)
+    logger.info("Submitting %s entry order", "Alpaca mleg" if settings.use_alpaca else "Tastytrade")
+    entry = await submit_order(settings, entry_payload, dry_run=dry_run)
+    entry_credit = float(spread.metadata["limit_credit"]) if settings.use_alpaca else None
+    return spread, entry, entry_credit
+
+
+def schedule_alpaca_exits_after_entry(
+    settings: Settings,
+    spread: SpreadPackage,
+    entry: OrderResult,
+    entry_credit: float | None,
+) -> str | None:
+    """Queue GTC TP/SL after Alpaca entry fill chase. Returns order id if scheduled."""
+    if not settings.use_alpaca or not (settings.auto_take_profit or settings.auto_stop_loss):
+        return None
+    order_id = (entry.broker_response or {}).get("id")
+    if not order_id:
+        logger.error("Alpaca entry accepted but no order id — cannot schedule auto exits")
+        return None
+    credit = entry_credit if entry_credit is not None else float(spread.metadata["limit_credit"])
+    asyncio.create_task(
+        alpaca_place_exits_after_fill(
+            settings,
+            spread,
+            str(order_id),
+            initial_credit=credit,
+        )
+    )
+    logger.info("Alpaca: scheduled auto GTC exits after fill for order %s", order_id)
+    return str(order_id)
+
+
 async def process_entry_alert(settings: Settings, signal: TradingViewSignal) -> None:
     """Run Alpaca/Tastytrade entry + exit scheduling (TradingView gets an instant 200 first)."""
     dry_run = not settings.is_live
     try:
-        spread = build_spread(signal, settings)
-        if settings.use_alpaca:
-            spread = await align_spread_to_alpaca(settings, spread, signal)
-            spread = await resolve_entry_limit_credit(settings, spread, signal)
-
+        spread, entry, entry_credit = await submit_entry_from_signal(settings, signal)
         expiration = spread.metadata["expiration"]
-
-        if signal.signal_price is not None:
-            danger, risk_msg, _ = check_danger(
-                signal.signal_price,
-                float(spread.metadata["short_strike"]),
-                settings.danger_zone_pct,
-                signal.ticker,
-            )
-            if danger and risk_msg:
-                await notify(settings, "Entry Near Danger Zone", risk_msg, "CRITICAL")
-
-        entry_payload = build_alpaca_entry_payload(spread) if settings.use_alpaca else build_entry_payload(spread)
-        logger.info("Background: submitting %s entry order", "Alpaca mleg" if settings.use_alpaca else "Tastytrade")
-        entry = await submit_order(settings, entry_payload, dry_run=dry_run)
 
         if entry.success:
             await notify(
@@ -1435,21 +1498,8 @@ async def process_entry_alert(settings: Settings, signal: TradingViewSignal) -> 
                         "SUCCESS",
                     )
 
-        elif settings.use_alpaca and (settings.auto_take_profit or settings.auto_stop_loss):
-            order_id = (entry.broker_response or {}).get("id")
-            entry_credit = float(spread.metadata["limit_credit"])
-            if order_id:
-                asyncio.create_task(
-                    alpaca_place_exits_after_fill(
-                        settings,
-                        spread,
-                        str(order_id),
-                        initial_credit=entry_credit,
-                    )
-                )
-                logger.info("Alpaca: scheduled auto GTC exits after fill for order %s", order_id)
-            else:
-                logger.error("Alpaca entry accepted but no order id — cannot schedule auto exits")
+        else:
+            schedule_alpaca_exits_after_entry(settings, spread, entry, entry_credit)
     except Exception as exc:
         logger.exception("Background entry processing failed: %s", exc)
         await notify(settings, "Entry Failed", str(exc), "CRITICAL")
@@ -1476,7 +1526,7 @@ def coerce_signal(payload: dict, settings: Settings) -> TradingViewSignal:
 
 app = FastAPI(
     title="spy-options-bridge",
-    version="5.5.3",
+    version="5.5.4",
     description="TradingView → Alpaca Paper multi-leg SPY credit spreads + auto GTC exits",
 )
 
@@ -1486,7 +1536,7 @@ async def startup_log() -> None:
     s = get_settings()
     broker_label = "Alpaca Paper" if s.use_alpaca else "Tastytrade Cert"
     logger.info(
-        "spy-options-bridge v5.5.3 started | broker=%s (%s) | configured=%s | mode=%s | auto_tp=%s auto_sl=%s chase=%s paper_force=%s",
+        "spy-options-bridge v5.5.4 started | broker=%s (%s) | configured=%s | mode=%s | auto_tp=%s auto_sl=%s chase=%s paper_force=%s",
         s.broker,
         broker_label,
         s.configured,
@@ -1517,7 +1567,7 @@ async def health() -> dict[str, str]:
     broker_name = "alpaca" if s.use_alpaca else s.broker
     return {
         "status": "ok",
-        "version": "5.5.3",
+        "version": "5.5.4",
         "auto_take_profit": str(s.auto_take_profit),
         "auto_stop_loss": str(s.auto_stop_loss),
         "broker": broker_name,
@@ -1530,6 +1580,8 @@ async def health() -> dict[str, str]:
         "warning_close_multiplier": str(s.warning_close_multiplier),
         "default_fill_mode": s.default_fill_mode,
         "auto_chase_entry_fill": str(s.auto_chase_entry_fill),
+        "entry_chase_wait_seconds": str(s.entry_chase_wait_seconds),
+        "entry_chase_poll_seconds": str(s.entry_chase_poll_seconds),
         "entry_min_credit": str(s.entry_min_credit),
         "paper_force_min_fill": str(s.paper_force_min_fill and s.is_alpaca_paper),
         "deploy_file": "main.py (root — NOT app/main.py)",
@@ -1539,7 +1591,75 @@ async def health() -> dict[str, str]:
 @app.get("/ping")
 async def ping() -> dict[str, str]:
     """Lightweight keep-alive for cron pings (prevents Render free-tier cold starts)."""
-    return {"status": "ok", "version": "5.5.3"}
+    return {"status": "ok", "version": "5.5.4"}
+
+
+@app.post("/exercise/entry")
+async def exercise_entry_endpoint(
+    request: Request,
+    x_webhook_secret: str | None = Header(default=None, alias="X-Webhook-Secret"),
+) -> JSONResponse:
+    """
+    Manual burst-test entry (no TradingView): forces fillMode=exercise, submits synchronously,
+    returns Alpaca order id for polling. GTC TP/SL chase runs in background.
+    """
+    settings = get_settings()
+    dry_run = not settings.is_live
+
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        return JSONResponse(
+            status_code=200,
+            content={"success": False, "message": f"Invalid JSON: {exc}", "dry_run": dry_run},
+        )
+
+    if not isinstance(payload, dict):
+        return JSONResponse(
+            status_code=200,
+            content={"success": False, "message": "Body must be a JSON object", "dry_run": dry_run},
+        )
+
+    provided, payload = extract_webhook_secret(payload, x_webhook_secret)
+    auth_err = webhook_auth_error(provided, settings.webhook_secret)
+    if auth_err:
+        return JSONResponse(status_code=200, content={"success": False, "message": auth_err, "dry_run": dry_run})
+
+    payload = dict(payload)
+    payload["fillMode"] = "exercise"
+    payload.setdefault("action", "PUT_CREDIT_SPREAD")
+
+    try:
+        signal = coerce_signal(payload, settings)
+        build_spread(signal, settings)
+    except (ValidationError, ValueError) as exc:
+        return JSONResponse(
+            status_code=200,
+            content={"success": False, "message": f"Bad payload: {exc}", "dry_run": dry_run},
+        )
+
+    try:
+        spread, entry, entry_credit = await submit_entry_from_signal(settings, signal)
+    except Exception as exc:
+        logger.exception("Exercise entry failed: %s", exc)
+        return JSONResponse(
+            status_code=200,
+            content={"success": False, "message": str(exc), "dry_run": dry_run},
+        )
+
+    order_id = schedule_alpaca_exits_after_entry(settings, spread, entry, entry_credit)
+    return JSONResponse(
+        status_code=200,
+        content={
+            "success": entry.success,
+            "message": entry.message,
+            "dry_run": dry_run,
+            "order_id": order_id,
+            "limit_credit": spread.metadata.get("limit_credit"),
+            "expiration": spread.metadata.get("expiration"),
+            "broker_response": entry.broker_response if entry.success else None,
+        },
+    )
 
 
 @app.post("/entry", response_model=EntryResponse)
