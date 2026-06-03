@@ -12,6 +12,11 @@ from zoneinfo import ZoneInfo
 import httpx
 
 ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(SCRIPTS))
+
+from security_utils import redact_line  # noqa: E402
 ENV = ROOT / ".env"
 RENDER = "https://spy-options-bridge.onrender.com"
 OUT = Path(r"C:\Users\Shiel\Desktop\PRE-OPEN-TEST-RESULTS.txt")
@@ -43,6 +48,16 @@ def add(matrix: str, test: str, status: str, note: str = "") -> None:
     rows.append((f"{matrix} | {test}", status, note))
 
 
+def market_session_open(now: datetime | None = None) -> bool:
+    """True Mon–Fri 9:30–16:00 ET (paper fill proof window)."""
+    now = now or datetime.now(ET)
+    if now.weekday() >= 5:
+        return False
+    open_t = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    close_t = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    return open_t <= now < close_t
+
+
 def run_cmd(matrix: str, test: str, args: list[str], timeout: float = 300) -> None:
     try:
         p = subprocess.run(
@@ -54,7 +69,7 @@ def run_cmd(matrix: str, test: str, args: list[str], timeout: float = 300) -> No
         )
         out = (p.stdout or "") + (p.stderr or "")
         tail = out.strip().splitlines()[-3:] if out.strip() else ["(no output)"]
-        note = " | ".join(tail)[:240]
+        note = " | ".join(redact_line(ln) for ln in tail)[:240]
         add(matrix, test, "PASS" if p.returncode == 0 else "FAIL", note)
     except Exception as exc:
         add(matrix, test, "FAIL", str(exc)[:200])
@@ -139,12 +154,33 @@ def render_get(matrix: str, test: str, path: str) -> None:
         add(matrix, test, "FAIL", str(exc)[:200])
 
 
-def main() -> int:
-    ts = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
+DESKTOP_BATS = (
+    "SETUP-EMAIL-AUTOMATION.bat",
+    "TEST-EMAIL-NOW.bat",
+    "CONFIRM-RENDER-EMAIL.bat",
+    "BURST-PAPER-100.bat",
+    "BRIDGE-KEEPALIVE.bat",
+    "DUAL-SYNC-LOOP.bat",
+    "PREP-MARKET-OPEN.bat",
+    "RUN-THURSDAY-LIVE.bat",
+    "REMIND-BEFORE-OPEN.bat",
+    "SCHEDULE-9AM-REMINDER.bat",
+    "OPEN-ALL-REPORTS.bat",
+    "START-REDUNDANT-TEST-LOOP.bat",
+    "STOP-REDUNDANT-TESTS.bat",
+)
+
+
+def run_matrix(*, fast: bool = False) -> tuple[int, int, list[tuple[str, str, str]]]:
+    """Run validation matrix; return (pass_count, fail_count, rows)."""
+    global rows
+    rows = []
     env = load_env()
 
-    # A
-    run_cmd("A", "pytest full suite", ["-m", "pytest", "tests/", "-q", "--tb=no"], timeout=120)
+    if fast:
+        run_cmd("A", "pytest quick", ["-m", "pytest", "tests/", "-q", "--tb=no", "-x"], timeout=90)
+    else:
+        run_cmd("A", "pytest full suite", ["-m", "pytest", "tests/", "-q", "--tb=no"], timeout=120)
     try:
         import main as m  # noqa: F401
 
@@ -168,12 +204,13 @@ def main() -> int:
     }
     post_json("B", "POST /entry", "/entry", {**body_base, "limitCredit": 0.55, "fillMode": "aggressive"})
     post_json("B", "POST /exercise/entry", "/exercise/entry", {**body_base, "fillMode": "exercise"})
+    burst_n = 1 if fast else 3
     post_json(
         "B",
-        "POST /exercise/burst count=3",
-        "/exercise/burst?count=3&interval=1",
-        {**body_base, "fillMode": "exercise", "burstCount": 3, "skipExits": True},
-        timeout=600,
+        f"POST /exercise/burst count={burst_n}",
+        f"/exercise/burst?count={burst_n}&interval=1",
+        {**body_base, "fillMode": "exercise", "burstCount": burst_n, "skipExits": True},
+        timeout=300 if fast else 600,
     )
     post_json(
         "B",
@@ -193,9 +230,29 @@ def main() -> int:
     alpaca_checks(env)
 
     # D
-    run_cmd("D", "prep_market_open.py", ["scripts/prep_market_open.py", "--skip-warning"], timeout=400)
-    run_cmd("D", "burst_paper_fills.py --count 3", ["scripts/burst_paper_fills.py", "--count", "3", "--interval", "2"], timeout=900)
-    for bat in ("PREP-MARKET-OPEN.bat", "BURST-PAPER-100.bat"):
+    if not fast:
+        if market_session_open():
+            run_cmd("D", "prep_market_open.py", ["scripts/prep_market_open.py", "--skip-warning"], timeout=400)
+            run_cmd(
+                "D",
+                "burst_paper_fills.py --count 3",
+                ["scripts/burst_paper_fills.py", "--count", "3", "--interval", "2"],
+                timeout=900,
+            )
+        else:
+            add(
+                "D",
+                "prep_market_open.py",
+                "LIMIT",
+                "After hours — re-run 9:30–16:00 ET for fill proof",
+            )
+            add(
+                "D",
+                "burst_paper_fills.py --count 3",
+                "LIMIT",
+                "After hours — use BURST-PAPER-100.bat at 9:31 ET",
+            )
+    for bat in DESKTOP_BATS:
         p = Path(r"C:\Users\Shiel\Desktop") / bat
         add("D", f"Desktop {bat}", "PASS" if p.exists() else "FAIL", str(p))
 
@@ -207,6 +264,12 @@ def main() -> int:
     except Exception as exc:
         add("F", "Render deploy version", "FAIL", str(exc)[:200])
 
+    pass_n = sum(1 for _, s, _ in rows if s == "PASS")
+    fail_n = sum(1 for _, s, _ in rows if s == "FAIL")
+    return pass_n, fail_n, list(rows)
+
+
+def format_report(ts: str, pass_n: int, fail_n: int, row_list: list[tuple[str, str, str]]) -> str:
     lines = [
         "SPY OPTIONS BRIDGE — PRE-OPEN TEST MATRIX",
         f"Generated: {ts}",
@@ -215,12 +278,35 @@ def main() -> int:
         f"{'Test':<50} {'Result':<8} Notes",
         "-" * 100,
     ]
-    for test, status, note in rows:
+    for test, status, note in row_list:
         lines.append(f"{test:<50} {status:<8} {note}")
-    pass_n = sum(1 for _, s, _ in rows if s == "PASS")
-    fail_n = sum(1 for _, s, _ in rows if s == "FAIL")
-    lines.extend(["", f"SUMMARY: {pass_n} PASS, {fail_n} FAIL, {len(rows) - pass_n - fail_n} other"])
-    OUT.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    limit_n = sum(1 for _, s, _ in row_list if s == "LIMIT")
+    other_n = len(row_list) - pass_n - fail_n - limit_n
+    lines.extend(
+        [
+            "",
+            f"SUMMARY: {pass_n} PASS, {fail_n} FAIL, {limit_n} LIMIT, {other_n} other",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
+def main() -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--fast", action="store_true", help="Shorter matrix for redundant loop")
+    parser.add_argument("--append", action="store_true", help="Append cycle block to results file")
+    args = parser.parse_args()
+
+    ts = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
+    pass_n, fail_n, row_list = run_matrix(fast=args.fast)
+    block = format_report(ts, pass_n, fail_n, row_list)
+    if args.append:
+        prior = OUT.read_text(encoding="utf-8") if OUT.exists() else ""
+        OUT.write_text(prior + "\n" + "=" * 80 + f"\nCYCLE {ts}\n" + block, encoding="utf-8")
+    else:
+        OUT.write_text(block, encoding="utf-8")
     print(f"Wrote {OUT}")
     print(f"SUMMARY: {pass_n} PASS, {fail_n} FAIL")
     return 0 if fail_n == 0 else 1
