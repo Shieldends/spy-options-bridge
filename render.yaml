@@ -21,11 +21,13 @@ services:
       - key: DEFAULT_LIMIT_CREDIT
         value: "0.55"
       - key: DEFAULT_FILL_MODE
-        value: aggressive
+        value: exercise
+      - key: PAPER_FORCE_MIN_FILL
+        value: true
       - key: AUTO_CHASE_ENTRY_FILL
         value: true
       - key: ENTRY_CHASE_WAIT_SECONDS
-        value: "8"
+        value: "3"
       - key: ENTRY_CHASE_MAX_ATTEMPTS
         value: "10"
       - key: ENTRY_MIN_CREDIT

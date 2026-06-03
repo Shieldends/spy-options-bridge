@@ -1,5 +1,5 @@
 """
-spy-options-bridge v5.5.2 — ALPACA PAPER (default broker)
+spy-options-bridge v5.5.3 — ALPACA PAPER (default broker)
 
 TradingView webhook → Render → Alpaca multi-leg SPY put credit spreads.
 
@@ -84,10 +84,11 @@ class Settings(BaseSettings):
     alpaca_exit_fill_timeout: int = Field(default=600, alias="ALPACA_EXIT_FILL_TIMEOUT")
     alpaca_exit_poll_seconds: float = Field(default=3.0, alias="ALPACA_EXIT_POLL_SECONDS")
     auto_chase_entry_fill: bool = Field(default=True, alias="AUTO_CHASE_ENTRY_FILL")
-    entry_chase_wait_seconds: float = Field(default=8.0, alias="ENTRY_CHASE_WAIT_SECONDS")
+    entry_chase_wait_seconds: float = Field(default=3.0, alias="ENTRY_CHASE_WAIT_SECONDS")
     entry_chase_poll_seconds: float = Field(default=3.0, alias="ENTRY_CHASE_POLL_SECONDS")
     entry_chase_max_attempts: int = Field(default=10, alias="ENTRY_CHASE_MAX_ATTEMPTS")
     entry_min_credit: float = Field(default=0.05, alias="ENTRY_MIN_CREDIT")
+    paper_force_min_fill: bool = Field(default=True, alias="PAPER_FORCE_MIN_FILL")
 
     discord_webhook_url: str = Field(default="", alias="DISCORD_WEBHOOK_URL")
     telegram_bot_token: str = Field(default="", alias="TELEGRAM_BOT_TOKEN")
@@ -98,7 +99,7 @@ class Settings(BaseSettings):
     default_strike_offset_short: int = Field(default=-5, alias="DEFAULT_STRIKE_OFFSET_SHORT")
     default_strike_offset_long: int = Field(default=-8, alias="DEFAULT_STRIKE_OFFSET_LONG")
     default_limit_credit: float = Field(default=0.35, alias="DEFAULT_LIMIT_CREDIT")
-    default_fill_mode: str = Field(default="aggressive", alias="DEFAULT_FILL_MODE")
+    default_fill_mode: str = Field(default="exercise", alias="DEFAULT_FILL_MODE")
     # fixed | auto | aggressive | exercise | fill — exercise/fill lean low for paper fills
     max_quantity: int = Field(default=0, alias="MAX_QUANTITY")
     # 0 = no cap; set e.g. 10 to limit spreads per alert
@@ -123,6 +124,10 @@ class Settings(BaseSettings):
     @property
     def alpaca_configured(self) -> bool:
         return bool(self.alpaca_key and self.alpaca_secret)
+
+    @property
+    def is_alpaca_paper(self) -> bool:
+        return "paper-api.alpaca.markets" in self.apca_api_base_url.lower()
 
     @property
     def username(self) -> str:
@@ -604,6 +609,21 @@ async def resolve_entry_limit_credit(
     mode = _normalize_fill_mode(signal.fill_mode, settings)
     requested = signal.limit_credit if signal.limit_credit is not None else settings.default_limit_credit
     meta = {"fill_mode_resolved": mode, "limit_credit_requested": requested}
+
+    # Alpaca paper: always start at minimum credit so simulator fills (user opts in via env).
+    if settings.use_alpaca and settings.is_alpaca_paper and settings.paper_force_min_fill:
+        credit = round(settings.entry_min_credit, 2)
+        meta["fill_mode_resolved"] = "paper_force_min"
+        meta["limit_credit_final"] = credit
+        logger.info("Paper force fill: entry credit pinned to $%s", credit)
+        return spread_with_credit(
+            SpreadPackage(
+                qty=spread.qty,
+                legs=spread.legs,
+                metadata={**spread.metadata, **meta},
+            ),
+            credit,
+        )
 
     if mode == "fixed" or not settings.use_alpaca:
         credit = float(requested)
@@ -1456,7 +1476,7 @@ def coerce_signal(payload: dict, settings: Settings) -> TradingViewSignal:
 
 app = FastAPI(
     title="spy-options-bridge",
-    version="5.5.2",
+    version="5.5.3",
     description="TradingView → Alpaca Paper multi-leg SPY credit spreads + auto GTC exits",
 )
 
@@ -1466,7 +1486,7 @@ async def startup_log() -> None:
     s = get_settings()
     broker_label = "Alpaca Paper" if s.use_alpaca else "Tastytrade Cert"
     logger.info(
-        "spy-options-bridge v5.5.2 started | broker=%s (%s) | configured=%s | mode=%s | auto_tp=%s auto_sl=%s chase=%s",
+        "spy-options-bridge v5.5.3 started | broker=%s (%s) | configured=%s | mode=%s | auto_tp=%s auto_sl=%s chase=%s paper_force=%s",
         s.broker,
         broker_label,
         s.configured,
@@ -1474,6 +1494,7 @@ async def startup_log() -> None:
         s.auto_take_profit,
         s.auto_stop_loss,
         s.auto_chase_entry_fill,
+        s.paper_force_min_fill and s.is_alpaca_paper,
     )
 
 SECRET_BODY_KEYS = ("webhookSecret", "webhook_secret", "secret")
@@ -1496,7 +1517,7 @@ async def health() -> dict[str, str]:
     broker_name = "alpaca" if s.use_alpaca else s.broker
     return {
         "status": "ok",
-        "version": "5.5.2",
+        "version": "5.5.3",
         "auto_take_profit": str(s.auto_take_profit),
         "auto_stop_loss": str(s.auto_stop_loss),
         "broker": broker_name,
@@ -1510,6 +1531,7 @@ async def health() -> dict[str, str]:
         "default_fill_mode": s.default_fill_mode,
         "auto_chase_entry_fill": str(s.auto_chase_entry_fill),
         "entry_min_credit": str(s.entry_min_credit),
+        "paper_force_min_fill": str(s.paper_force_min_fill and s.is_alpaca_paper),
         "deploy_file": "main.py (root — NOT app/main.py)",
     }
 
@@ -1517,7 +1539,7 @@ async def health() -> dict[str, str]:
 @app.get("/ping")
 async def ping() -> dict[str, str]:
     """Lightweight keep-alive for cron pings (prevents Render free-tier cold starts)."""
-    return {"status": "ok", "version": "5.5.2"}
+    return {"status": "ok", "version": "5.5.3"}
 
 
 @app.post("/entry", response_model=EntryResponse)
