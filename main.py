@@ -1,5 +1,5 @@
 """
-spy-options-bridge v5.5.5 — ALPACA PAPER (default broker)
+spy-options-bridge v5.5.6 — ALPACA PAPER (default broker)
 
 TradingView webhook → Render → Alpaca multi-leg SPY put credit spreads.
 
@@ -18,10 +18,12 @@ Required Render env vars:
   WEBHOOK_SECRET=<your secret>
 
 Endpoints:
-  GET  /health   — shows broker=alpaca when configured
-  POST /entry    — Alpaca mleg entry + GTC take-profit + GTC stop-loss
-  POST /webhook  — alias for /entry
-  POST /warning  — danger zone: notify + optional auto-close spread (override in JSON)
+  GET  /health          — shows broker=alpaca when configured
+  POST /entry           — Alpaca mleg entry + GTC take-profit + GTC stop-loss
+  POST /webhook         — alias for /entry
+  POST /warning         — danger zone: notify + optional auto-close spread
+  POST /exercise/entry  — sync paper fill test (exercise mode, chase fill)
+  POST /exercise/burst  — paper-only N-fill burst (?count=N or burstCount)
 """
 
 from __future__ import annotations
@@ -998,6 +1000,20 @@ async def fetch_alpaca_positions(settings: Settings) -> list[dict[str, Any]]:
     return data if isinstance(data, list) else []
 
 
+async def cancel_alpaca_order(settings: Settings, order_id: str) -> bool:
+    """Cancel a single Alpaca order by id."""
+    if not order_id:
+        return False
+    base = settings.apca_api_base_url.rstrip("/")
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.delete(f"{base}/v2/orders/{order_id}", headers=_alpaca_headers(settings))
+    if r.is_success:
+        logger.info("Canceled Alpaca order %s", order_id)
+        return True
+    logger.warning("Cancel order %s failed (%s): %s", order_id, r.status_code, r.text[:200])
+    return False
+
+
 async def cancel_alpaca_open_orders_for_symbols(settings: Settings, symbols: set[str]) -> int:
     """Cancel resting TP/SL before emergency warning close."""
     base = settings.apca_api_base_url.rstrip("/")
@@ -1398,6 +1414,130 @@ def webhook_auth_error(provided: str | None, expected: str) -> str | None:
     return "Invalid webhook secret — must match Render env WEBHOOK_SECRET exactly"
 
 
+async def submit_entry_sync_chase(
+    settings: Settings,
+    signal: TradingViewSignal,
+    *,
+    skip_exits: bool = True,
+) -> dict[str, Any]:
+    """
+    Paper burst helper: submit entry, chase fill synchronously, cancel if stale.
+    Returns attempt dict with order_id, status, filled.
+    """
+    spread, entry, entry_credit = await submit_entry_from_signal(settings, signal)
+    if not entry.success:
+        return {
+            "filled": False,
+            "order_id": None,
+            "status": "rejected",
+            "message": entry.message,
+            "limit_credit": spread.metadata.get("limit_credit"),
+        }
+
+    order_id = str((entry.broker_response or {}).get("id") or "")
+    if not order_id:
+        return {
+            "filled": False,
+            "order_id": None,
+            "status": "no_order_id",
+            "message": entry.message,
+            "limit_credit": spread.metadata.get("limit_credit"),
+        }
+
+    start_credit = entry_credit if entry_credit is not None else float(spread.metadata["limit_credit"])
+    filled_order = await wait_and_chase_alpaca_entry_fill(settings, order_id, start_credit)
+    if filled_order:
+        if not skip_exits and (settings.auto_take_profit or settings.auto_stop_loss):
+            credit = resolve_entry_credit(spread, filled_order)
+            spread_filled = spread_with_credit(spread, credit)
+            asyncio.create_task(
+                _place_exits_after_known_fill(settings, spread_filled, order_id, credit),
+            )
+        return {
+            "filled": True,
+            "order_id": order_id,
+            "status": "filled",
+            "message": "filled",
+            "limit_credit": resolve_entry_credit(spread, filled_order),
+        }
+
+    await cancel_alpaca_order(settings, order_id)
+    final = await fetch_alpaca_order(settings, order_id)
+    status = str(final.get("status", "unfilled"))
+    return {
+        "filled": False,
+        "order_id": order_id,
+        "status": status,
+        "message": f"not filled — canceled ({status})",
+        "limit_credit": spread.metadata.get("limit_credit"),
+    }
+
+
+async def _place_exits_after_known_fill(
+    settings: Settings,
+    spread: SpreadPackage,
+    entry_order_id: str,
+    credit: float,
+) -> None:
+    """Submit GTC TP/SL when entry is already filled (burst optional exits)."""
+    if settings.auto_take_profit:
+        tp_payload = build_take_profit_payload(spread, settings.take_profit_pct, settings)
+        tp = await submit_order(settings, tp_payload, dry_run=not settings.is_live)
+        if tp.success:
+            meta = tp_payload.get("_meta", {})
+            await notify(
+                settings,
+                "GTC Take-Profit Resting",
+                f"{spread.metadata.get('underlying', 'SPY')} close at ${meta.get('close_debit')} debit",
+                "SUCCESS",
+            )
+    if settings.auto_stop_loss:
+        sl_payload = build_stop_loss_payload(spread, settings.stop_loss_multiplier, settings)
+        sl = await submit_order(settings, sl_payload, dry_run=not settings.is_live)
+        if sl.success:
+            meta = sl_payload.get("_meta", {})
+            await notify(
+                settings,
+                "GTC Stop-Loss Resting",
+                f"{spread.metadata.get('underlying', 'SPY')} close at ${meta.get('close_debit')} debit",
+                "CRITICAL",
+            )
+
+
+async def run_burst_attempts(
+    settings: Settings,
+    signal: TradingViewSignal,
+    count: int,
+    *,
+    interval_sec: float = 0.0,
+    skip_exits: bool = True,
+) -> dict[str, Any]:
+    """Sequential paper burst: min credit, sync chase, cancel stale before next."""
+    count = max(1, min(int(count), 200))
+    attempts: list[dict[str, Any]] = []
+    for i in range(count):
+        if i > 0 and interval_sec > 0:
+            await asyncio.sleep(interval_sec)
+        attempt = await submit_entry_sync_chase(settings, signal, skip_exits=skip_exits)
+        attempt["attempt"] = i + 1
+        attempts.append(attempt)
+        logger.info(
+            "Burst %s/%s order=%s filled=%s status=%s",
+            i + 1,
+            count,
+            (attempt.get("order_id") or "")[:8],
+            attempt.get("filled"),
+            attempt.get("status"),
+        )
+    filled_count = sum(1 for a in attempts if a.get("filled"))
+    return {
+        "success": filled_count > 0,
+        "burst_count": count,
+        "filled_count": filled_count,
+        "attempts": attempts,
+    }
+
+
 async def submit_entry_from_signal(
     settings: Settings,
     signal: TradingViewSignal,
@@ -1526,7 +1666,7 @@ def coerce_signal(payload: dict, settings: Settings) -> TradingViewSignal:
 
 app = FastAPI(
     title="spy-options-bridge",
-    version="5.5.5",
+    version="5.5.6",
     description="TradingView → Alpaca Paper multi-leg SPY credit spreads + auto GTC exits",
 )
 
@@ -1536,7 +1676,7 @@ async def startup_log() -> None:
     s = get_settings()
     broker_label = "Alpaca Paper" if s.use_alpaca else "Tastytrade Cert"
     logger.info(
-        "spy-options-bridge v5.5.5 started | broker=%s (%s) | configured=%s | mode=%s | auto_tp=%s auto_sl=%s chase=%s paper_force=%s",
+        "spy-options-bridge v5.5.6 started | broker=%s (%s) | configured=%s | mode=%s | auto_tp=%s auto_sl=%s chase=%s paper_force=%s",
         s.broker,
         broker_label,
         s.configured,
@@ -1567,7 +1707,8 @@ async def health() -> dict[str, str]:
     broker_name = "alpaca" if s.use_alpaca else s.broker
     return {
         "status": "ok",
-        "version": "5.5.5",
+        "version": "5.5.6",
+        "burst_endpoint": "/exercise/burst",
         "auto_take_profit": str(s.auto_take_profit),
         "auto_stop_loss": str(s.auto_stop_loss),
         "broker": broker_name,
@@ -1591,7 +1732,102 @@ async def health() -> dict[str, str]:
 @app.get("/ping")
 async def ping() -> dict[str, str]:
     """Lightweight keep-alive for cron pings (prevents Render free-tier cold starts)."""
-    return {"status": "ok", "version": "5.5.5"}
+    return {"status": "ok", "version": "5.5.6"}
+
+
+def _burst_paper_guard(settings: Settings) -> str | None:
+    if not settings.is_alpaca_paper:
+        return "Burst mode is paper-only — set APCA_API_BASE_URL to paper-api.alpaca.markets"
+    if not settings.configured:
+        return "Alpaca credentials not configured"
+    return None
+
+
+def _parse_burst_count(payload: dict[str, Any], query_count: int | None) -> int:
+    raw = payload.pop("burstCount", None) or payload.pop("burst_count", None)
+    if raw is not None:
+        try:
+            return max(1, min(int(raw), 200))
+        except (TypeError, ValueError):
+            pass
+    if query_count is not None:
+        return max(1, min(int(query_count), 200))
+    return 1
+
+
+@app.post("/exercise/burst")
+async def exercise_burst_endpoint(
+    request: Request,
+    count: int | None = None,
+    interval: float = 0.0,
+    x_webhook_secret: str | None = Header(default=None, alias="X-Webhook-Secret"),
+) -> JSONResponse:
+    """
+    Paper validation burst: N sequential exercise fills (min $0.05 credit, sync chase).
+    Query: ?count=N&interval=2  or JSON burstCount + webhookSecret.
+    Max 200 per request; use scripts/burst_paper_fills.py for long runs with client-side pacing.
+    """
+    settings = get_settings()
+    dry_run = not settings.is_live
+
+    guard = _burst_paper_guard(settings)
+    if guard:
+        return JSONResponse(status_code=200, content={"success": False, "message": guard, "dry_run": dry_run})
+
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    if not isinstance(payload, dict):
+        payload = {}
+
+    provided, payload = extract_webhook_secret(payload, x_webhook_secret)
+    auth_err = webhook_auth_error(provided, settings.webhook_secret)
+    if auth_err:
+        return JSONResponse(status_code=200, content={"success": False, "message": auth_err, "dry_run": dry_run})
+
+    burst_n = _parse_burst_count(payload, count)
+    interval_sec = float(payload.pop("burstInterval", payload.pop("burst_interval", interval)) or interval)
+
+    payload = dict(payload)
+    payload["fillMode"] = "exercise"
+    payload.setdefault("action", "PUT_CREDIT_SPREAD")
+    skip_exits = bool(payload.pop("skipExits", payload.pop("skip_exits", True)))
+
+    try:
+        signal = coerce_signal(payload, settings)
+        build_spread(signal, settings)
+    except (ValidationError, ValueError) as exc:
+        return JSONResponse(
+            status_code=200,
+            content={"success": False, "message": f"Bad payload: {exc}", "dry_run": dry_run},
+        )
+
+    try:
+        result = await run_burst_attempts(
+            settings,
+            signal,
+            burst_n,
+            interval_sec=interval_sec,
+            skip_exits=skip_exits,
+        )
+    except Exception as exc:
+        logger.exception("Burst failed: %s", exc)
+        return JSONResponse(
+            status_code=200,
+            content={"success": False, "message": str(exc), "dry_run": dry_run},
+        )
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "success": result["success"],
+            "message": f"Burst complete: {result['filled_count']}/{result['burst_count']} filled",
+            "dry_run": dry_run,
+            **result,
+        },
+    )
 
 
 @app.post("/exercise/entry")
@@ -1625,9 +1861,49 @@ async def exercise_entry_endpoint(
     if auth_err:
         return JSONResponse(status_code=200, content={"success": False, "message": auth_err, "dry_run": dry_run})
 
+    guard = _burst_paper_guard(settings)
+    if guard:
+        return JSONResponse(status_code=200, content={"success": False, "message": guard, "dry_run": dry_run})
+
     payload = dict(payload)
     payload["fillMode"] = "exercise"
     payload.setdefault("action", "PUT_CREDIT_SPREAD")
+
+    burst_n = _parse_burst_count(payload, None)
+    if burst_n > 1:
+        try:
+            signal = coerce_signal(payload, settings)
+            build_spread(signal, settings)
+        except (ValidationError, ValueError) as exc:
+            return JSONResponse(
+                status_code=200,
+                content={"success": False, "message": f"Bad payload: {exc}", "dry_run": dry_run},
+            )
+        interval_sec = float(payload.get("burstInterval", payload.get("burst_interval", 0)) or 0)
+        skip_exits = bool(payload.get("skipExits", payload.get("skip_exits", True)))
+        try:
+            result = await run_burst_attempts(
+                settings,
+                signal,
+                burst_n,
+                interval_sec=interval_sec,
+                skip_exits=skip_exits,
+            )
+        except Exception as exc:
+            logger.exception("Exercise burst failed: %s", exc)
+            return JSONResponse(
+                status_code=200,
+                content={"success": False, "message": str(exc), "dry_run": dry_run},
+            )
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": result["success"],
+                "message": f"Burst complete: {result['filled_count']}/{result['burst_count']} filled",
+                "dry_run": dry_run,
+                **result,
+            },
+        )
 
     try:
         signal = coerce_signal(payload, settings)
@@ -1639,7 +1915,7 @@ async def exercise_entry_endpoint(
         )
 
     try:
-        spread, entry, entry_credit = await submit_entry_from_signal(settings, signal)
+        attempt = await submit_entry_sync_chase(settings, signal, skip_exits=False)
     except Exception as exc:
         logger.exception("Exercise entry failed: %s", exc)
         return JSONResponse(
@@ -1647,17 +1923,16 @@ async def exercise_entry_endpoint(
             content={"success": False, "message": str(exc), "dry_run": dry_run},
         )
 
-    order_id = schedule_alpaca_exits_after_entry(settings, spread, entry, entry_credit)
     return JSONResponse(
         status_code=200,
         content={
-            "success": entry.success,
-            "message": entry.message,
+            "success": attempt.get("filled", False),
+            "message": attempt.get("message", ""),
             "dry_run": dry_run,
-            "order_id": order_id,
-            "limit_credit": spread.metadata.get("limit_credit"),
-            "expiration": spread.metadata.get("expiration"),
-            "broker_response": entry.broker_response if entry.success else None,
+            "order_id": attempt.get("order_id"),
+            "filled": attempt.get("filled"),
+            "status": attempt.get("status"),
+            "limit_credit": attempt.get("limit_credit"),
         },
     )
 
@@ -1714,6 +1989,58 @@ async def entry_endpoint(
                 "notifications": {},
             },
         )
+
+    burst_raw = payload.get("burstCount") or payload.get("burst_count")
+    if burst_raw is not None and settings.is_alpaca_paper:
+        burst_n = _parse_burst_count(dict(payload), None)
+        if burst_n > 1:
+            guard = _burst_paper_guard(settings)
+            if guard:
+                return JSONResponse(  # type: ignore[return-value]
+                    status_code=200,
+                    content={"success": False, "message": guard, "dry_run": dry_run, "notifications": {}},
+                )
+            clean_payload = dict(payload)
+            clean_payload["fillMode"] = "exercise"
+            try:
+                signal = coerce_signal(clean_payload, settings)
+                build_spread(signal, settings)
+            except (ValidationError, ValueError) as exc:
+                return JSONResponse(  # type: ignore[return-value]
+                    status_code=200,
+                    content={
+                        "success": False,
+                        "message": f"Bad burst payload: {exc}",
+                        "dry_run": dry_run,
+                        "notifications": {},
+                    },
+                )
+            interval_sec = float(clean_payload.get("burstInterval", clean_payload.get("burst_interval", 0)) or 0)
+            skip_exits = bool(clean_payload.get("skipExits", clean_payload.get("skip_exits", True)))
+            try:
+                result = await run_burst_attempts(
+                    settings,
+                    signal,
+                    burst_n,
+                    interval_sec=interval_sec,
+                    skip_exits=skip_exits,
+                )
+            except Exception as exc:
+                logger.exception("Entry burst failed: %s", exc)
+                return JSONResponse(  # type: ignore[return-value]
+                    status_code=200,
+                    content={"success": False, "message": str(exc), "dry_run": dry_run, "notifications": {}},
+                )
+            return JSONResponse(  # type: ignore[return-value]
+                status_code=200,
+                content={
+                    "success": result["success"],
+                    "message": f"Burst complete: {result['filled_count']}/{result['burst_count']} filled",
+                    "dry_run": dry_run,
+                    "notifications": {},
+                    **result,
+                },
+            )
 
     try:
         signal = coerce_signal(payload, settings)
