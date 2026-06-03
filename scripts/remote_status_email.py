@@ -14,7 +14,11 @@ import httpx
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from email_alerts import send_email_alert  # noqa: E402
+from team_email import (  # noqa: E402
+    notify_health_fail,
+    send_status,
+    send_test_and_permission_sample,
+)
 
 HEALTH_URL = "https://spy-options-bridge.onrender.com/health"
 MIN_VERSION = "5.5.8"
@@ -44,14 +48,13 @@ def main() -> int:
     ts = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
 
     if args.test:
-        body = (
-            f"SPY bridge test email.\n\n"
-            f"Time: {ts}\n"
-            f"If you received this, local SMTP / Render EMAIL_* is working.\n"
-            f"Recipient default: shieldinc850@gmail.com\n"
+        ok_status, ok_perm = send_test_and_permission_sample()
+        sent = ok_status or ok_perm
+        print(
+            "test+permission sample sent"
+            if sent
+            else "email disabled or failed — GUI Setup Email or SETUP-EMAIL-AUTOMATION.bat"
         )
-        sent = send_email_alert("SPY Bridge TEST email", body)
-        print("test email sent" if sent else "email disabled or failed — run SETUP-EMAIL-AUTOMATION.bat first")
         return 0 if sent else 1
 
     ok, data = fetch_health()
@@ -69,7 +72,7 @@ def main() -> int:
             f"URL: {HEALTH_URL}\n\n"
             f"TradingView → Render → Alpaca runs without your PC when Render is up."
         )
-        sent = send_email_alert(f"SPY Bridge ready ({ver})", body)
+        sent = send_status(body, headline=f"Bridge ready {ver}")
         print("daily-ready email sent" if sent else "email disabled or failed (see logs)")
         return 0
 
@@ -84,7 +87,7 @@ def main() -> int:
             f"Error: {err}\n"
             f"URL: {HEALTH_URL}\n"
         )
-        send_email_alert("SPY Bridge ALERT — health failed", body)
+        notify_health_fail(body)
         print("alert email sent (or disabled)")
         return 1
 

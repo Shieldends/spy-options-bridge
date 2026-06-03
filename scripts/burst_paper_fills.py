@@ -242,6 +242,13 @@ def main() -> int:
 
     log_line(f"DONE filled={filled_total}/{total}", log_file)
     print(f"\nRESULT: {filled_total}/{total} filled — log: {log_file}")
+    try:
+        sys.path.insert(0, str(ROOT / "scripts"))
+        from team_email import notify_burst_complete  # noqa: E402
+
+        notify_burst_complete(filled_total, total)
+    except Exception:
+        pass
     return 0 if filled_total > 0 else 1
 
 

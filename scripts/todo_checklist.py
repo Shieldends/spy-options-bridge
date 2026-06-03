@@ -10,6 +10,13 @@ from zoneinfo import ZoneInfo
 
 CHECKLIST_PATH = Path(r"C:\Users\Shiel\Desktop\USER-TODO-CHECKLIST.json")
 ET = ZoneInfo("America/New_York")
+USER_INBOX = "shieldinc850@gmail.com"
+
+USER_PREFS_DEFAULTS: dict[str, Any] = {
+    "user_wants_email": True,
+    "user_wants_burst": True,
+    "priority": ["email_setup", "render_email_env", "burst_931_et"],
+}
 
 DEFAULT_ITEMS: dict[str, bool] = {
     "email_setup_done": False,
@@ -68,6 +75,8 @@ def load_checklist() -> dict[str, Any]:
         "updated_at": data.get("updated_at", ""),
         "notes": data.get("notes", ""),
     }
+    for key, default in USER_PREFS_DEFAULTS.items():
+        out[key] = data.get(key, default)
     return out
 
 
@@ -75,8 +84,26 @@ def _fresh_checklist() -> dict[str, Any]:
     return {
         "items": dict(DEFAULT_ITEMS),
         "updated_at": datetime.now(ET).isoformat(timespec="seconds"),
-        "notes": "Auto-created — run Desktop bats to mark items done.",
+        "notes": "User confirmed email + burst — reply YES/NO to team emails.",
+        **USER_PREFS_DEFAULTS,
     }
+
+
+def user_wants_email() -> bool:
+    return bool(load_checklist().get("user_wants_email", True))
+
+
+def user_wants_burst() -> bool:
+    return bool(load_checklist().get("user_wants_burst", True))
+
+
+def set_user_prefs(*, email: bool | None = None, burst: bool | None = None) -> None:
+    data = load_checklist()
+    if email is not None:
+        data["user_wants_email"] = bool(email)
+    if burst is not None:
+        data["user_wants_burst"] = bool(burst)
+    save_checklist(data)
 
 
 def save_checklist(data: dict[str, Any]) -> None:
@@ -126,14 +153,20 @@ def ensure_live_defaults() -> None:
 def format_user_live_lines(*, team_running: bool, max_lines: int = 3) -> list[str]:
     """Human-required only — max 3 lines for popups."""
     lines: list[str] = []
+    data = load_checklist()
     if not team_running:
         lines.append("Click START TEAM (or leave SPY-LIVE-COMMAND open overnight)")
-    data = load_checklist()
+    if data.get("user_wants_email", True) and not data["items"].get("email_setup_done"):
+        lines.append("Email: GUI app password + Save → CONFIRM-RENDER-EMAIL.bat once")
+    elif data.get("user_wants_email", True) and not data["items"].get("render_email_env"):
+        lines.append("Render: CONFIRM-RENDER-EMAIL.bat (one click after dashboard SMTP)")
+    if data.get("user_wants_burst", True) and len(lines) < max_lines:
+        lines.append("Burst: click THURSDAY BURST at 9:31 ET")
     for key in USER_LIVE_REQUIRED:
-        if not data["items"].get(key):
-            lines.append(LABELS.get(key, key))
         if len(lines) >= max_lines:
             return lines[:max_lines]
+        if not data["items"].get(key):
+            lines.append(LABELS.get(key, key))
     return lines[:max_lines]
 
 

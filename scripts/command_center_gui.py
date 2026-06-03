@@ -36,6 +36,7 @@ GROK_PATHS = (
 ET = ZoneInfo("America/New_York")
 BTN_FONT = ("Segoe UI", 11, "bold")
 TITLE = "SPY Live Command"
+USER_EMAIL = email_setup.DEFAULT_TO
 
 
 class CommandCenterApp(tk.Tk):
@@ -52,8 +53,10 @@ class CommandCenterApp(tk.Tk):
         self._check_vars: dict[str, tk.BooleanVar] = {}
         self._status_var = tk.StringVar(value="Ready — click RENDER STATUS or START TEAM")
         self._live_banner_var = tk.StringVar(value="LIVE RUN: checking…")
+        self._prefs_var = tk.StringVar(value="")
 
         tc.ensure_live_defaults()
+        tc.set_user_prefs(email=True, burst=True)
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(500, self._refresh_checklist_ui)
@@ -77,21 +80,30 @@ class CommandCenterApp(tk.Tk):
             fg="#0a5",
             wraplength=520,
             justify=tk.CENTER,
-        ).grid(row=0, column=0, columnspan=2, pady=(0, 10), sticky="ew")
+        ).grid(row=0, column=0, columnspan=2, pady=(4, 4), sticky="ew")
+
+        tk.Label(
+            main,
+            textvariable=self._prefs_var,
+            font=("Segoe UI", 10),
+            fg="#036",
+            wraplength=520,
+            justify=tk.CENTER,
+        ).grid(row=1, column=0, columnspan=2, pady=(0, 8), sticky="ew")
 
         buttons: list[tuple[str, callable]] = [
             ("START TEAM", self._start_team),
             ("WHAT'S LEFT?", self._whats_left),
             ("OPTIONAL: Setup Email", self._setup_email_dialog),
-            ("TEST EMAIL", self._test_email),
+            ("SEND TEST + PERMISSION SAMPLE", self._test_permission_email),
             ("OPEN REPORTS", self._open_reports),
             ("OPEN GROK SYNC", self._open_grok_sync),
-            ("THURSDAY BURST", self._thursday_burst),
+            ("THURSDAY BURST (9:31 ET)", self._thursday_burst),
             ("STOP ALL", self._stop_all),
             ("RENDER STATUS", self._render_status),
         ]
         for idx, (label, cmd) in enumerate(buttons):
-            row, col = divmod(idx + 1, 2)
+            row, col = divmod(idx + 2, 2)
             ttk.Button(main, text=label, command=cmd, width=22).grid(
                 row=row, column=col, padx=6, pady=6, sticky="ew"
             )
@@ -159,6 +171,13 @@ class CommandCenterApp(tk.Tk):
             self._live_banner_var.set("LIVE RUN: READY")
         else:
             self._live_banner_var.set("NEEDS: click START TEAM")
+        data = tc.load_checklist()
+        parts: list[str] = []
+        if data.get("user_wants_email", True):
+            parts.append("Email alerts ON (you confirmed)")
+        if data.get("user_wants_burst", True):
+            parts.append("Burst 9:31 ET ON (you confirmed)")
+        self._prefs_var.set("YOU WANT: " + " | ".join(parts) if parts else "")
 
     def _refresh_checklist_ui(self) -> None:
         tc.ensure_live_defaults()
@@ -218,27 +237,27 @@ class CommandCenterApp(tk.Tk):
 
     def _setup_email_dialog(self) -> None:
         dlg = tk.Toplevel(self)
-        dlg.title("Setup Email")
-        dlg.geometry("420x220")
+        dlg.title("Setup Email (1 field)")
+        dlg.geometry("440x200")
         dlg.transient(self)
         dlg.grab_set()
 
-        ttk.Label(dlg, text="Gmail address:").pack(anchor=tk.W, padx=12, pady=(12, 0))
-        user_entry = ttk.Entry(dlg, width=42)
-        user_entry.pack(padx=12, pady=4)
-
-        ttk.Label(dlg, text="App password (16 chars, hidden):").pack(anchor=tk.W, padx=12)
+        ttk.Label(
+            dlg,
+            text=f"From/To (fixed): {USER_EMAIL}",
+            wraplength=400,
+        ).pack(anchor=tk.W, padx=12, pady=(12, 0))
+        ttk.Label(dlg, text="Gmail app password (16 chars, hidden):").pack(anchor=tk.W, padx=12)
         pass_entry = ttk.Entry(dlg, width=42, show="*")
         pass_entry.pack(padx=12, pady=4)
 
         def save() -> None:
-            user = user_entry.get().strip()
-            pwd = pass_entry.get().strip()
-            if not user or not pwd:
-                messagebox.showerror(TITLE, "Enter Gmail address and app password.", parent=dlg)
+            pwd = pass_entry.get().strip().replace(" ", "")
+            if not pwd:
+                messagebox.showerror(TITLE, "Enter app password.", parent=dlg)
                 return
             try:
-                email_setup.save_gmail_credentials(user, pwd)
+                email_setup.save_app_password_only(pwd)
                 email_setup._mark_google_bat_only()
             except Exception as exc:
                 messagebox.showerror(TITLE, f"Save failed: {type(exc).__name__}", parent=dlg)
@@ -249,18 +268,27 @@ class CommandCenterApp(tk.Tk):
             self._set_status("Email .env saved (password not shown)")
             messagebox.showinfo(
                 TITLE,
-                f"Local .env updated.\n\nAlso set same EMAIL_* on Render → Manual Deploy.\n\n"
-                f"{email_setup.RENDER_HINT[:120]}…",
+                "Local .env saved.\n\n"
+                "Next: Desktop CONFIRM-RENDER-EMAIL.bat (one click) — same SMTP on Render, Manual Deploy.\n\n"
+                "Then: SEND TEST + PERMISSION SAMPLE.",
             )
 
         ttk.Button(dlg, text="Save", command=save).pack(pady=12)
 
-    def _test_email(self) -> None:
-        self._set_status("Sending test email…")
+    def _test_permission_email(self) -> None:
+        self._set_status("Sending test + permission sample…")
+        cc._load_dotenv()
+        sys.path.insert(0, str(SCRIPTS))
+        import team_email as te  # noqa: E402
 
         def run() -> None:
-            code = email_setup.run_test_send()
-            msg = "Test email sent." if code == 0 else f"Test send exit code {code}"
+            ok_status, ok_perm = te.send_test_and_permission_sample()
+            code = 0 if (ok_status or ok_perm) else 1
+            msg = (
+                "Status + permission sample sent — reply YES to the permission email."
+                if code == 0
+                else "Email failed — run OPTIONAL Setup Email first."
+            )
             if code == 0:
                 try:
                     tc.mark_done("email_test_done")
@@ -274,7 +302,7 @@ class CommandCenterApp(tk.Tk):
         self._refresh_checklist_ui()
         self._set_status(msg)
         if code == 0:
-            messagebox.showinfo(TITLE, f"{msg}\nRecipient: shieldinc850@gmail.com")
+            messagebox.showinfo(TITLE, f"{msg}\nInbox: {USER_EMAIL}")
         else:
             messagebox.showwarning(TITLE, msg)
 
@@ -289,12 +317,14 @@ class CommandCenterApp(tk.Tk):
         self._set_status("Opened cursor_inbox + grok_outbox")
 
     def _thursday_burst(self) -> None:
-        if not messagebox.askyesno(
-            TITLE,
-            "Run Thursday burst proof?\n\n"
-            "100 paper fills at ~9:31 ET (bypasses TradingView).\n"
-            "Only use when you intend burst testing.",
-        ):
+        now = datetime.now(ET)
+        schedule = (
+            "Scheduled: click this button at 9:31 ET Thursday.\n\n"
+            "100 paper fills (bypasses TradingView). You confirmed this test.\n\n"
+            "Launch now only if market is open and you intend to run early."
+        )
+        if not messagebox.askyesno(TITLE, schedule + "\n\nLaunch burst now?"):
+            self._set_status("Burst: waiting for 9:31 ET click")
             return
         if BURST_BAT.exists():
             subprocess.Popen(

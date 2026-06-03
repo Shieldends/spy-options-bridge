@@ -11,9 +11,11 @@ from zoneinfo import ZoneInfo
 import httpx
 
 ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(SCRIPTS))
 
-from email_alerts import send_email_alert  # noqa: E402
+from team_email import notify_health_fail  # noqa: E402
 
 RENDER_PING = "https://spy-options-bridge.onrender.com/ping"
 INTERVAL_SEC = 300
@@ -54,11 +56,10 @@ def main() -> int:
                 consecutive_fails += 1
                 if consecutive_fails >= FAIL_EMAIL_THRESHOLD:
                     ts = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
-                    send_email_alert(
-                        "SPY Bridge keepalive — 3 ping failures",
-                        f"Render /ping failed {consecutive_fails} times in a row.\n"
-                        f"Time: {ts}\nURL: {RENDER_PING}\n"
-                        f"Check Render dashboard or wait for cold-start recovery.",
+                    notify_health_fail(
+                        f"Render /ping failed {consecutive_fails} times in a row. "
+                        f"Time: {ts}. URL: {RENDER_PING}. "
+                        "Check Render or wait for cold-start recovery."
                     )
                     consecutive_fails = 0
             time.sleep(INTERVAL_SEC)

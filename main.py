@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 import time
 from datetime import datetime, timedelta
 from enum import Enum
@@ -39,7 +40,13 @@ from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
 import httpx
+from pathlib import Path
 from email_alerts import send_email_alert
+
+_scripts_dir = Path(__file__).resolve().parent / "scripts"
+if _scripts_dir.is_dir() and str(_scripts_dir) not in sys.path:
+    sys.path.insert(0, str(_scripts_dir))
+from team_email import bridge_notify as team_bridge_notify  # noqa: E402
 from fastapi import BackgroundTasks, FastAPI, Header, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
@@ -1092,9 +1099,10 @@ async def notify(
         plain = f"[{level}] {title}\n{body}"
         try:
             ok = await asyncio.to_thread(
-                send_email_alert,
-                f"SPY Bridge: {title}",
+                team_bridge_notify,
+                title,
                 plain,
+                level=level,
                 settings=settings,
             )
             if ok:

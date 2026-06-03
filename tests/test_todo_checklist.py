@@ -31,6 +31,8 @@ def checklist_file(tmp_path, monkeypatch):
     path.write_text(
         json.dumps(
             {
+                "user_wants_email": True,
+                "user_wants_burst": False,
                 "items": {
                     "email_setup_done": False,
                     "email_test_done": False,
@@ -39,7 +41,7 @@ def checklist_file(tmp_path, monkeypatch):
                     "keepalive_running": False,
                     "tradingview_alerts_confirmed": True,
                     "alpaca_old_orders_canceled": True,
-                }
+                },
             }
         ),
         encoding="utf-8",
@@ -81,7 +83,14 @@ def test_format_user_live_lines_team_off(checklist_file):
 
 def test_format_user_live_lines_team_on(checklist_file):
     lines = tc.format_user_live_lines(team_running=True)
-    assert lines == []
+    assert len(lines) <= 3
+    assert any("Email" in line for line in lines)
+
+
+def test_user_prefs_defaults(checklist_file):
+    data = tc.load_checklist()
+    assert data.get("user_wants_email") is True
+    assert "burst_931" in str(data.get("priority", ""))
 
 
 def test_ensure_live_defaults(checklist_file):

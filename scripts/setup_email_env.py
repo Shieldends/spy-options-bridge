@@ -87,6 +87,11 @@ def _mark_google_bat_only() -> None:
         pass
 
 
+def save_app_password_only(smtp_pass: str, *, email_to: str = DEFAULT_TO) -> None:
+    """GUI path: inbox fixed to DEFAULT_TO — user only types app password."""
+    save_gmail_credentials(DEFAULT_TO, smtp_pass, email_from=DEFAULT_TO, email_to=email_to)
+
+
 def save_gmail_credentials(
     smtp_user: str,
     smtp_pass: str,
