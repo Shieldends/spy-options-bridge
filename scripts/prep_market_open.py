@@ -147,8 +147,8 @@ def run_once(
     health = hr.json()
     ver = health.get("version", "?")
     print(f"health version={ver} configured={health.get('configured')} paper_force={health.get('paper_force_min_fill')}")
-    if str(ver) < "5.5.3":
-        print(f"WARN: expected version >= 5.5.3 (got {ver}) — deploy Render after push")
+    if str(ver) < "5.5.4":
+        print(f"WARN: expected version >= 5.5.4 (got {ver}) — deploy Render after push")
 
     body = {
         "webhookSecret": secret,
@@ -160,9 +160,8 @@ def run_once(
         "strikeOffsetLong": -6,
         "quantity": 1,
         "fillMode": "exercise",
-        "limitCredit": 0.55,
     }
-    entry_paths = ["/entry", "/exercise/entry"]
+    entry_paths = ["/exercise/entry", "/entry"]
     er = None
     data: dict = {}
     for path in entry_paths:
@@ -175,6 +174,8 @@ def run_once(
             data = er.json()
         except Exception:
             data = {}
+        if path == "/entry" and data.get("processing"):
+            print("  (background /entry — no order_id; fill poll may be inconclusive)")
         break
     if er is None:
         print("FAIL: no entry response")
@@ -187,15 +188,18 @@ def run_once(
         print("FAIL: exercise entry rejected")
         fails += 1
     else:
-        ok, msg = poll_mleg_fill(env, str(order_id) if order_id else None, fill_timeout)
-        if ok:
-            print(f"PASS entry fill: {msg}")
+        if not order_id and not clock.get("is_open"):
+            print("PASS entry accepted (market closed — fill expected at open)")
         else:
-            print(f"WARN entry fill: {msg}")
-            if not clock.get("is_open"):
-                print("  (expected if market closed — order may fill at Thursday open)")
+            ok, msg = poll_mleg_fill(env, str(order_id) if order_id else None, fill_timeout)
+            if ok:
+                print(f"PASS entry fill: {msg}")
             else:
-                fails += 1
+                print(f"WARN entry fill: {msg}")
+                if not clock.get("is_open"):
+                    print("  (expected if market closed — order may fill at Thursday open)")
+                else:
+                    fails += 1
 
     if test_warning:
         atm = round(spy)
