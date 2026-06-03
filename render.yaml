@@ -20,6 +20,16 @@ services:
         value: "-6"
       - key: DEFAULT_LIMIT_CREDIT
         value: "0.55"
+      - key: DEFAULT_FILL_MODE
+        value: aggressive
+      - key: AUTO_CHASE_ENTRY_FILL
+        value: true
+      - key: ENTRY_CHASE_WAIT_SECONDS
+        value: "8"
+      - key: ENTRY_CHASE_MAX_ATTEMPTS
+        value: "10"
+      - key: ENTRY_MIN_CREDIT
+        value: "0.05"
       - key: AUTO_TAKE_PROFIT
         value: true
       - key: TAKE_PROFIT_PCT

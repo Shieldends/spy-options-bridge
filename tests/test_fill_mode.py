@@ -64,3 +64,17 @@ def test_cap_limits_high_fixed():
     }
     credit, _ = estimate_credit_from_quotes(spread, quotes, mode="auto", cap=0.55)
     assert credit == 0.55
+
+
+def test_no_quotes_fallback_starts_at_floor_not_cap():
+    spread = SpreadPackage(
+        qty="1",
+        legs=[
+            SpreadLeg(symbol="SPY260605P00752000", side="sell", position_intent="sell_to_open"),
+            SpreadLeg(symbol="SPY260605P00751000", side="buy", position_intent="buy_to_open"),
+        ],
+        metadata={},
+    )
+    credit, meta = estimate_credit_from_quotes(spread, {}, mode="aggressive", cap=0.55)
+    assert credit == 0.05
+    assert meta["quote_source"] == "fallback_no_quotes"

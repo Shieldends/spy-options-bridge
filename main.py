@@ -1,5 +1,5 @@
 """
-spy-options-bridge v5.5.1 — ALPACA PAPER (default broker)
+spy-options-bridge v5.5.2 — ALPACA PAPER (default broker)
 
 TradingView webhook → Render → Alpaca multi-leg SPY put credit spreads.
 
@@ -83,6 +83,11 @@ class Settings(BaseSettings):
     default_dte_filter: str = Field(default="weekly", alias="DEFAULT_DTE_FILTER")
     alpaca_exit_fill_timeout: int = Field(default=600, alias="ALPACA_EXIT_FILL_TIMEOUT")
     alpaca_exit_poll_seconds: float = Field(default=3.0, alias="ALPACA_EXIT_POLL_SECONDS")
+    auto_chase_entry_fill: bool = Field(default=True, alias="AUTO_CHASE_ENTRY_FILL")
+    entry_chase_wait_seconds: float = Field(default=8.0, alias="ENTRY_CHASE_WAIT_SECONDS")
+    entry_chase_poll_seconds: float = Field(default=3.0, alias="ENTRY_CHASE_POLL_SECONDS")
+    entry_chase_max_attempts: int = Field(default=10, alias="ENTRY_CHASE_MAX_ATTEMPTS")
+    entry_min_credit: float = Field(default=0.05, alias="ENTRY_MIN_CREDIT")
 
     discord_webhook_url: str = Field(default="", alias="DISCORD_WEBHOOK_URL")
     telegram_bot_token: str = Field(default="", alias="TELEGRAM_BOT_TOKEN")
@@ -93,8 +98,8 @@ class Settings(BaseSettings):
     default_strike_offset_short: int = Field(default=-5, alias="DEFAULT_STRIKE_OFFSET_SHORT")
     default_strike_offset_long: int = Field(default=-8, alias="DEFAULT_STRIKE_OFFSET_LONG")
     default_limit_credit: float = Field(default=0.35, alias="DEFAULT_LIMIT_CREDIT")
-    default_fill_mode: str = Field(default="fixed", alias="DEFAULT_FILL_MODE")
-    # fixed | auto | aggressive — auto/aggressive quote real credit from Alpaca (better fills on OTM spreads)
+    default_fill_mode: str = Field(default="aggressive", alias="DEFAULT_FILL_MODE")
+    # fixed | auto | aggressive | exercise | fill — exercise/fill lean low for paper fills
     max_quantity: int = Field(default=0, alias="MAX_QUANTITY")
     # 0 = no cap; set e.g. 10 to limit spreads per alert
 
@@ -488,14 +493,19 @@ def snap_call_credit_strikes(short_target: float, long_target: float, available:
 
 
 def _normalize_fill_mode(mode: str | None, settings: Settings) -> str:
-    raw = (mode or settings.default_fill_mode or "fixed").strip().lower()
+    raw = (mode or settings.default_fill_mode or "aggressive").strip().lower()
     if raw in {"auto", "market", "mid", "quote"}:
         return "auto"
-    if raw in {"aggressive", "fast", "fill"}:
+    if raw in {"aggressive", "fast"}:
         return "aggressive"
-    if raw in {"exercise", "expedite", "probe", "system_test"}:
+    if raw in {"exercise", "expedite", "probe", "system_test", "fill"}:
         return "exercise"
     return "fixed"
+
+
+def _quote_fallback_credit(cap: float | None, *, floor: float = 0.05) -> float:
+    """When bid/ask are missing, start low — chasing will reprice down if needed."""
+    return floor
 
 
 async def fetch_option_snapshot_quotes(settings: Settings, symbols: list[str]) -> dict[str, dict[str, float]]:
@@ -561,18 +571,18 @@ def estimate_credit_from_quotes(
     }
 
     if short_bid <= 0 and long_ask <= 0:
-        fallback = cap if cap is not None else 0.35
+        fallback = _quote_fallback_credit(cap)
         meta["quote_source"] = "fallback_no_quotes"
         return fallback, meta
 
     mid_credit = max((short_bid + short_q.get("ask", short_bid)) / 2 - (long_ask + long_q.get("bid", long_ask)) / 2, 0.05)
     natural = max(short_bid - long_ask, 0.05)
     if mode == "aggressive":
-        credit = max(natural * 0.97 - 0.01, 0.05)
+        credit = max(natural * 0.80 - 0.02, 0.05)
         meta["quote_source"] = "bid_ask_aggressive"
     elif mode == "exercise":
-        # System validation: lean below market credit for faster paper fills (not for live profit tuning).
-        credit = max(natural * 0.80 - 0.03, 0.05)
+        # Paper / validation: price well below market for faster fills.
+        credit = max(natural * 0.55 - 0.05, 0.05)
         meta["quote_source"] = "bid_ask_exercise"
     else:
         credit = max(min(natural, mid_credit), 0.05)
@@ -1154,6 +1164,70 @@ async def fetch_alpaca_order(settings: Settings, order_id: str) -> dict[str, Any
         return {"raw": r.text}
 
 
+async def replace_alpaca_order_limit(settings: Settings, order_id: str, credit: float) -> bool:
+    """Lower limit credit on a resting mleg entry to improve fill odds."""
+    base = settings.apca_api_base_url.rstrip("/")
+    payload = {"limit_price": format_alpaca_limit_price(credit, is_credit=True)}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.patch(f"{base}/v2/orders/{order_id}", headers=_alpaca_headers(settings), json=payload)
+    if r.is_success:
+        logger.info("Chase fill: order %s repriced to $%s credit", order_id, credit)
+        return True
+    logger.warning("Chase fill replace failed (%s): %s", r.status_code, r.text[:200])
+    return False
+
+
+async def wait_and_chase_alpaca_entry_fill(
+    settings: Settings,
+    order_id: str,
+    initial_credit: float,
+) -> dict[str, Any] | None:
+    """
+    Poll for fill; if still open, repeatedly lower limit credit until filled or floor hit.
+    Needed because Alpaca paper often leaves mleg orders at status=new when limit is too high.
+    """
+    terminal = {"canceled", "expired", "rejected", "failed", "done_for_day"}
+    credit = round(initial_credit, 2)
+    floor = round(settings.entry_min_credit, 2)
+    max_attempts = settings.entry_chase_max_attempts if settings.auto_chase_entry_fill else 0
+
+    for attempt in range(max_attempts + 1):
+        deadline = time.monotonic() + settings.entry_chase_wait_seconds
+        while time.monotonic() < deadline:
+            order = await fetch_alpaca_order(settings, order_id)
+            status = str(order.get("status", "")).lower()
+            if status == "filled":
+                logger.info("Alpaca entry %s filled (attempt %s, credit=$%s)", order_id, attempt, credit)
+                return order
+            if status in terminal:
+                logger.warning("Alpaca entry %s stopped as %s", order_id, status)
+                return None
+            await asyncio.sleep(settings.entry_chase_poll_seconds)
+
+        if attempt >= max_attempts:
+            break
+
+        new_credit = max(round(credit * 0.75 - 0.02, 2), floor)
+        if new_credit >= credit:
+            new_credit = max(round(credit - 0.05, 2), floor)
+        if new_credit >= credit:
+            logger.info("Chase fill: order %s already at floor $%s", order_id, credit)
+            break
+
+        if not await replace_alpaca_order_limit(settings, order_id, new_credit):
+            break
+        credit = new_credit
+        await notify(
+            settings,
+            "Chasing Entry Fill",
+            f"Order {order_id[:8]}… repriced to ${credit:.2f} credit (attempt {attempt + 1})",
+            "INFO",
+        )
+
+    logger.warning("Alpaca entry %s not filled after chase — last credit $%s", order_id, credit)
+    return None
+
+
 async def wait_for_alpaca_entry_fill(
     settings: Settings,
     order_id: str,
@@ -1204,22 +1278,32 @@ def spread_with_credit(spread: SpreadPackage, credit: float) -> SpreadPackage:
     )
 
 
-async def alpaca_place_exits_after_fill(settings: Settings, spread: SpreadPackage, entry_order_id: str) -> None:
-    """Background task: after entry fill, submit GTC take-profit + stop-loss (rest on Alpaca)."""
+async def alpaca_place_exits_after_fill(
+    settings: Settings,
+    spread: SpreadPackage,
+    entry_order_id: str,
+    *,
+    initial_credit: float | None = None,
+) -> None:
+    """Background task: chase entry fill, then submit GTC take-profit + stop-loss."""
     if not settings.is_live or not settings.alpaca_configured:
         return
 
-    filled = await wait_for_alpaca_entry_fill(
-        settings,
-        entry_order_id,
-        max_wait_sec=settings.alpaca_exit_fill_timeout,
-        poll_sec=settings.alpaca_exit_poll_seconds,
-    )
+    start_credit = initial_credit if initial_credit is not None else float(spread.metadata["limit_credit"])
+    if settings.auto_chase_entry_fill:
+        filled = await wait_and_chase_alpaca_entry_fill(settings, entry_order_id, start_credit)
+    else:
+        filled = await wait_for_alpaca_entry_fill(
+            settings,
+            entry_order_id,
+            max_wait_sec=settings.alpaca_exit_fill_timeout,
+            poll_sec=settings.alpaca_exit_poll_seconds,
+        )
     if not filled:
         await notify(
             settings,
-            "Auto Exits Not Placed",
-            f"Entry order {entry_order_id} did not fill in time — no GTC TP/SL submitted",
+            "Entry Not Filled",
+            f"Order {entry_order_id} never filled (chased down to ${settings.entry_min_credit}) — no GTC TP/SL",
             "CRITICAL",
         )
         return
@@ -1333,8 +1417,16 @@ async def process_entry_alert(settings: Settings, signal: TradingViewSignal) -> 
 
         elif settings.use_alpaca and (settings.auto_take_profit or settings.auto_stop_loss):
             order_id = (entry.broker_response or {}).get("id")
+            entry_credit = float(spread.metadata["limit_credit"])
             if order_id:
-                asyncio.create_task(alpaca_place_exits_after_fill(settings, spread, str(order_id)))
+                asyncio.create_task(
+                    alpaca_place_exits_after_fill(
+                        settings,
+                        spread,
+                        str(order_id),
+                        initial_credit=entry_credit,
+                    )
+                )
                 logger.info("Alpaca: scheduled auto GTC exits after fill for order %s", order_id)
             else:
                 logger.error("Alpaca entry accepted but no order id — cannot schedule auto exits")
@@ -1364,7 +1456,7 @@ def coerce_signal(payload: dict, settings: Settings) -> TradingViewSignal:
 
 app = FastAPI(
     title="spy-options-bridge",
-    version="5.5.1",
+    version="5.5.2",
     description="TradingView → Alpaca Paper multi-leg SPY credit spreads + auto GTC exits",
 )
 
@@ -1374,13 +1466,14 @@ async def startup_log() -> None:
     s = get_settings()
     broker_label = "Alpaca Paper" if s.use_alpaca else "Tastytrade Cert"
     logger.info(
-        "spy-options-bridge v5.5.1 started | broker=%s (%s) | configured=%s | mode=%s | auto_tp=%s auto_sl=%s",
+        "spy-options-bridge v5.5.2 started | broker=%s (%s) | configured=%s | mode=%s | auto_tp=%s auto_sl=%s chase=%s",
         s.broker,
         broker_label,
         s.configured,
         s.execution_mode,
         s.auto_take_profit,
         s.auto_stop_loss,
+        s.auto_chase_entry_fill,
     )
 
 SECRET_BODY_KEYS = ("webhookSecret", "webhook_secret", "secret")
@@ -1403,7 +1496,7 @@ async def health() -> dict[str, str]:
     broker_name = "alpaca" if s.use_alpaca else s.broker
     return {
         "status": "ok",
-        "version": "5.5.1",
+        "version": "5.5.2",
         "auto_take_profit": str(s.auto_take_profit),
         "auto_stop_loss": str(s.auto_stop_loss),
         "broker": broker_name,
@@ -1415,6 +1508,8 @@ async def health() -> dict[str, str]:
         "auto_close_on_warning": str(s.auto_close_on_warning),
         "warning_close_multiplier": str(s.warning_close_multiplier),
         "default_fill_mode": s.default_fill_mode,
+        "auto_chase_entry_fill": str(s.auto_chase_entry_fill),
+        "entry_min_credit": str(s.entry_min_credit),
         "deploy_file": "main.py (root — NOT app/main.py)",
     }
 
@@ -1422,7 +1517,7 @@ async def health() -> dict[str, str]:
 @app.get("/ping")
 async def ping() -> dict[str, str]:
     """Lightweight keep-alive for cron pings (prevents Render free-tier cold starts)."""
-    return {"status": "ok", "version": "5.5.1"}
+    return {"status": "ok", "version": "5.5.2"}
 
 
 @app.post("/entry", response_model=EntryResponse)
