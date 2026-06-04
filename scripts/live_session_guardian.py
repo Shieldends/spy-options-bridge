@@ -105,9 +105,10 @@ def alpaca_line(env: dict[str, str]) -> str:
 
 
 def worker_line() -> str:
-    counts = {s: len(dedupe.pids_for_script(s)) for s in cc.TEAM_WORKER_SCRIPTS}
+    status = cc.team_worker_status()
+    counts = {s: (1 if status.get(s) else 0) for s in cc.TEAM_WORKER_SCRIPTS}
     dupes = [k for k, v in counts.items() if v > 1]
-    core = counts.get("dual_sync_loop.py", 0) >= 1 and counts.get("bridge_keepalive.py", 0) >= 1
+    core = status.get("dual_sync_loop.py") and status.get("bridge_keepalive.py")
     note = " READY" if core and not dupes else " WARN"
     if dupes:
         note += f" dupes={','.join(dupes)}"
@@ -125,10 +126,9 @@ def ensure_core_workers() -> list[str]:
             continue
         cc.spawn_worker(name, script, args)
         actions.append(f"spawned {name}")
-    dupes = [s for s in cc.TEAM_WORKER_SCRIPTS if len(dedupe.pids_for_script(s)) > 1]
-    if dupes:
+    if any(cc.team_worker_status().values()):
         cc.dedupe_worker_duplicates_only()
-        actions.append(f"deduped {','.join(dupes)}")
+        actions.append("dedupe pass")
     return actions
 
 

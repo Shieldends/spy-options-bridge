@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from security_utils import run_hidden  # noqa: E402
+
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = Path(__file__).resolve().parent
 DESKTOP = Path(r"C:\Users\Shiel\Desktop")
@@ -24,7 +26,7 @@ def _pid_alive(pid: int) -> bool:
             return True
         except OSError:
             return False
-    proc = subprocess.run(
+    proc = run_hidden(
         ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
         capture_output=True,
         text=True,
@@ -96,7 +98,7 @@ def stop_guardian() -> tuple[bool, str]:
     if not pid:
         return True, "Guardian not running"
     if sys.platform == "win32":
-        subprocess.run(
+        run_hidden(
             ["taskkill", "/PID", str(pid), "/F"],
             capture_output=True,
             check=False,

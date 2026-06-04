@@ -319,9 +319,13 @@ class CommandCenterApp(tk.Tk):
             self._set_status("Missing RUN-TRIGGER-CHAIN-PROOF.bat on Desktop")
             return
         self._set_status("Running trigger chain proof…")
-        subprocess.Popen(
-            ["cmd", "/c", "start", "/wait", str(TRIGGER_PROOF_BAT)],
-            cwd=str(DESKTOP),
+        from security_utils import run_hidden  # noqa: E402
+
+        run_hidden(
+            [str(cc.pythonw_exe()), str(SCRIPTS / "trigger_chain_proof.py")],
+            cwd=str(ROOT),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
         self.after(2000, self._update_live_banner)
         self._set_status("Trigger proof finished — open TRIGGER PROOF REPORT")
@@ -374,9 +378,11 @@ class CommandCenterApp(tk.Tk):
         if not note or not str(note).strip():
             return
         py = cc.python_exe()
-        proc = subprocess.run(
+        from security_utils import run_hidden  # noqa: E402
+
+        proc = run_hidden(
             [
-                str(py),
+                str(cc.pythonw_exe()),
                 str(SCRIPTS / "cursor_handoff.py"),
                 "--topic",
                 "Command Center team note",
@@ -391,7 +397,6 @@ class CommandCenterApp(tk.Tk):
             encoding="utf-8",
             errors="replace",
             timeout=60,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if sys.platform == "win32" else 0,
         )
         if proc.returncode == 0:
             self._set_status("Handoff posted to cursor_inbox.md")
@@ -451,19 +456,8 @@ class CommandCenterApp(tk.Tk):
             self._handoff_var.set(handoff[:200] if handoff else "Team sync: (no recent handoff line)")
 
     def _reconcile_team_helpers(self) -> None:
-        """Dedupe duplicate helpers only — auto-respawn fights console supervisor (20min loops)."""
+        """Refresh UI only — no dedupe/spawn (prevents blue/black console flashes)."""
         self._prune_dead_procs()
-        if not (DESKTOP / "OPERATOR-GRANT.json").is_file():
-            return
-        try:
-            import dedupe_spy_workers as dedupe  # noqa: E402
-
-            dupes = [s for s in cc.TEAM_WORKER_SCRIPTS if len(dedupe.pids_for_script(s)) > 1]
-            if dupes:
-                cc.dedupe_worker_duplicates_only()
-                cc.log_line(f"GUI reconcile deduped: {', '.join(dupes)}")
-        except Exception:
-            pass
 
     def _prune_dead_procs(self) -> None:
         dead = [name for name, p in self.procs.items() if p.poll() is not None]
@@ -513,8 +507,10 @@ class CommandCenterApp(tk.Tk):
     def _run_eod_report(self) -> None:
         self._set_status("Building EOD report…")
         py = cc.python_exe()
-        proc = subprocess.run(
-            [str(py), str(SCRIPTS / "eod_session_report.py"), "--email"],
+        from security_utils import run_hidden  # noqa: E402
+
+        proc = run_hidden(
+            [str(cc.pythonw_exe()), str(SCRIPTS / "eod_session_report.py"), "--email"],
             cwd=str(ROOT),
             capture_output=True,
             text=True,

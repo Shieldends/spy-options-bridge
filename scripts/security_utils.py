@@ -32,6 +32,15 @@ def redact_line(line: str) -> str:
     return line
 
 
+def background_python_exe(root: Path) -> str:
+    """pythonw.exe for child workers (no black console flash)."""
+    pw = root / ".venv" / "Scripts" / "pythonw.exe"
+    if pw.is_file():
+        return str(pw)
+    py = root / ".venv" / "Scripts" / "python.exe"
+    return str(py if py.is_file() else root)
+
+
 def hidden_subprocess_flags() -> int:
     """Windows: run PowerShell/task tools without flashing a blue console."""
     if sys.platform != "win32":

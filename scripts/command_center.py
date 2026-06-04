@@ -95,6 +95,15 @@ def python_exe() -> Path:
     return venv_py if venv_py.exists() else Path(sys.executable)
 
 
+def pythonw_exe() -> Path:
+    venv_pw = ROOT / ".venv" / "Scripts" / "pythonw.exe"
+    return venv_pw if venv_pw.exists() else python_exe()
+
+
+_worker_check_cache: dict[str, tuple[float, bool]] = {}
+_WORKER_CACHE_SEC = 45.0
+
+
 def log_line(msg: str) -> None:
     ts = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
     line = f"{ts} {msg}"
@@ -116,7 +125,7 @@ def print_banner() -> None:
 
 
 def worker_command(script: str, extra_args: list[str]) -> list[str]:
-    py = python_exe()
+    py = pythonw_exe()
     return [str(py), str(SCRIPTS / script), *extra_args]
 
 
@@ -188,6 +197,10 @@ def worker_already_running(script: str) -> bool:
     """Avoid duplicate worker if same script already in a python process."""
     if sys.platform != "win32":
         return False
+    now = time.time()
+    cached = _worker_check_cache.get(script)
+    if cached and now - cached[0] < _WORKER_CACHE_SEC:
+        return cached[1]
     needle = script.replace("\\", "/").replace("'", "''")
     ps = _win_python_process_where(f"[regex]::Escape('{needle}')")
     try:
@@ -198,9 +211,12 @@ def worker_already_running(script: str) -> bool:
             timeout=20,
         )
     except (subprocess.TimeoutExpired, OSError):
+        _worker_check_cache[script] = (now, False)
         return False
     pid = (proc.stdout or "").strip()
-    return bool(pid and pid.isdigit())
+    ok = bool(pid and pid.isdigit())
+    _worker_check_cache[script] = (now, ok)
+    return ok
 
 
 TEAM_WORKER_SCRIPTS = (
@@ -289,24 +305,22 @@ def team_worker_status() -> dict[str, bool]:
 
 
 def dedupe_worker_duplicates_only() -> None:
-    """Kill extra dual_sync/keepalive/redundant PIDs only — never wipe the whole team."""
+    """Kill extra worker PIDs only — one hidden subprocess (avoids 3x console flash)."""
     script = SCRIPTS / "dedupe_spy_workers.py"
     if not script.is_file():
         return
-    py = python_exe()
-    for worker_script in TEAM_WORKER_SCRIPTS:
-        try:
-            subprocess.run(
-                [str(py), str(script), "--only", worker_script],
-                cwd=str(ROOT),
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=30,
-            )
-        except (subprocess.TimeoutExpired, OSError):
-            pass
+    try:
+        run_hidden(
+            [str(pythonw_exe()), str(script)],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=90,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        pass
 
 
 def stop_team_workers() -> None:
@@ -320,7 +334,7 @@ def _pid_alive(pid: int) -> bool:
         return False
     if sys.platform == "win32":
         try:
-            proc = subprocess.run(
+            proc = run_hidden(
                 ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
                 capture_output=True,
                 text=True,
@@ -382,7 +396,7 @@ def consolidate_to_one_gui() -> int:
     for pid in pids:
         if pid == keep:
             continue
-        subprocess.run(
+        run_hidden(
             ["taskkill", "/PID", str(pid), "/F"],
             capture_output=True,
             check=False,
@@ -538,8 +552,8 @@ def try_open_cursor_workspace() -> None:
 def mark_todo_items() -> None:
     py = python_exe()
     for item in ("dual_sync_running", "keepalive_running"):
-        subprocess.run(
-            [str(py), str(SCRIPTS / "mark_todo_done.py"), "--item", item],
+        run_hidden(
+            [str(pythonw_exe()), str(SCRIPTS / "mark_todo_done.py"), "--item", item],
             cwd=str(ROOT),
             capture_output=True,
             text=True,

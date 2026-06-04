@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 
-from security_utils import redact_line  # noqa: E402
+from security_utils import redact_line, run_hidden  # noqa: E402
 
 SYNC_DIR = Path(r"C:\Users\Shiel\Projects\spy-hybrid-v3\sync")
 APPEND_SYNC = Path(r"C:\Users\Shiel\Projects\spy-hybrid-v3\scripts\append_sync.py")
@@ -47,8 +47,11 @@ def run_append_sync() -> int:
     if not APPEND_SYNC.exists():
         log(f"ERROR append_sync missing: {APPEND_SYNC}")
         return 1
-    proc = subprocess.run(
-        [sys.executable, str(APPEND_SYNC)],
+    py = SCRIPTS.parent / ".venv" / "Scripts" / "pythonw.exe"
+    if not py.is_file():
+        py = Path(sys.executable)
+    proc = run_hidden(
+        [str(py), str(APPEND_SYNC)],
         cwd=str(APPEND_SYNC.parents[1]),
         capture_output=True,
         text=True,
