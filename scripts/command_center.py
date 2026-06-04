@@ -16,6 +16,8 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from security_utils import run_hidden  # noqa: E402
+
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = Path(__file__).resolve().parent
 DESKTOP = Path(r"C:\Users\Shiel\Desktop")
@@ -189,7 +191,7 @@ def worker_already_running(script: str) -> bool:
     needle = script.replace("\\", "/").replace("'", "''")
     ps = _win_python_process_where(f"[regex]::Escape('{needle}')")
     try:
-        proc = subprocess.run(
+        proc = run_hidden(
             ["powershell", "-NoProfile", "-Command", ps],
             capture_output=True,
             text=True,
@@ -456,7 +458,7 @@ def supervisor_already_running() -> bool:
         exclude_pid=my_pid,
     )
     try:
-        proc = subprocess.run(
+        proc = run_hidden(
             ["powershell", "-NoProfile", "-Command", ps],
             capture_output=True,
             text=True,

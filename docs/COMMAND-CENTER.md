@@ -60,7 +60,7 @@ Usually **not** Cursor inbox — it is extra Windows consoles:
 |--------|----------------|
 | Black **SPY Live Command Center** | `SPY-LIVE-COMMAND-CENTER.bat` — keep **one**; close duplicates |
 | Black **ARM FOR OPEN** / **MONITOR** | `ARM-FOR-OPEN-ONE-CLICK.bat`, `MONITOR-AND-READY.bat` — closes after ~6–8s; don’t run in a loop |
-| Blue **PowerShell** | Scheduled burst, `DO-NOW-LAUNCH`, operator scripts |
+| Blue **PowerShell** | Worker checks every 15–60s (fixed: hidden PowerShell in repo); also burst task, `DO-NOW-LAUNCH` |
 | Many small consoles | Duplicate workers — GUI **STOP ALL**, then **START TEAM** once; avoid ARM + GUI + console supervisor together |
 | Panel inside **Cursor** | Agent terminal — normal; disable auto-run in Cursor settings if it distracts |
 

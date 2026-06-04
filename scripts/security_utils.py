@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+import subprocess
+import sys
 
 # Env-style KEY=value lines and common secret-bearing keys
 _SECRET_KEY_RE = re.compile(
@@ -28,6 +30,21 @@ def redact_line(line: str) -> str:
         line,
     )
     return line
+
+
+def hidden_subprocess_flags() -> int:
+    """Windows: run PowerShell/task tools without flashing a blue console."""
+    if sys.platform != "win32":
+        return 0
+    return getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
+
+def run_hidden(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+    """subprocess.run with CREATE_NO_WINDOW on Windows."""
+    if sys.platform == "win32":
+        kwargs = dict(kwargs)
+        kwargs.setdefault("creationflags", hidden_subprocess_flags())
+    return subprocess.run(cmd, **kwargs)  # type: ignore[arg-type,call-overload]
 
 
 def redact_text(text: str, *, max_len: int = 500) -> str:

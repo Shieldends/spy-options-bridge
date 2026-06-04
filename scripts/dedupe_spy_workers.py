@@ -10,6 +10,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from security_utils import run_hidden  # noqa: E402
+
 SCRIPTS = Path(__file__).resolve().parent
 ROOT = SCRIPTS.parent
 
@@ -36,7 +38,7 @@ def pids_for_script(script: str) -> list[int]:
         "Select-Object -ExpandProperty ProcessId"
     )
     try:
-        proc = subprocess.run(
+        proc = run_hidden(
             ["powershell", "-NoProfile", "-Command", ps],
             capture_output=True,
             text=True,
@@ -82,7 +84,7 @@ def process_creation_ts(pid: int) -> float:
         f"(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').CreationDate"
     )
     try:
-        proc = subprocess.run(
+        proc = run_hidden(
             ["powershell", "-NoProfile", "-Command", ps],
             capture_output=True,
             text=True,
