@@ -10,7 +10,7 @@ import time
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import messagebox, simpledialog, ttk
 from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -65,6 +65,7 @@ class CommandCenterApp(tk.Tk):
         self._guardian_var = tk.StringVar(value="Guardian: …")
         self._workers_var = tk.StringVar(value="Workers: …")
         self._handoff_var = tk.StringVar(value="Team sync: …")
+        self._sync_var = tk.StringVar(value="Sync: …")
 
         self.configure(bg="#f4f4f4")
         tc.ensure_live_defaults()
@@ -75,7 +76,7 @@ class CommandCenterApp(tk.Tk):
         self.after(600, self._bootstrap_team_state)
         self.after(800, self._refresh_email_approval_status)
         self.after(30000, self._schedule_email_approval_refresh)
-        self.after(15000, self._schedule_banner_refresh)
+        self.after(5000, self._schedule_banner_refresh)
 
     def _schedule_email_approval_refresh(self) -> None:
         self._refresh_email_approval_status()
@@ -105,111 +106,121 @@ class CommandCenterApp(tk.Tk):
         if "clam" in style.theme_names():
             style.theme_use("clam")
 
-        header = tk.Frame(self, bg="#1e293b", height=52)
+        header = tk.Frame(self, bg="#1e293b", height=56)
         header.pack(fill=tk.X)
         tk.Label(
             header,
-            text=f"{APP_NAME}  ·  Guardian supervises PC helpers",
+            text=f"{APP_NAME}  ·  Team hub (You · Grok · Cursor)",
             font=("Segoe UI", 12, "bold"),
             fg="#f8fafc",
             bg="#1e293b",
-        ).pack(pady=12)
+        ).pack(pady=(10, 0))
+        tk.Label(
+            header,
+            text="Develop & deploy here · Live review tab = optional babysitter",
+            font=("Segoe UI", 9),
+            fg="#94a3b8",
+            bg="#1e293b",
+        ).pack(pady=(0, 10))
 
         notebook = ttk.Notebook(self)
         notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
 
-        live = ttk.Frame(notebook, padding=10)
         team = ttk.Frame(notebook, padding=10)
-        actions = ttk.Frame(notebook, padding=10)
-        notebook.add(live, text="Live")
+        deploy = ttk.Frame(notebook, padding=10)
+        live = ttk.Frame(notebook, padding=10)
         notebook.add(team, text="Team")
-        notebook.add(actions, text="Actions")
-
-        self._banner_label = tk.Label(
-            live,
-            textvariable=self._live_banner_var,
-            font=("Segoe UI", 15, "bold"),
-            fg="#0a5",
-            bg="#f4f4f4",
-            wraplength=500,
-            justify=tk.CENTER,
-        )
-        self._banner_label.pack(fill=tk.X, pady=(0, 10))
-
-        for var in (self._bridge_var, self._guardian_var, self._workers_var):
-            tk.Label(
-                live,
-                textvariable=var,
-                font=("Segoe UI", 10),
-                fg="#334155",
-                bg="#f4f4f4",
-                anchor=tk.W,
-                justify=tk.LEFT,
-                wraplength=500,
-            ).pack(fill=tk.X, pady=2)
-
-        tk.Label(live, text="Session journal (Guardian)", font=("Segoe UI", 9, "bold"), bg="#f4f4f4").pack(
-            anchor=tk.W, pady=(10, 4)
-        )
-        self._journal_text = tk.Text(live, height=10, wrap=tk.WORD, font=("Consolas", 9), state=tk.DISABLED)
-        self._journal_text.pack(fill=tk.BOTH, expand=True)
+        notebook.add(deploy, text="Deploy")
+        notebook.add(live, text="Live review")
+        notebook.select(team)
 
         tk.Label(
             team,
-            textvariable=self._handoff_var,
-            font=("Segoe UI", 10),
+            text="Shared thread — same room for design, code, and ship",
+            font=("Segoe UI", 10, "bold"),
             wraplength=500,
             justify=tk.LEFT,
-        ).pack(anchor=tk.W, pady=(0, 8))
+        ).pack(anchor=tk.W, pady=(0, 6))
+        tk.Label(team, textvariable=self._handoff_var, font=("Segoe UI", 9), wraplength=500, justify=tk.LEFT).pack(
+            anchor=tk.W, pady=2
+        )
+        tk.Label(team, textvariable=self._sync_var, font=("Segoe UI", 9), fg="#036", wraplength=500, justify=tk.LEFT).pack(
+            anchor=tk.W, pady=2
+        )
         tk.Label(
             team,
             textvariable=self._email_approval_var,
-            font=("Segoe UI", 10),
+            font=("Segoe UI", 9),
             fg="#630",
             wraplength=500,
             justify=tk.LEFT,
         ).pack(anchor=tk.W, pady=(0, 8))
 
         for label, cmd in (
-            ("Open Grok + Cursor sync", self._open_grok_sync),
-            ("Open readiness reports", self._open_reports),
-            ("What's left?", self._whats_left),
+            ("Open Cursor inbox", self._open_cursor_inbox),
+            ("Open Grok outbox", self._open_grok_outbox),
+            ("Post handoff to Cursor", self._post_handoff_to_cursor),
+            ("Open active plan (ACTIVE-PLAN.md)", self._open_active_plan),
+            ("Open bridge repo folder", self._open_repo_folder),
+            ("What's left for me?", self._whats_left),
         ):
-            ttk.Button(team, text=label, command=cmd).pack(fill=tk.X, pady=4)
+            ttk.Button(team, text=label, command=cmd).pack(fill=tk.X, pady=5, ipady=3)
 
-        ttk.Separator(team).pack(fill=tk.X, pady=8)
-        for key in tc.DEFAULT_ITEMS:
-            var = tk.BooleanVar(value=False)
-            self._check_vars[key] = var
-            ttk.Checkbutton(
-                team,
-                text=tc.LABELS.get(key, key),
-                variable=var,
-                command=lambda k=key: self._on_check_toggle(k),
-            ).pack(anchor=tk.W, pady=2)
-
-        primary: list[tuple[str, callable]] = [
-            ("Start Guardian", self._start_guardian),
-            ("Stop Guardian", self._stop_guardian),
-            ("EOD report now", self._run_eod_report),
-            ("Stop all workers", self._stop_all),
-            ("Render status", self._render_status),
-        ]
-        for label, cmd in primary:
-            ttk.Button(actions, text=label, command=cmd).pack(fill=tk.X, pady=6, ipady=4)
-
-        ttk.Label(actions, text="More (email / tests)", font=("Segoe UI", 9, "bold")).pack(anchor=tk.W, pady=(12, 4))
-        more = ttk.Frame(actions)
-        more.pack(fill=tk.X)
+        ttk.Label(deploy, text="Ship changes — approvals before push/Render", font=("Segoe UI", 10, "bold")).pack(
+            anchor=tk.W, pady=(0, 8)
+        )
         for label, cmd in (
-            ("Setup email", self._setup_email_dialog),
-            ("Test email", self._test_permission_email),
-            ("Request approval", self._request_deploy_email_approval),
-            ("Check email replies", self._check_email_replies),
-            ("Email latest report", self._email_latest_report),
-            ("Operator grant", self._operator_grant_session),
+            ("Request deploy approval (email)", self._request_deploy_email_approval),
+            ("Check email replies (YES/NO)", self._check_email_replies),
+            ("Operator grant (12h session)", self._operator_grant_session),
+            ("Open WHAT-YOU-DO-NOW", self._open_what_you_do_now),
+            ("Email latest reports", self._email_latest_report),
+            ("Setup / test email", self._setup_email_dialog),
         ):
-            ttk.Button(more, text=label, command=cmd).pack(fill=tk.X, pady=2)
+            ttk.Button(deploy, text=label, command=cmd).pack(fill=tk.X, pady=5, ipady=3)
+        ttk.Button(deploy, text="Send test + permission sample", command=self._test_permission_email).pack(
+            fill=tk.X, pady=5
+        )
+
+        tk.Label(
+            live,
+            text="Optional — trading path status (Render is what MACD uses)",
+            font=("Segoe UI", 9),
+            fg="#64748b",
+            wraplength=500,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(0, 6))
+        self._banner_label = tk.Label(
+            live,
+            textvariable=self._live_banner_var,
+            font=("Segoe UI", 13, "bold"),
+            fg="#0a5",
+            bg="#f4f4f4",
+            wraplength=500,
+            justify=tk.CENTER,
+        )
+        self._banner_label.pack(fill=tk.X, pady=(0, 8))
+        for var in (self._bridge_var, self._guardian_var, self._workers_var):
+            tk.Label(
+                live,
+                textvariable=var,
+                font=("Segoe UI", 9),
+                fg="#334155",
+                bg="#f4f4f4",
+                anchor=tk.W,
+                wraplength=500,
+            ).pack(fill=tk.X, pady=2)
+        for label, cmd in (
+            ("Start Guardian (babysitter)", self._start_guardian),
+            ("Stop Guardian", self._stop_guardian),
+            ("Render status", self._render_status),
+            ("EOD session report", self._run_eod_report),
+            ("Stop all workers", self._stop_all),
+        ):
+            ttk.Button(live, text=label, command=cmd).pack(fill=tk.X, pady=4)
+        tk.Label(live, text="Guardian journal", font=("Segoe UI", 9, "bold"), bg="#f4f4f4").pack(anchor=tk.W, pady=(8, 2))
+        self._journal_text = tk.Text(live, height=8, wrap=tk.WORD, font=("Consolas", 8), state=tk.DISABLED)
+        self._journal_text.pack(fill=tk.BOTH, expand=True)
 
         bar = ttk.Label(
             self,
@@ -317,9 +328,92 @@ class CommandCenterApp(tk.Tk):
 
     def _schedule_banner_refresh(self) -> None:
         self._reconcile_team_helpers()
+        self._refresh_team_panel()
         self._refresh_live_panel()
         self._update_live_banner()
-        self.after(15000, self._schedule_banner_refresh)
+        self.after(60000, self._schedule_banner_refresh)
+
+    def _open_path(self, path: Path) -> None:
+        if not path.is_file():
+            self._set_status(f"Missing: {path.name}")
+            return
+        cc.open_notepad(path)
+        self._set_status(f"Opened {path.name}")
+
+    def _open_cursor_inbox(self) -> None:
+        self._open_path(SYNC_DIR / "cursor_inbox.md")
+
+    def _open_grok_outbox(self) -> None:
+        self._open_path(SYNC_DIR / "grok_outbox.md")
+
+    def _open_active_plan(self) -> None:
+        self._open_path(ROOT / "docs" / "ACTIVE-PLAN.md")
+
+    def _open_what_you_do_now(self) -> None:
+        path = ROOT / "WHAT-YOU-DO-NOW.txt"
+        if path.is_file():
+            self._open_path(path)
+        else:
+            self._open_path(DESKTOP / "WHAT-YOU-DO-NOW.txt")
+
+    def _open_repo_folder(self) -> None:
+        if sys.platform == "win32":
+            subprocess.Popen(
+                ["explorer.exe", str(ROOT)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        self._set_status(f"Opened repo {ROOT}")
+
+    def _post_handoff_to_cursor(self) -> None:
+        note = simpledialog.askstring(
+            TITLE,
+            "Handoff note for Cursor (one line):",
+            parent=self,
+        )
+        if not note or not str(note).strip():
+            return
+        py = cc.python_exe()
+        proc = subprocess.run(
+            [
+                str(py),
+                str(SCRIPTS / "cursor_handoff.py"),
+                "--topic",
+                "Command Center team note",
+                "--bullet",
+                str(note).strip(),
+                "--next",
+                "Continue from cursor_inbox handoff block",
+            ],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if sys.platform == "win32" else 0,
+        )
+        if proc.returncode == 0:
+            self._set_status("Handoff posted to cursor_inbox.md")
+            self._refresh_team_panel()
+        else:
+            self._set_status("Handoff failed — see COMMAND-CENTER-CRASH or run HANDOFF-TO-CURSOR.bat")
+
+    def _refresh_team_panel(self) -> None:
+        inbox = SYNC_DIR / "cursor_inbox.md"
+        if inbox.is_file():
+            lines = inbox.read_text(encoding="utf-8", errors="replace").splitlines()
+            handoff = next(
+                (ln for ln in reversed(lines) if "handoff" in ln.lower() or ln.startswith("### [")),
+                "",
+            )
+            self._handoff_var.set(handoff[:220] if handoff else "No recent handoff line in cursor_inbox")
+        dual = DESKTOP / "DUAL-SYNC-LOG.txt"
+        if dual.is_file():
+            tail = dual.read_text(encoding="utf-8", errors="replace").splitlines()
+            self._sync_var.set(tail[-1][:200] if tail else "Sync: (empty log)")
+        else:
+            self._sync_var.set("Sync: dual_sync not logging yet")
 
     def _tail_file(self, path: Path, n: int = 12) -> str:
         if not path.is_file():
@@ -377,17 +471,12 @@ class CommandCenterApp(tk.Tk):
             del self.procs[name]
 
     def _bootstrap_team_state(self) -> None:
-        """On open: prefer Guardian supervisor (CC 2.0)."""
+        """On open: team hub first; Guardian only if you start it (Live review tab)."""
         cc.stop_stale_console_supervisors()
         self._prune_dead_procs()
-        grant = DESKTOP / "OPERATOR-GRANT.json"
-        if grant.is_file() and not self._guardian_on():
-            self._start_guardian(quiet=True)
-        if self._team_running():
-            self._set_status("Guardian / team active — this window is your desk")
-            self._start_health_loop()
-        else:
-            self._set_status("Actions tab → Start Guardian (recommended)")
+        self._refresh_team_panel()
+        self._set_status("Team tab — develop & deploy; Live review = optional babysitter")
+        self._start_health_loop()
         self._refresh_live_panel()
         self._update_live_banner()
 
@@ -404,7 +493,11 @@ class CommandCenterApp(tk.Tk):
         self._update_live_banner()
         self._start_health_loop()
         if ok and not quiet:
-            messagebox.showinfo(TITLE, f"{msg}\n\nMACD path uses Render — Guardian babysits this PC only.")
+            messagebox.showinfo(
+                TITLE,
+                f"{msg}\n\nGuardian = optional PC babysitter.\n"
+                "MACD still uses Render; use Team/Deploy tabs for dev work.",
+            )
 
     def _stop_guardian(self) -> None:
         try:

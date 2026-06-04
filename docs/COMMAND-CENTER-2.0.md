@@ -1,74 +1,48 @@
-# Command Center 2.0 — architecture (plan, not scrap)
+# Command Center 2.0 — team development & deployment hub
 
-**Status:** **ACTIVE (go CC2)** — Guardian default supervisor; GUI **2.0** three tabs (Live / Team / Actions).
+**Status:** ACTIVE — revised for **You · Grok · Cursor** workflow (not a trading babysitter UI).
 
-## Vision
+## Primary purpose
 
-One **professional operations desk** — not a phone app, not bloated IDE software:
+**One room to build and ship the trading system together:**
 
-| Pillar | Role |
-|--------|------|
-| **You** | Approve, goals, TradingView, Alpaca truth |
-| **Super Grok Heavy** | Research, diagnostics, `grok_outbox.md` |
-| **Cursor** | Engineer + deploy, `cursor_inbox.md`, bridge code |
+| Who | Channel |
+|-----|---------|
+| **You** | Goals, YES/NO email, TradingView, Alpaca truth |
+| **Super Grok Heavy** | `grok_outbox.md` — research, diagnostics |
+| **Cursor** | `cursor_inbox.md` — engineer, push, Render deploy |
 
-Same room: **status · comms · execute** without fighting duplicate processes.
+The app is your **desk for development and deployment** — not the trader execution engine (that stays on **Render + TradingView**).
 
-## What we keep (v1 assets)
+## GUI tabs (2.0 revised)
 
-- Render bridge Phase 0 MACD
-- `dual_sync_loop`, `bridge_keepalive`, sync files
-- Operator grant + email YES/NO protocol
-- Desktop launchers (thin wrappers)
-- `paper_pnl_audit`, `trigger_chain_proof`, burst tools (off-hours)
+| Tab | Purpose |
+|-----|---------|
+| **Team** | Open inbox/outbox, post handoff to Cursor, active plan, repo folder |
+| **Deploy** | Deploy approval email, operator grant, WHAT-YOU-DO-NOW, email reports |
+| **Live review** | *Optional* — bridge health, Guardian on/off, journal tail, EOD |
 
-## v1 problems (today)
+**Default tab:** Team (opens here).
 
-- GUI + console supervisor fought → worker respawn / black console
-- tkinter fragile on Windows (lock, python vs pythonw)
-- Too many buttons on one tab; unclear “READY” vs “filled”
-- Success = **MACD fill in Activities**, not “helpers running”
+## Secondary: babysitter (optional)
 
-## 2.0 design pillars
+- **Live Session Guardian** — headless; keeps sync + Render warm; logs journal
+- Use **Live review** tab or `START-GUARDIAN.bat` only when you want “what’s up”
+- **Not required** for MACD alerts
 
-### 1. Single supervisor
+## Console flashes (blue/black)
 
-- **Only** GUI *or* headless guardian — never both restarting workers
-- `cc_launcher.py` + `CLEAR-GUI-LOCK.bat` for clean open
-- `live_session_guardian.py` when GUI down (today’s salvage)
+- Blue = PowerShell; black = `.bat` / old console supervisor
+- Fixed: hidden PowerShell for worker checks (no random blue flash)
+- Avoid: ARM + GUI fight, MONITOR bat in a loop, `BURST-100` during MACD
+- Once: `launchers\STOP-BLUE-FLASH.bat` if flashes return
 
-### 2. Three-panel UI (tkinter or lightweight web local)
+## What we keep
 
-| Panel | Content |
-|-------|---------|
-| **Live** | Bridge health, tv_risk, open orders, READY banner |
-| **Team** | Grok/Cursor sync open buttons, last handoff line |
-| **Actions** | START TEAM, STOP ALL, reports — fewer, larger buttons |
+- Phase 0 bridge, sync files, email protocol, launchers, pytest
+- Guardian + EOD report as **review tools**, not the product center
 
-Dark-neutral palette, Segoe UI, no consumer gradients.
+## Out of scope
 
-### 3. Session lifecycle
-
-| Phase | Tool |
-|-------|------|
-| Pre-open | redundant tests (optional) |
-| RTH | guardian + Render keepalive |
-| EOD | `eod_session_report.py` → Desktop + email |
-
-### 4. Approval path
-
-Email subject: `[SPY Command Center] NEED APPROVAL - Command Center 2.0 sprint`  
-Reply **YES** / **go CC2** to authorize implementation sprints.
-
-## Implementation tracks (after **go CC2**)
-
-1. **2.0a** — Launcher + lock + guardian default (today partial)
-2. **2.0b** — UI shell refactor (3 panels, status bar)
-3. **2.0c** — Embedded log tail + one-click EOD
-4. **2.0d** — Optional local dashboard (FastAPI localhost) if tkinter still fails
-
-## Out of scope for 2.0
-
-- Replacing Render bridge
-- Phase 1 committee Pine without explicit gate
+- Replacing Render or Phase 1 committee without explicit gate
 - Gmail read automation without permission

@@ -62,7 +62,7 @@ def kill_pid(pid: int, *, kill_tree: bool) -> bool:
     args = ["taskkill", "/PID", str(pid), "/F"]
     if kill_tree:
         args = ["taskkill", "/PID", str(pid), "/T", "/F"]
-    proc = subprocess.run(
+    proc = run_hidden(
         args,
         capture_output=True,
         text=True,

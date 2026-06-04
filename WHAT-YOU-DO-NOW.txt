@@ -1,26 +1,27 @@
-﻿SPY Command Center 2.0 + Guardian | 2026-06-04
-================================================
+﻿SPY Command Center 2.0 — TEAM HUB | 2026-06-04
+=================================================
 
-YOU APPROVED: Guardian + go CC2
+PRIMARY (why you open the app)
+  Team tab    — Cursor inbox, Grok outbox, handoff, active plan, repo
+  Deploy tab  — deploy approval email, operator grant, ship checklist
+  Live review — OPTIONAL babysitter only (Guardian, bridge, journal)
 
-DEFAULT (use this)
-  launchers\START-GUARDIAN.bat   — headless babysitter until 4:05 PM ET
-  OR open launchers\SPY-LIVE-COMMAND-CENTER.bat → Actions → Start Guardian
+TRADING (unchanged — not the GUI)
+  TV MACD → Render 5.5.11 → Alpaca paper
 
-GUI 2.0 (optional desk)
-  Live tab   — bridge + journal tail
-  Team tab   — Grok/Cursor sync + checklist
-  Actions    — Start/Stop Guardian, EOD report, Render status
+GUARDIAN (optional, headless)
+  launchers\START-GUARDIAN.bat — only if you want PC babysitting
+  Do NOT need GUI for MACD
 
-LIVE MACD (unchanged)
-  TradingView → Render 5.5.11 → Alpaca paper
+FLASHING BLUE/BLACK?
+  Run launchers\STOP-BLUE-FLASH.bat once
+  Do not loop MONITOR or ARM while app is open
+
+OPEN APP
+  launchers\SPY-LIVE-COMMAND-CENTER.bat
 
 EOD
-  Auto ~4:05 PM: Desktop\EOD-SESSION-REPORT-*.txt + email
-  Or GUI: Actions → EOD report now
+  ~4:05 PM auto report on Desktop (+ email)
 
-DO NOT
-  Old START TEAM spawn wars | BURST-100 during MACD | ARM + Guardian fight
-
-BRIDGE
-  https://spy-options-bridge.onrender.com/health
+DOC
+  docs\COMMAND-CENTER-2.0.md

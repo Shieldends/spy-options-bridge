@@ -19,6 +19,7 @@ sys.path.insert(0, str(SCRIPTS))
 import command_center as cc  # noqa: E402
 import operator_gateway as og  # noqa: E402
 from cursor_handoff import handoff_arm_session  # noqa: E402
+from security_utils import run_hidden  # noqa: E402
 
 DESKTOP = Path(r"C:\Users\Shiel\Desktop")
 SYNC_DIR = Path(r"C:\Users\Shiel\Projects\spy-hybrid-v3\sync")
@@ -109,7 +110,7 @@ def command_center_running() -> bool:
         "Select-Object -First 1 -ExpandProperty ProcessId"
     )
     try:
-        proc = subprocess.run(
+        proc = run_hidden(
             ["powershell", "-NoProfile", "-Command", ps],
             capture_output=True,
             text=True,
@@ -130,7 +131,7 @@ def _supervisor_pids() -> list[int]:
         "Select-Object -ExpandProperty ProcessId"
     )
     try:
-        proc = subprocess.run(
+        proc = run_hidden(
             ["powershell", "-NoProfile", "-Command", ps],
             capture_output=True,
             text=True,
@@ -163,7 +164,7 @@ def run_dedupe(
     for pid in exclude_pids or []:
         cmd.extend(["--exclude-pid", str(pid)])
     try:
-        subprocess.run(
+        run_hidden(
             cmd,
             cwd=str(ROOT),
             capture_output=True,
@@ -234,7 +235,7 @@ def register_burst_task(*, skip_schtask: bool = False) -> None:
         "Write-Output 'registered'"
     )
     try:
-        proc = subprocess.run(
+        proc = run_hidden(
             ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
             capture_output=True,
             text=True,

@@ -153,7 +153,7 @@ def dedupe_workers(*, reset: bool = False) -> None:
     if reset:
         cmd.append("--reset-workers")
     try:
-        subprocess.run(
+        run_hidden(
             cmd,
             cwd=str(ROOT),
             capture_output=True,
@@ -415,7 +415,7 @@ def kill_gui_supervisor_processes() -> int:
         return 0
     killed = 0
     for pid in other_gui_supervisor_pids():
-        subprocess.run(
+        run_hidden(
             ["taskkill", "/PID", str(pid), "/F"],
             capture_output=True,
             check=False,
@@ -437,7 +437,7 @@ def stop_stale_console_supervisors() -> int:
     pids = dedupe.pids_for_script("command_center.py")
     killed = 0
     for pid in pids:
-        subprocess.run(
+        run_hidden(
             ["taskkill", "/PID", str(pid), "/F"],
             capture_output=True,
             check=False,
@@ -495,7 +495,7 @@ def kill_worker(proc: subprocess.Popen[bytes]) -> None:
     if proc.poll() is not None:
         return
     if sys.platform == "win32":
-        subprocess.run(
+        run_hidden(
             ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
             capture_output=True,
             check=False,
