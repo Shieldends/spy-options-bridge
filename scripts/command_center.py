@@ -167,16 +167,27 @@ def dedupe_workers(*, reset: bool = False) -> None:
         log_line(f"dedupe_spy_workers error: {type(exc).__name__}: {exc}")
 
 
+def _win_python_process_where(commandline_match: str, *, exclude_pid: int | None = None) -> str:
+    """Match python.exe and pythonw.exe (Command Center GUI uses pythonw)."""
+    exclude = (
+        f" -and $_.ProcessId -ne {int(exclude_pid)}"
+        if exclude_pid is not None
+        else ""
+    )
+    return (
+        "Get-CimInstance Win32_Process | "
+        "Where-Object { ($_.Name -eq 'python.exe' -or $_.Name -eq 'pythonw.exe') "
+        f"-and $_.CommandLine -match {commandline_match}{exclude} }} | "
+        "Select-Object -First 1 -ExpandProperty ProcessId"
+    )
+
+
 def worker_already_running(script: str) -> bool:
     """Avoid duplicate worker if same script already in a python process."""
     if sys.platform != "win32":
         return False
-    needle = script.replace("\\", "/")
-    ps = (
-        "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
-        f"Where-Object {{ $_.CommandLine -match [regex]::Escape('{needle}') }} | "
-        "Select-Object -First 1 -ExpandProperty ProcessId"
-    )
+    needle = script.replace("\\", "/").replace("'", "''")
+    ps = _win_python_process_where(f"[regex]::Escape('{needle}')")
     try:
         proc = subprocess.run(
             ["powershell", "-NoProfile", "-Command", ps],
@@ -410,16 +421,36 @@ def kill_gui_supervisor_processes() -> int:
     return killed
 
 
+def stop_stale_console_supervisors() -> int:
+    """When GUI is up, end hidden command_center.py loops that fight the GUI team."""
+    if sys.platform != "win32" or not gui_supervisor_running():
+        return 0
+    try:
+        import dedupe_spy_workers as dedupe  # noqa: E402
+    except Exception:
+        return 0
+    pids = dedupe.pids_for_script("command_center.py")
+    killed = 0
+    for pid in pids:
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/F"],
+            capture_output=True,
+            check=False,
+        )
+        killed += 1
+    if killed:
+        log_line(f"stop_stale_console_supervisors: ended {killed} console supervisor(s)")
+    return killed
+
+
 def supervisor_already_running() -> bool:
     """Another command_center supervisor (console or GUI) already active."""
     if sys.platform != "win32":
         return False
     my_pid = os.getpid()
-    ps = (
-        "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
-        "Where-Object {{ $_.CommandLine -match 'command_center(\\.py|_gui\\.py)' "
-        f"-and $_.ProcessId -ne {my_pid} }} | "
-        "Select-Object -First 1 -ExpandProperty ProcessId"
+    ps = _win_python_process_where(
+        "'command_center(\\.py|_gui\\.py)'",
+        exclude_pid=my_pid,
     )
     try:
         proc = subprocess.run(
@@ -544,7 +575,15 @@ def ensure_team_workers(procs: dict[str, subprocess.Popen[bytes]]) -> None:
         if proc is not None and proc.poll() is None:
             continue
         if proc is not None and proc.poll() is not None:
-            log_line(f"worker exited: {name} code={proc.poll()} — restarting")
+            exit_code = proc.poll()
+            if worker_already_running(script):
+                log_line(
+                    f"{name}: tracked child exited code={exit_code} — "
+                    "untracked helper still running (skip respawn)"
+                )
+                procs.pop(name, None)
+                continue
+            log_line(f"worker exited: {name} code={exit_code} — restarting")
         elif worker_already_running(script):
             log_line(f"{name}: helper already running (untracked) — ok")
             continue

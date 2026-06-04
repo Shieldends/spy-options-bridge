@@ -1,7 +1,7 @@
 # Active plan (consult before work)
 
-**Status:** **go A+E implemented** — git push + Render Manual Deploy when you approve  
-**Updated:** 2026-06-04 ET (post go A+E)  
+**Status:** **go A+E + Render 5.5.11 live** — local team needs one GUI START TEAM after dedupe  
+**Updated:** 2026-06-04 ET (~12:47)  
 **Gate:** Track **D** still blocked until you say **`go D`**.
 
 ### go A+E — done in repo

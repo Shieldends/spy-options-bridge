@@ -28,9 +28,11 @@ _USE_TREE_KILL = False
 def pids_for_script(script: str) -> list[int]:
     if sys.platform != "win32":
         return []
+    esc = script.replace("'", "''")
     ps = (
-        "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
-        f"Where-Object {{ $_.CommandLine -match [regex]::Escape('{script}') }} | "
+        "Get-CimInstance Win32_Process | "
+        "Where-Object { ($_.Name -eq 'python.exe' -or $_.Name -eq 'pythonw.exe') "
+        f"-and $_.CommandLine -match [regex]::Escape('{esc}') }} | "
         "Select-Object -ExpandProperty ProcessId"
     )
     try:

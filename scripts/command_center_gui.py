@@ -308,7 +308,7 @@ class CommandCenterApp(tk.Tk):
         self.after(15000, self._schedule_banner_refresh)
 
     def _reconcile_team_helpers(self) -> None:
-        """Keep READY accurate: respawn helpers that died without a full START TEAM click."""
+        """Dedupe duplicate helpers only — auto-respawn fights console supervisor (20min loops)."""
         self._prune_dead_procs()
         if not (DESKTOP / "OPERATOR-GRANT.json").is_file():
             return
@@ -321,20 +321,6 @@ class CommandCenterApp(tk.Tk):
                 cc.log_line(f"GUI reconcile deduped: {', '.join(dupes)}")
         except Exception:
             pass
-        now = time.time()
-        for name, script, args in cc.WORKERS:
-            if not cc.should_spawn_worker(name, script):
-                continue
-            proc = self.procs.get(name)
-            if proc is not None and proc.poll() is None:
-                continue
-            if cc.worker_already_running(script):
-                continue
-            last = self._last_worker_spawn.get(name, 0.0)
-            if now - last < 45.0:
-                continue
-            self.procs[name] = cc.spawn_worker(name, script, args)
-            self._last_worker_spawn[name] = now
 
     def _prune_dead_procs(self) -> None:
         dead = [name for name, p in self.procs.items() if p.poll() is not None]
@@ -343,6 +329,7 @@ class CommandCenterApp(tk.Tk):
 
     def _bootstrap_team_state(self) -> None:
         """On open: detect existing workers, refresh banner, start health polling."""
+        cc.stop_stale_console_supervisors()
         self._prune_dead_procs()
         if self._team_running():
             self._set_status("Team on standby — leave this window open or minimized")
@@ -365,6 +352,7 @@ class CommandCenterApp(tk.Tk):
         self._set_status(f"Checklist: {tc.LABELS.get(key, key)} → {'done' if done else 'open'}")
 
     def _start_team(self, *, quiet: bool = False, auto: bool = False) -> None:
+        cc.stop_stale_console_supervisors()
         self._prune_dead_procs()
         if self._team_running():
             self._set_status("Team already running — banner READY (no popup)")

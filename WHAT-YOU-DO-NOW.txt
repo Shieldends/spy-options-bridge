@@ -1,27 +1,32 @@
-﻿SPY Render OOM fix + go A+E | 2026-06-04
-========================================
+﻿SPY LIVE STATUS | 2026-06-04 ~12:47 ET
+=====================================
 
-RENDER MEMORY (on our side — deploy v5.5.11)
-  Cause: large /exercise/burst (e.g. count=100) on free tier ~512MB
-  Fix: BURST_MAX_COUNT=10, max 2 chase tasks, slim API response
-  Live MACD: brief 502 if Render restarts — avoid BURST-PAPER-100 during session
-  Doc: docs\RENDER-MEMORY.md
+GREEN (production path)
+  Render bridge: 5.5.11 LIVE | tv_pause_risk=green | open orders=0
+  MACD TV → /entry → Alpaca paper is the live path (Phase 0, weekly)
 
-IMPLEMENTED (repo — push + Manual Deploy)
-  go A+E — fill chase env + PAPER-FILL-TEST + PAPER-PNL-AUDIT
-  Render guard — main.py + render.yaml v5.5.11
+YELLOW (local PC — fixed on your machine just now)
+  Stale console supervisor was fighting GUI (workers exiting every 60s)
+  Dedupe cleaned duplicates; helpers were stopped to end the loop
+  YOU: open ONE SPY-LIVE-COMMAND-CENTER.bat → START TEAM once (or minimize GUI)
 
-YOUR STEPS
-  1. DONE — git push (5b74119). YOU: Render Manual Deploy today
-     → ideally OUTSIDE the next MACD window (or a gap you accept)
-  2. Confirm /health → version 5.5.11 (still 5.5.10 until deploy)
-  3. UNTIL 5.5.11 LIVE: no large bursts — most likely OOM trigger
-  4. After 5.5.11: still avoid BURST-PAPER-100 during live MACD
-  5. Unset REDUNDANT_BURST_EACH_CYCLE on PC if set
-  6. Off-hours: PUSH-PAPER-FILL-TEST.bat + PAPER-PNL-AUDIT.bat --try-entry
+DONE (no action)
+  Git push: 5b74119 memory + 1c73fed respawn fix
+  Render Manual Deploy: 5.5.11 confirmed on /health
+
+OPTIONAL (off-hours, not during MACD)
+  PUSH-PAPER-FILL-TEST.bat + PAPER-PNL-AUDIT.bat --try-entry
 
 NOT STARTED
-  Track D (0dte hold) — reply go D after fills look good
+  Track D (0dte hold) — say go D when you want it
 
 BRIDGE
   https://spy-options-bridge.onrender.com/health
+
+MONITOR (2026-06-04 12:49 ET)
+  command_center.py       : 0
+  dual_sync_loop.py       : 2
+  bridge_keepalive.py     : 2
+  redundant_test_loop.py  : 0
+  WARN — duplicates dual_sync_loop.py, bridge_keepalive.py (GUI will reconcile; avoid full DEDUPE bat)
+
