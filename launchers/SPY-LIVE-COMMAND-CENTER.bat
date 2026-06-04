@@ -8,8 +8,10 @@ if not exist ".venv\Scripts\python.exe" (
   pause
   exit /b 1
 )
-.venv\Scripts\python.exe scripts\command_center_gui.py
+REM Launcher clears stale lock, shows error dialog (not silent black console)
+.venv\Scripts\pythonw.exe scripts\cc_launcher.py 2>>"%USERPROFILE%\Desktop\COMMAND-CENTER-BOOT.txt"
 if errorlevel 1 (
-  echo Command Center exited with an error. See message above.
-  pause
+  .venv\Scripts\python.exe scripts\cc_launcher.py
+  if errorlevel 1 pause
 )
+exit /b 0

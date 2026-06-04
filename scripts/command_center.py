@@ -342,8 +342,11 @@ def try_acquire_gui_lock() -> bool:
             holder = int(GUI_LOCK.read_text(encoding="utf-8").strip())
         except (ValueError, OSError):
             holder = 0
-        if holder and holder != my_pid and _pid_alive(holder):
-            return False
+        if holder and holder != my_pid:
+            if _pid_alive(holder):
+                return False
+            GUI_LOCK.unlink(missing_ok=True)  # type: ignore[arg-type]
+            log_line(f"cleared stale GUI lock (dead PID {holder})")
     try:
         GUI_LOCK.write_text(str(my_pid), encoding="utf-8")
     except OSError:

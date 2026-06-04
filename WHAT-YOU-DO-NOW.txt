@@ -1,32 +1,30 @@
-﻿SPY LIVE STATUS | 2026-06-04 ~12:47 ET
+﻿SPY LIVE SESSION | 2026-06-04 afternoon
 =====================================
 
-GREEN (production path)
-  Render bridge: 5.5.11 LIVE | tv_pause_risk=green | open orders=0
-  MACD TV → /entry → Alpaca paper is the live path (Phase 0, weekly)
+PRIORITY TODAY (Cursor running for you)
+  • LIVE-SESSION-GUARDIAN — keeps Render warm + dual_sync/keepalive until 16:05 ET
+  • EOD-SESSION-REPORT — auto ~16:05 ET weekdays + email if SMTP ok
+  • MACD path: TV → Render 5.5.11 → Alpaca (unchanged)
 
-YELLOW (local PC — fixed on your machine just now)
-  Stale console supervisor was fighting GUI (workers exiting every 60s)
-  Dedupe cleaned duplicates; helpers were stopped to end the loop
-  YOU: open ONE SPY-LIVE-COMMAND-CENTER.bat → START TEAM once (or minimize GUI)
+YOU — ZERO STEPS REQUIRED FOR LIVE ALERTS
+  Bridge is green. Guardian salvages PC helpers without Command Center GUI.
 
-DONE (no action)
-  Git push: 5b74119 memory + 1c73fed respawn fix
-  Render Manual Deploy: 5.5.11 confirmed on /health
+IF YOU WANT THE GUI (optional)
+  1. launchers\CLEAR-GUI-LOCK.bat (only if open failed before)
+  2. launchers\SPY-LIVE-COMMAND-CENTER.bat — uses pythonw + error dialog (not black console)
 
-OPTIONAL (off-hours, not during MACD)
-  PUSH-PAPER-FILL-TEST.bat + PAPER-PNL-AUDIT.bat --try-entry
+COMMAND CENTER 2.0
+  Plan: docs\COMMAND-CENTER-2.0.md
+  Approval email sent: NEED APPROVAL - Command Center 2.0 sprint after EOD
+  Reply YES or go CC2 when ready (not during active MACD unless urgent)
 
-NOT STARTED
-  Track D (0dte hold) — say go D when you want it
+TODAY SUCCESS = truth in EOD report
+  Desktop\EOD-SESSION-REPORT-2026-06-04.txt (after close)
+  Desktop\LIVE-SESSION-JOURNAL-2026-06-04.txt (live log)
+  Alpaca Activities for MACD fills
+
+DO NOT
+  BURST-PAPER-100 during MACD | ARM + GUI together | full DEDUPE bat
 
 BRIDGE
   https://spy-options-bridge.onrender.com/health
-
-MONITOR (2026-06-04 12:49 ET)
-  command_center.py       : 0
-  dual_sync_loop.py       : 2
-  bridge_keepalive.py     : 2
-  redundant_test_loop.py  : 0
-  WARN — duplicates dual_sync_loop.py, bridge_keepalive.py (GUI will reconcile; avoid full DEDUPE bat)
-
