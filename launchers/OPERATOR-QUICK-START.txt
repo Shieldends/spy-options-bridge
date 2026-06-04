@@ -1,0 +1,38 @@
+SPY OPERATOR — MINIMUM PATH (one double-click)
+==============================================
+
+ONE FILE (do this before market):
+  C:\Users\Shiel\Desktop\ARM-FOR-OPEN-ONE-CLICK.bat
+
+  Copy from repo if missing:
+  copy C:\Users\Shiel\spy-options-bridge\launchers\ARM-FOR-OPEN-ONE-CLICK.bat %USERPROFILE%\Desktop\
+
+WHAT HAPPENS AUTOMATICALLY (after 5s countdown or Y):
+  1. Desktop\OPERATOR-GRANT.json — session tier, 12 hours (agents use operator_gateway)
+  2. command_center.py supervisor starts (dual sync + keepalive + redundant tests)
+  3. STOP-REDUNDANT-TESTS.txt cleared if present
+  4. Windows task SPY-BURST-931-ET — burst_paper_fills 100 @ 9:31 ET weekdays
+  5. sync\grok_outbox.md brief "ARMED minimal mode"
+  6. Desktop\ARM-FOR-OPEN.log
+
+YOU NEVER DO AGAIN (until STOP ALL):
+  - GRANT-OPERATOR-FULL.bat / GRANT-OPERATOR-SESSION.bat
+  - RUN-OPERATOR-ACTION.bat for routine launches
+  - Command Center "Operator: grant session" button
+  - Manual START TEAM if you used ARM bat (supervisor auto-starts workers)
+
+OPTIONAL ONCE: Desktop\OPERATOR-AUTO-ARM.txt
+  ARM bat creates this marker automatically.
+  If present + config auto_grant_on_arm: true → START TEAM writes grant with no second prompt.
+
+FULL STOP:
+  Command Center → STOP ALL (creates STOP-REDUNDANT-TESTS.txt)
+  Delete Desktop\OPERATOR-GRANT.json to revoke operator immediately
+
+REVOKE ONLY OPERATOR (keep team running):
+  Delete Desktop\OPERATOR-GRANT.json
+
+LOGS:
+  Desktop\ARM-FOR-OPEN.log
+  Desktop\OPERATOR-AUDIT.log
+  Desktop\COMMAND-CENTER-LOG.txt

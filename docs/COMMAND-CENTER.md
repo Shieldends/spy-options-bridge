@@ -17,7 +17,7 @@
 
 1. `dual_sync_loop.py` — 60s heartbeat, `append_sync.py`, log `Desktop\DUAL-SYNC-LOG.txt`
 2. `bridge_keepalive.py` — Render `/ping` 8:00–17:00 ET
-3. `redundant_test_loop.py` — pre-open matrix every 5 min until 9:30 ET or `STOP-REDUNDANT-TESTS.txt`
+3. `redundant_test_loop.py` — pre-open matrix every 5 min until **9:30–16:00 ET session** or `STOP-REDUNDANT-TESTS.txt` (resumes after 16:00 for overnight)
 
 Supervisor thread: every 60s `GET /health` → `Desktop\COMMAND-CENTER-LOG.txt`
 
@@ -52,5 +52,7 @@ Unchanged: 9:30 ET TV MACD alerts; optional 9:31 `BURST-PAPER-100.bat`. See `MAR
 
 ## Stop
 
-- **Ctrl+C** in the command center window — kills all three child processes
-- Redundant tests only: `STOP-REDUNDANT-TESTS.bat` or 9:30 ET auto-stop
+- **STOP ALL** (GUI) or **Ctrl+C** (console) — kills all three child processes; creates `STOP-REDUNDANT-TESTS.txt`
+- **START TEAM** after STOP ALL — one dual_sync, one keepalive, one redundant loop (avoid duplicate Desktop bats)
+- Redundant tests only: `STOP-REDUNDANT-TESTS.bat` or auto-stop during Mon–Fri 9:30–16:00 ET
+- Fast cycles default to `/health`, `/ping`, pytest, auth dry-run (`PRE_OPEN_TEST_AGGRESSIVE=false`); fill pressure = `BURST-PAPER-100.bat` at 9:31 ET

@@ -1,0 +1,4 @@
+﻿# Pre-open redundant loop — safe defaults (Phase 0 MACD unchanged)
+pre_open_pressure: true
+# pre_open_pressure: log burst reminder only; fast matrix stays dry unless:
+#   set PRE_OPEN_TEST_AGGRESSIVE=true (live /entry + burst in --fast cycles)

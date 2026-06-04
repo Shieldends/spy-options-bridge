@@ -1,0 +1,20 @@
+﻿PRE-OPEN STANDBY — SPY Options Bridge (2026-06-04 ET)
+================================================================================
+BEFORE OPEN (one step): Desktop\ARM-FOR-OPEN-ONE-CLICK.bat
+  → 12h OPERATOR-GRANT.json, Command Center START TEAM, 9:31 ET burst task, grok brief.
+
+Systems green: redundant --once 21 PASS / 0 FAIL (auth dry accepts Render 200+JSON reject).
+BURST MANDATORY when systems green: BURST-PAPER-100.bat or burst_paper_fills.py @ 9:31 ET (RTH).
+ARM schedules SPY-BURST-931-ET if you used one-click arm; still OK to run bat manually at open.
+
+After-hours burst: submits/cancels OK; 0 fills until RTH (market closed — normal).
+100-fill proof: Thu 9:31 ET RTH only — not after hours.
+
+Phase 0 MACD 9:30 ET: TV Entry/Warning → Render → Alpaca paper (committee off).
+Redundant loop: pauses Mon–Fri 9:30–16:00 ET (live MACD window); fixed session stop.
+Operator: grant via ARM only; revoke = delete Desktop\OPERATOR-GRANT.json.
+
+Grok: append fill diagnostics to Projects\spy-hybrid-v3\sync\grok_outbox.md on FAIL.
+Cursor: bridge/deploy; read sync\cursor_inbox.md RULES + ACTIONS COMPLETE section.
+
+Logs: Desktop\BURST-PAPER-LOG.txt, REDUNDANT-TEST-LOG.txt, ARM-FOR-OPEN.log

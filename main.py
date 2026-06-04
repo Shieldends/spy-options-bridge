@@ -1,5 +1,5 @@
 """
-spy-options-bridge v5.5.8 — ALPACA PAPER (default broker)
+spy-options-bridge v5.5.9 — ALPACA PAPER (default broker)
 
 TradingView webhook → Render → Alpaca multi-leg SPY put credit spreads.
 
@@ -55,6 +55,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+_app_started_mono = time.monotonic()
+_preflight_cache: dict[str, Any] = {"ts": 0.0, "data": {}}
+PREFLIGHT_CACHE_SEC = 30.0
+PREFLIGHT_TIMEOUT_SEC = 4.0
 ET = ZoneInfo("America/New_York")
 CERT_URL = "https://api.cert.tastyworks.com"
 ALPACA_PAPER_URL = "https://paper-api.alpaca.markets"
@@ -100,6 +104,9 @@ class Settings(BaseSettings):
     entry_chase_floor_extra_polls: int = Field(default=12, alias="ENTRY_CHASE_FLOOR_EXTRA_POLLS")
     entry_min_credit: float = Field(default=0.05, alias="ENTRY_MIN_CREDIT")
     paper_force_min_fill: bool = Field(default=True, alias="PAPER_FORCE_MIN_FILL")
+    auto_cancel_conflicting_orders: bool = Field(
+        default=True, alias="AUTO_CANCEL_CONFLICTING_ORDERS"
+    )
 
     discord_webhook_url: str = Field(default="", alias="DISCORD_WEBHOOK_URL")
     telegram_bot_token: str = Field(default="", alias="TELEGRAM_BOT_TOKEN")
@@ -1036,21 +1043,37 @@ async def cancel_alpaca_order(settings: Settings, order_id: str) -> bool:
     return False
 
 
-async def cancel_alpaca_open_orders_for_symbols(settings: Settings, symbols: set[str]) -> int:
-    """Cancel resting TP/SL before emergency warning close."""
+async def fetch_alpaca_open_orders(settings: Settings, *, limit: int = 100) -> list[dict[str, Any]]:
+    """List open Alpaca orders (nested legs when present)."""
+    if not settings.alpaca_configured:
+        return []
     base = settings.apca_api_base_url.rstrip("/")
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.get(
+            f"{base}/v2/orders",
+            headers=_alpaca_headers(settings),
+            params={"status": "open", "limit": limit, "nested": "true"},
+        )
+    if not r.is_success:
+        logger.warning("Alpaca open-order list failed (%s): %s", r.status_code, r.text[:200])
+        return []
+    body = r.json()
+    return body if isinstance(body, list) else []
+
+
+async def cancel_alpaca_open_orders_for_symbols(settings: Settings, symbols: set[str]) -> int:
+    """Cancel resting orders whose legs intersect symbol set (TP/SL or entry conflicts)."""
+    if not symbols:
+        return 0
     canceled = 0
+    base = settings.apca_api_base_url.rstrip("/")
     async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.get(f"{base}/v2/orders?status=open&limit=100", headers=_alpaca_headers(settings))
-        if not r.is_success:
-            return 0
-        body = r.json()
-        orders = body if isinstance(body, list) else []
-        for order in orders:
+        for order in await fetch_alpaca_open_orders(settings):
             legs = order.get("legs") or []
             leg_syms = {str(leg.get("symbol", "")) for leg in legs}
-            if order.get("symbol") in symbols:
-                leg_syms.add(str(order["symbol"]))
+            sym = order.get("symbol")
+            if sym:
+                leg_syms.add(str(sym))
             if not leg_syms.intersection(symbols):
                 continue
             oid = order.get("id")
@@ -1060,6 +1083,88 @@ async def cancel_alpaca_open_orders_for_symbols(settings: Settings, symbols: set
             if cr.is_success:
                 canceled += 1
     return canceled
+
+
+async def cancel_open_mleg_orders(settings: Settings) -> int:
+    """Cancel all open multi-leg orders (burst leftovers block new mleg entries)."""
+    canceled = 0
+    base = settings.apca_api_base_url.rstrip("/")
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for order in await fetch_alpaca_open_orders(settings):
+            if str(order.get("order_class", "")).lower() != "mleg":
+                continue
+            oid = order.get("id")
+            if not oid:
+                continue
+            cr = await client.delete(f"{base}/v2/orders/{oid}", headers=_alpaca_headers(settings))
+            if cr.is_success:
+                canceled += 1
+    return canceled
+
+
+async def alpaca_open_order_preflight(settings: Settings) -> dict[str, int]:
+    """Counts for /health TV-pause risk (no secrets)."""
+    orders = await fetch_alpaca_open_orders(settings)
+    mleg = sum(1 for o in orders if str(o.get("order_class", "")).lower() == "mleg")
+    return {
+        "open_order_count": len(orders),
+        "open_mleg_count": mleg,
+    }
+
+
+async def alpaca_open_order_preflight_cached(settings: Settings) -> dict[str, Any]:
+    """Cached open-order counts so /health stays fast for keepalive probes."""
+    now = time.monotonic()
+    if now - float(_preflight_cache["ts"]) < PREFLIGHT_CACHE_SEC:
+        cached = _preflight_cache.get("data")
+        if isinstance(cached, dict):
+            return cached
+    try:
+        data = await asyncio.wait_for(
+            alpaca_open_order_preflight(settings),
+            timeout=PREFLIGHT_TIMEOUT_SEC,
+        )
+    except Exception as exc:
+        logger.warning("Alpaca preflight skipped: %s", exc)
+        data = {"open_order_count": -1, "open_mleg_count": -1, "preflight_skipped": True}
+    _preflight_cache["ts"] = now
+    _preflight_cache["data"] = data
+    return data
+
+
+def build_tv_pause_risk(settings: Settings, preflight: dict[str, int]) -> dict[str, Any]:
+    """Surface signals that can pause TradingView alerts or block fills."""
+    reasons: list[str] = []
+    if not settings.configured:
+        reasons.append("bridge_not_configured")
+    if not settings.webhook_secret:
+        reasons.append("webhook_secret_missing_on_bridge")
+    open_mleg = int(preflight.get("open_mleg_count", 0))
+    open_total = int(preflight.get("open_order_count", 0))
+    if preflight.get("preflight_skipped"):
+        reasons.append("alpaca_preflight_skipped")
+    elif open_mleg > 0:
+        reasons.append(f"open_mleg_orders={open_mleg}")
+    elif open_total > 0:
+        reasons.append(f"open_orders={open_total}")
+    uptime_sec = round(time.monotonic() - _app_started_mono, 1)
+    if uptime_sec < 45:
+        reasons.append(f"cold_start_uptime_sec={uptime_sec}")
+    if any(r.startswith("bridge_not") or r.startswith("webhook_secret") for r in reasons):
+        level = "red"
+    elif reasons:
+        level = "yellow"
+    else:
+        level = "green"
+    return {
+        "level": level,
+        "reasons": reasons,
+        "webhook_secret_configured": bool(settings.webhook_secret),
+        "open_mleg_count": open_mleg,
+        "open_order_count": open_total,
+        "uptime_sec": uptime_sec,
+        "auto_cancel_conflicting_orders": settings.auto_cancel_conflicting_orders,
+    }
 
 
 def resolve_warning_close_debit(
@@ -1474,6 +1579,30 @@ def webhook_auth_error(provided: str | None, expected: str) -> str | None:
     return "Invalid webhook secret — must match Render env WEBHOOK_SECRET exactly"
 
 
+def webhook_auth_json_response(
+    auth_err: str,
+    *,
+    dry_run: bool,
+    kind: Literal["entry", "warning"] = "entry",
+) -> JSONResponse:
+    """401 for bad secret (TradingView marks alert failed — correct for misconfig)."""
+    if kind == "warning":
+        content: dict[str, Any] = {
+            "danger_zone": False,
+            "action_taken": "auth_failed",
+            "risk_warning": auth_err,
+            "notifications": {},
+        }
+    else:
+        content = {
+            "success": False,
+            "message": auth_err,
+            "dry_run": dry_run,
+            "notifications": {},
+        }
+    return JSONResponse(status_code=401, content=content)
+
+
 async def submit_entry_sync_chase(
     settings: Settings,
     signal: TradingViewSignal,
@@ -1630,7 +1759,31 @@ async def submit_entry_from_signal(
 
     entry_payload = build_alpaca_entry_payload(spread) if settings.use_alpaca else build_entry_payload(spread)
     logger.info("Submitting %s entry order", "Alpaca mleg" if settings.use_alpaca else "Tastytrade")
+
+    if settings.use_alpaca and settings.auto_cancel_conflicting_orders and settings.alpaca_configured:
+        leg_syms = {leg.symbol for leg in spread.legs}
+        sym_canceled = await cancel_alpaca_open_orders_for_symbols(settings, leg_syms)
+        mleg_canceled = await cancel_open_mleg_orders(settings)
+        total = sym_canceled + mleg_canceled
+        if total:
+            logger.info(
+                "Pre-entry cleanup: canceled %s open order(s) (%s symbol, %s mleg)",
+                total,
+                sym_canceled,
+                mleg_canceled,
+            )
+
     entry = await submit_order(settings, entry_payload, dry_run=dry_run)
+    if (
+        settings.use_alpaca
+        and settings.auto_cancel_conflicting_orders
+        and not entry.success
+        and "(403)" in entry.message
+    ):
+        mleg_canceled = await cancel_open_mleg_orders(settings)
+        logger.warning("Entry rejected 403 — canceled %s open mleg order(s), retrying once", mleg_canceled)
+        entry = await submit_order(settings, entry_payload, dry_run=dry_run)
+
     entry_credit = float(spread.metadata["limit_credit"]) if settings.use_alpaca else None
     return spread, entry, entry_credit
 
@@ -1732,17 +1885,19 @@ def coerce_signal(payload: dict, settings: Settings) -> TradingViewSignal:
 
 app = FastAPI(
     title="spy-options-bridge",
-    version="5.5.8",
+    version="5.5.9",
     description="TradingView → Alpaca Paper multi-leg SPY credit spreads + auto GTC exits",
 )
 
 
 @app.on_event("startup")
 async def startup_log() -> None:
+    global _app_started_mono
+    _app_started_mono = time.monotonic()
     s = get_settings()
     broker_label = "Alpaca Paper" if s.use_alpaca else "Tastytrade Cert"
     logger.info(
-        "spy-options-bridge v5.5.8 started | broker=%s (%s) | configured=%s | mode=%s | auto_tp=%s auto_sl=%s chase=%s paper_force=%s",
+        "spy-options-bridge v5.5.9 started | broker=%s (%s) | configured=%s | mode=%s | auto_tp=%s auto_sl=%s chase=%s paper_force=%s auto_cancel=%s",
         s.broker,
         broker_label,
         s.configured,
@@ -1751,6 +1906,7 @@ async def startup_log() -> None:
         s.auto_stop_loss,
         s.auto_chase_entry_fill,
         s.paper_force_min_fill and s.is_alpaca_paper,
+        s.auto_cancel_conflicting_orders,
     )
 
 SECRET_BODY_KEYS = ("webhookSecret", "webhook_secret", "secret")
@@ -1768,12 +1924,18 @@ def extract_webhook_secret(payload: dict[str, Any], header: str | None) -> tuple
 
 
 @app.get("/health")
-async def health() -> dict[str, str]:
+async def health() -> dict[str, Any]:
     s = get_settings()
     broker_name = "alpaca" if s.use_alpaca else s.broker
+    preflight = (
+        await alpaca_open_order_preflight_cached(s)
+        if s.use_alpaca and s.alpaca_configured
+        else {}
+    )
+    tv_pause_risk = build_tv_pause_risk(s, preflight)
     return {
-        "status": "ok",
-        "version": "5.5.8",
+        "status": "ok" if tv_pause_risk["level"] != "red" else "degraded",
+        "version": "5.5.9",
         "burst_endpoint": "/exercise/burst",
         "auto_take_profit": str(s.auto_take_profit),
         "auto_stop_loss": str(s.auto_stop_loss),
@@ -1781,6 +1943,9 @@ async def health() -> dict[str, str]:
         "broker_label": "Alpaca Paper" if s.use_alpaca else "Tastytrade Cert",
         "mode": s.execution_mode,
         "configured": str(s.configured),
+        "webhook_secret_configured": str(bool(s.webhook_secret)),
+        "email_configured": s.email_configured,
+        "email_enabled": s.email_enabled,
         "api": s.apca_api_base_url if s.use_alpaca else s.tastytrade_api_base_url,
         "dte_filter_default": s.default_dte_filter,
         "auto_close_on_warning": str(s.auto_close_on_warning),
@@ -1791,6 +1956,10 @@ async def health() -> dict[str, str]:
         "entry_chase_poll_seconds": str(s.entry_chase_poll_seconds),
         "entry_min_credit": str(s.entry_min_credit),
         "paper_force_min_fill": str(s.paper_force_min_fill and s.is_alpaca_paper),
+        "auto_cancel_conflicting_orders": str(s.auto_cancel_conflicting_orders),
+        "open_mleg_count": str(preflight.get("open_mleg_count", "")),
+        "open_order_count": str(preflight.get("open_order_count", "")),
+        "tv_pause_risk": tv_pause_risk,
         "deploy_file": "main.py (root — NOT app/main.py)",
     }
 
@@ -1798,7 +1967,7 @@ async def health() -> dict[str, str]:
 @app.get("/ping")
 async def ping() -> dict[str, str]:
     """Lightweight keep-alive for cron pings (prevents Render free-tier cold starts)."""
-    return {"status": "ok", "version": "5.5.8"}
+    return {"status": "ok", "version": "5.5.9"}
 
 
 def _burst_paper_guard(settings: Settings) -> str | None:
@@ -1851,7 +2020,7 @@ async def exercise_burst_endpoint(
     provided, payload = extract_webhook_secret(payload, x_webhook_secret)
     auth_err = webhook_auth_error(provided, settings.webhook_secret)
     if auth_err:
-        return JSONResponse(status_code=200, content={"success": False, "message": auth_err, "dry_run": dry_run})
+        return webhook_auth_json_response(auth_err, dry_run=dry_run, kind="entry")
 
     burst_n = _parse_burst_count(payload, count)
     interval_sec = float(payload.pop("burstInterval", payload.pop("burst_interval", interval)) or interval)
@@ -1925,7 +2094,7 @@ async def exercise_entry_endpoint(
     provided, payload = extract_webhook_secret(payload, x_webhook_secret)
     auth_err = webhook_auth_error(provided, settings.webhook_secret)
     if auth_err:
-        return JSONResponse(status_code=200, content={"success": False, "message": auth_err, "dry_run": dry_run})
+        return webhook_auth_json_response(auth_err, dry_run=dry_run, kind="entry")
 
     guard = _burst_paper_guard(settings)
     if guard:
@@ -2046,15 +2215,7 @@ async def entry_endpoint(
     auth_err = webhook_auth_error(provided, settings.webhook_secret)
     if auth_err:
         logger.warning("Webhook auth failed: %s", auth_err)
-        return JSONResponse(  # type: ignore[return-value]
-            status_code=200,
-            content={
-                "success": False,
-                "message": auth_err,
-                "dry_run": dry_run,
-                "notifications": {},
-            },
-        )
+        return webhook_auth_json_response(auth_err, dry_run=dry_run, kind="entry")  # type: ignore[return-value]
 
     burst_raw = payload.get("burstCount") or payload.get("burst_count")
     if burst_raw is not None and settings.is_alpaca_paper:
@@ -2182,15 +2343,7 @@ async def warning_endpoint(
     auth_err = webhook_auth_error(provided, settings.webhook_secret)
     if auth_err:
         logger.warning("Warning webhook auth failed: %s", auth_err)
-        return JSONResponse(  # type: ignore[return-value]
-            status_code=200,
-            content={
-                "danger_zone": False,
-                "action_taken": "auth_failed",
-                "risk_warning": auth_err,
-                "notifications": {},
-            },
-        )
+        return webhook_auth_json_response(auth_err, dry_run=dry_run, kind="warning")  # type: ignore[return-value]
 
     warning = WarningSignal.model_validate(payload)
 

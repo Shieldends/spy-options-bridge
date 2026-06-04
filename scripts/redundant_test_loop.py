@@ -16,6 +16,11 @@ SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 
 from security_utils import redact_text  # noqa: E402
+from run_preopen_matrix import (  # noqa: E402
+    market_session_open,
+    pre_open_pressure_enabled,
+    pre_open_test_aggressive,
+)
 
 STOP_FILE = Path(r"C:\Users\Shiel\Desktop\STOP-REDUNDANT-TESTS.txt")
 LOG_PATH = Path(r"C:\Users\Shiel\Desktop\REDUNDANT-TEST-LOG.txt")
@@ -52,10 +57,8 @@ def should_stop() -> str | None:
     if STOP_FILE.exists():
         return f"STOP file present: {STOP_FILE}"
     now = datetime.now(ET)
-    if now.weekday() < 5:
-        open_time = now.replace(hour=9, minute=30, second=0, microsecond=0)
-        if now >= open_time:
-            return "Market open reached (9:30 AM ET) — live run begins"
+    if market_session_open(now):
+        return "Market open reached (9:30 AM ET) — live run begins"
     return None
 
 
@@ -112,6 +115,53 @@ def _team_email():
     )
 
     return notify_redundant_cycle, notify_health_fail, try_email_final_report_available
+
+
+
+
+def run_burst_pressure_hook() -> None:
+    """When pre_open_pressure enabled, log burst path; optional mini-burst via env."""
+    if not pre_open_pressure_enabled():
+        return
+    if not pre_open_test_aggressive():
+        return
+    log_line(
+        "BURST REQUIRED (pre_open_pressure): Desktop BURST-PAPER-100.bat or "
+        "burst_paper_fills.py --count 100 (Render /exercise/burst)"
+    )
+    import os
+
+    if os.environ.get("REDUNDANT_BURST_EACH_CYCLE", "").strip().lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return
+    py = ROOT / ".venv" / "Scripts" / "python.exe"
+    if not py.exists():
+        py = Path(sys.executable)
+    log_line("REDUNDANT_BURST_EACH_CYCLE=1 -> burst_paper_fills --count 5 --batch-size 5")
+    proc = subprocess.run(
+        [
+            str(py),
+            str(SCRIPTS / "burst_paper_fills.py"),
+            "--count",
+            "5",
+            "--batch-size",
+            "5",
+            "--interval",
+            "2",
+        ],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        timeout=1800,
+    )
+    tail = (proc.stdout or proc.stderr or "").strip().splitlines()[-2:]
+    if tail:
+        log_line("burst hook: " + redact_text(" | ".join(tail), max_len=240))
+    log_line(f"burst hook exit={proc.returncode}")
 
 
 def email_cycle_summary(cycle: int, pass_n: int, fail_n: int, summary: str) -> None:

@@ -1,13 +1,50 @@
-THURSDAY JUNE 4, 2026 — MARKET OPEN PROOF (paper)
+THURSDAY MARKET OPEN — SPY PAPER PROOF (2026-06-04)
+Updated: 2026-06-03 evening ET | No secrets
 
-YOU: Keep TradingView alerts ON for SPY (MACD entry + close/warning). Watch Alpaca Paper → Orders/Positions; you do not need to click anything unless something looks stuck.
+================================================================================
+BULLET RECAP
+================================================================================
+• Phase 0 production: MACD Entry + Warning on SPY → Render → Alpaca put credit spread.
+• YOU: Keep TV alerts ON; watch Alpaca Paper at 9:30 ET — no clicks unless stuck.
+• Optional 9:31: Desktop BURST-PAPER-100.bat (100-fill proof; bypasses TV).
+• Bridge: https://spy-options-bridge.onrender.com (health /entry /warning /exercise/burst).
+• Live tonight: v5.5.6 on Render; local v5.5.7 + email — deploy when ready.
 
-SUCCESS: Entry alert → Render log "Alert accepted" → Alpaca mleg order → status FILLED → optional GTC TP/SL. Close/warning alert → danger check → auto-close spread (or notify if override).
+================================================================================
+TIMELINE (Eastern)
+================================================================================
+9:30  TV MACD Entry/Warning may fire → webhook → fill chase (min credit 0.01 on Render yaml).
+9:31  Optional: BURST-PAPER-100.bat → /exercise/burst (does not spam TV).
 
-BEFORE OPEN (optional): Double-click Desktop PREP-MARKET-OPEN.bat or run:
+================================================================================
+SUCCESS CRITERIA
+================================================================================
+Entry: TV delivered → Render accepts → Alpaca mleg FILLED → GTC TP/SL placed.
+Warning: danger check → auto-close or notify (overrideAutoClose in JSON).
+
+================================================================================
+BEFORE OPEN (optional)
+================================================================================
+PREP-MARKET-OPEN.bat or:
   C:\Users\Shiel\spy-options-bridge\.venv\Scripts\python.exe scripts\prep_market_open.py
-Expect health version 5.5.4+ and exercise entry accepted; fill may wait until 9:30 ET if tested pre-open.
 
-IF NO FILL: Check Render is awake (health URL), Alpaca paper Orders tab, and that WEBHOOK_SECRET in TV JSON matches Render env.
+Health: https://spy-options-bridge.onrender.com/health → version 5.5.6+, configured true.
 
-FRIDAY: Same setup if Thursday misses a fill — no need to wait until Monday.
+================================================================================
+IF NO FILL
+================================================================================
+Render awake? WEBHOOK_SECRET match? Paper options enabled? Flat conflicting positions?
+See Desktop PRE-OPEN-TEST-RESULTS.txt and sync\grok_outbox.md diagnostic tree.
+
+================================================================================
+TV SAFETY
+================================================================================
+No extra test alerts. Burst/prep/exercise bypass TradingView.
+
+================================================================================
+GROK / DESKTOP
+================================================================================
+THURSDAY-LIVE-RUN.txt | PRE-OPEN-TEST-RESULTS.txt | AUTOMATION-SETUP.txt
+sync\cursor_inbox.md | append_sync.py after inbox updates
+
+FRIDAY: Same setup if Thursday misses — no need to wait until Monday.

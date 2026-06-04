@@ -1,0 +1,339 @@
+# SPY Hybrid V3 Trading Engine — Master Architecture (LOCKED)
+# Unchangeable core foundation. Frame ALL code, strategy, and advice against this thesis.
+# Last locked: 2026-06-02 | Owner: Shieldends / David Kennedy pipeline
+
+---
+
+## 0. OPERATIONAL MANDATE FOR CURSOR
+
+- You are the **Master Architect** for a **hybrid Python + Pine Script V3** trading engine.
+- **Do not brainstorm** when the user asks for implementation; **execute** against this file.
+- **Do not** replace or break **Phase 0 production** unless the user explicitly says **"implement Phase N"**.
+- **Default broker path:** Alpaca **paper** via `spy-options-bridge` on Render (`https://spy-options-bridge.onrender.com`).
+- **Secrets:** Read only from local `.env` files — **never** ask the user to paste keys in chat.
+- **User constraints:** One step at a time; short instructions; prefer Desktop `.bat` launchers and absolute paths under `C:\Users\Shiel`.
+- **Autonomy:** Run terminal commands yourself to debug API/connection errors; read terminal output; fix and retry.
+- **Continuity:** This blueprint is the **unchangeable core**. Every future session inherits these rules without re-negotiation.
+
+---
+
+## 1. OBJECTIVE
+
+Build and maintain an **institutional-grade Multi-Layer Voting Committee** workflow:
+
+| Pillar | Specification |
+|--------|----------------|
+| **Execution capital** | Thousands USD in trading account — agile, fractional, **zero market footprint** |
+| **Infrastructure capital** | **Separate** funding for APIs, Render, data — never mix with risk sizing |
+| **TradingView** | Micro-timing clock (bar-level triggers) |
+| **Python** | External institutional brain (lookback, IV, API verification, risk math) |
+| **Bridge** | `spy-options-bridge` — webhook ingress, committee veto, Alpaca mleg orders |
+| **Proven base** | Put credit spreads on SPY (weekly, offsets -5/-6) — **extend**, do not discard working plumbing |
+
+**Phase 0 (LIVE NOW):** `spy-macd-bridge-signals.pine` + ENTRY `/entry` + WARNING `/warning` + `fillMode: aggressive`.  
+**Phase 1+:** `MASTER-WORKFORCE-V3-BACKUP.pine` — enable only after user says **"implement Phase 1"**.
+
+---
+
+## 2. THREE-LAYER VOTING ENGINE
+
+**RULE:** An order routes to the broker **only if all three layers align**. Any layer **NO** → **block** (no order or bridge returns `success: false` with reason).
+
+### Layer 1 — Behavioral Bias (Initiator)
+
+| Component | Responsibility |
+|-----------|----------------|
+| **Purpose** | Macro bias: smart money / fundamentals agree before short-vol or directional entry |
+| **Python hooks** | `scripts/committee_engine.py` → `LookbackWindow.check_quiver_insider()` |
+| **API** | **Quiver Quantitative** — legal corporate insider transactions, short-interest float (when enabled) |
+| **Async rule** | **Lookback window:** insider buy OR significant activity within last `lookbackHours` (default 24) — **not** same-second as TV bar |
+| **Pine proxy (Phase 1)** | VIX vs SMA (not elevated); SPY/QQQ relative strength rising |
+| **Vote** | `layerBehavioral == true` |
+
+### Layer 2 — Structural Liquidity (Dark Pool Gatekeeper)
+
+| Component | Responsibility |
+|-----------|----------------|
+| **Purpose** | Institutional flow present; ignore retail noise |
+| **Python hooks** | `LookbackWindow.check_unusual_whales_dp()`; optional 15-min burst on trigger |
+| **API** | **Unusual Whales** — dark pool prints, heavy options sweeps (when enabled) |
+| **Pine proxy (Phase 1)** | Volume **> 2σ** above 20-period MA; optional VWAP/structure break; block dead tape (volZ < 0.25) |
+| **Vote** | `layerStructural == true` |
+
+### Layer 3 — Statistical Execution (Timing Clock)
+
+| Component | Responsibility |
+|-----------|----------------|
+| **Purpose** | Exact entry moment; avoid overpaying premium |
+| **Pine** | **ATR volatility squeeze:** Bollinger Band inside Keltner Channel compression → release; **AND** MACD line cross up (12/26/9) |
+| **Python** | **IV Rank / IV proxy** via VIX regime + ORATS hook (Phase 3) — avoid buying rich premium (IV crush) |
+| **IV routing** | `ivRegime` 0=low → long ITM (Phase 4); 1=mid / 2=high → **put_credit_spread** (production) |
+| **Vote** | `layerStatistical == true` |
+
+### Committee consensus
+
+```
+committeePass = layerBehavioral AND layerStructural AND layerStatistical
+entry_fire = committeePass AND macdCrossUp AND liquidityOK
+```
+
+---
+
+## 3. DATA BUDGET GUARD — QUERY-ON-TRIGGER
+
+**Never** poll Quiver/Unusual Whales 24/7.
+
+| State | Behavior |
+|-------|----------|
+| **Idle** | Premium APIs dormant; no background spend |
+| **Trigger** | TradingView statistical pre-setup fires → webhook hits bridge with `"queryOnTrigger": true` |
+| **Verify** | Python pulls **last 15 minutes** (configurable) of DP/insider data + **lookbackHours** window |
+| **Result** | Merge with Pine flags; approve or reject before Alpaca submit |
+
+Implementation: `QueryOnTrigger.on_statistical_setup()` in `committee_engine.py`.  
+Config: `config/committee.yaml` → `query_on_trigger: true`, paid integration flags `enabled: false` until user approves spend.
+
+---
+
+## 4. STRICT RISK MATH & EXECUTION ROUTING
+
+### User inputs (Pine + JSON + bridge)
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `accountEquity` | 3000 | Total account USD |
+| `maxRiskPct` | 1.5 | Max loss per trade (% of equity) → **$45** on $3k |
+| `sizeMultiplier` | 1.0 or 0.5 | 50% size when `macroVolHigh` and committee still GREEN |
+
+### Enforcement (Python — Phase 2+)
+
+- Compute **max risk dollars** = `accountEquity * (maxRiskPct / 100)`.
+- **Dynamic contract qty** from **structural stop-loss distance** so stop-out loss ≤ max risk dollars.
+- **Never** exceed 1.5% on a single stop-out.
+
+### Default execution target (Phase 4 — architect now, implement when user enables)
+
+| Parameter | Value |
+|-----------|-------|
+| Structure | Front-month **ITM options**, delta **0.60–0.70** |
+| Rationale | Leverage without tying massive equity; fits thousands-scale account |
+| Phase 0–2 production | **`PUT_CREDIT_SPREAD`** mleg via Alpaca (working plumbing) |
+| Bridge config | `committee.yaml` → `execution_phase4.target_delta_min/max` |
+
+### Macro volatility caution
+
+If all three layers GREEN **and** `macroVolHigh` (VIX > SMA × 1.15): **`sizeMultiplier = 0.5`**.
+
+---
+
+## 5. LIQUIDITY GUARDRAILS
+
+Block execution if:
+
+| Guard | Threshold |
+|-------|-----------|
+| 10-day ADV | < 2,000,000 shares |
+| Price | < $10 or > $150 (configurable) |
+| SPY | Always passes ADV (ETF) |
+
+Config: `committee.yaml` → `liquidity:` section.  
+Function: `liquidity_ok()` in `committee_engine.py`.
+
+---
+
+## 6. REPOSITORY LAYOUT — CURSOR MUST ORGANIZE HERE
+
+### Primary: `C:\Users\Shiel\spy-options-bridge\`
+
+| File / path | Role |
+|-------------|------|
+| `main.py` | FastAPI **server** — `/health`, `/entry`, `/webhook`, `/warning`; Alpaca mleg; GTC TP/SL; fill modes (`fixed`, `aggressive`, `exercise`) |
+| `scripts/committee_engine.py` | **Committee brain** — lookback, query-on-trigger, IV routing, liquidity, risk stubs |
+| `scripts/exercise_system.py` | Full system exercise + undo |
+| `scripts/scenario_lab.py` | Multi-scenario unattended validation |
+| `config/committee.yaml` | Committee mode: `off` \| `monitor` \| `strict` |
+| `config/scenario_lab.yaml` | Scenario matrix |
+| `render.yaml` | Render deploy env |
+| `.env` | `APCA_*`, `WEBHOOK_SECRET` — **never commit** |
+| `templates/spy-macd-bridge-signals.pine` | **Phase 0 production Pine** |
+| `templates/MASTER-WORKFORCE-V3-BACKUP.pine` | **Phase 1 master Pine** |
+| `templates/tradingview-entry-autofill.json` | Phase 0 entry message |
+| `templates/tradingview-entry-committee-v3.json` | Phase 1 entry message |
+| `templates/tradingview-warning-alert.json` | Warning message |
+| `tests/` | pytest — run before deploy |
+| `docs/WORKFORCE-ARCHITECTURE.md` | Design reference |
+
+### Secondary: `C:\Users\Shiel\market-analyzer\`
+
+| File / path | Role |
+|-------------|------|
+| `scripts/autopilot.py` | Prelaunch + scale campaigns |
+| `src/market_analyzer/consensus/engine.py` | Guru/persona consensus (extend for L1) |
+| `config/paper_campaigns.yaml` | Backtest grids + live burst config |
+| `reports/` | Autopilot output |
+
+### Desktop launchers (`C:\Users\Shiel\Desktop\`)
+
+| Bat | Action |
+|-----|--------|
+| `RUN-LAB.bat` / `RUN-SCENARIO-LAB.bat` | Scenario lab |
+| `UNDO-EXERCISE.bat` | Cleanup paper artifacts |
+| `OPEN-MASTER-V3-PINE.bat` | Open master Pine backup |
+| `OPEN-COMMITTEE-JSON.bat` | Open committee JSON template |
+| `WORKFORCE-V3-FULL.pine` | Protected Pine copy |
+| `WORKFORCE-PLAN.txt` | Human rollout plan |
+
+**When adding modules:** prefer `scripts/committee_engine.py` + thin hooks in `main.py` — **do not** create duplicate `server.py` unless migrating; if migrating, `main.py` remains canonical until explicit rename PR.
+
+---
+
+## 7. JSON WEBHOOK TEMPLATES — CURSOR RULES
+
+### ENTRY (`POST /entry` or `/webhook`)
+
+Required for Phase 0:
+
+```json
+{
+  "webhookSecret": "<from .env WEBHOOK_SECRET>",
+  "ticker": "SPY",
+  "action": "PUT_CREDIT_SPREAD",
+  "signalPrice": {{close}},
+  "dteFilter": "weekly",
+  "strikeOffsetShort": -5,
+  "strikeOffsetLong": -6,
+  "quantity": 1,
+  "fillMode": "aggressive",
+  "limitCredit": 0.55
+}
+```
+
+Phase 1 additions:
+
+```json
+{
+  "committeePass": true,
+  "committeeVersion": "v3-phase1",
+  "layerBehavioral": true,
+  "layerStructural": true,
+  "layerStatistical": true,
+  "macroVolHigh": false,
+  "sizeMultiplier": 1.0,
+  "lookbackHours": 24,
+  "ivRegime": 0,
+  "preferredStructure": "put_credit_spread",
+  "accountEquity": 3000,
+  "maxRiskPct": 1.5,
+  "queryOnTrigger": true
+}
+```
+
+**Critical:** `{{close}}` must **never** be quoted in TradingView.
+
+### WARNING (`POST /warning`)
+
+```json
+{
+  "webhookSecret": "<secret>",
+  "ticker": "SPY",
+  "signalPrice": {{close}},
+  "strikeOffsetShort": -5,
+  "strikeOffsetLong": -6,
+  "overrideAutoClose": false
+}
+```
+
+### Bridge behavior Cursor must preserve
+
+- Invalid secret → **401**
+- Invalid JSON → **200** with `success: false` (TradingView delivery UX)
+- `committee.yaml` `mode: strict` → reject if `committeePass` not true (Phase 2)
+- Alpaca credit spread `limit_price` negative = credit received
+- Auto GTC TP/SL after entry fill (background task)
+
+---
+
+## 8. PHASE GATES — DO NOT SKIP
+
+| Phase | User trigger | Allowed changes |
+|-------|--------------|-----------------|
+| **0** | *(active)* | MACD alerts only; no committee gate |
+| **1** | `"implement Phase 1"` | Add V3 Pine + new alert; **pause** MACD ENTRY |
+| **2** | `"implement Phase 2"` | `committee.mode: strict` in bridge |
+| **3** | User enables API keys | Quiver + Unusual Whales on trigger |
+| **4** | User approves | ITM delta routing, full 1.5% stop sizing in bridge |
+
+---
+
+## 9. CURSOR TERMINAL & DEBUG PROTOCOL
+
+When any task involves connectivity or orders:
+
+1. `GET https://spy-options-bridge.onrender.com/health` — expect `version` ≥ 5.5, `configured: true`
+2. Read `C:\Users\Shiel\spy-options-bridge\.env` for secrets (do not print secrets to user)
+3. Run `.\.venv\Scripts\python.exe scripts\exercise_system.py` or `scripts\scenario_lab.py` from bridge root
+4. On failure: read stderr; check Alpaca `403` (position conflict), `401` (secret), unfilled `New` (limit vs market)
+5. Git push from `spy-options-bridge` with Git in PATH: `C:\Program Files\Git\bin`
+6. User Render deploy: Manual Deploy after push — remind in **one step** only
+
+**Alpaca paper base:** `https://paper-api.alpaca.markets`  
+**Data:** `https://data.alpaca.markets`
+
+---
+
+## 10. PAID API INTEGRATION HOOKS (APPROVE BEFORE ENABLE)
+
+| Service | Layer | Enable flag |
+|---------|-------|-------------|
+| Quiver Quantitative | L1 Behavioral | `committee.yaml` → `paid_integrations.quiver.enabled` |
+| Unusual Whales | L2 Structural | `paid_integrations.unusual_whales.enabled` |
+| ORATS (or equivalent) | L3 IV Rank | `paid_integrations.orats.enabled` |
+
+Cursor **must stop and ask** before setting any `enabled: true` or adding monthly spend.
+
+---
+
+## 11. TESTING REQUIREMENTS
+
+Before declaring any phase complete:
+
+- `pytest tests/ -q` in `spy-options-bridge`
+- `RUN-LAB.bat` or `scenario_lab.py` → Desktop `SCENARIO-LAB-RESULT.txt` PASS > FAIL
+- Account flat after exercise (`UNDO-EXERCISE.bat`)
+- Do **not** run lab during user's live MACD window unless user requests
+
+---
+
+## 12. WHAT NOT TO DO
+
+- Do **not** invent a TV-only script pretending to see dark pools
+- Do **not** remove `fillMode: aggressive` from production entry without user approval
+- Do **not** stream premium APIs 24/7
+- Do **not** commit `.env` or paste secrets
+- Do **not** overload user with multi-step chat paste — use Desktop files and `.bat`
+- Do **not** re-litigate architecture — **this file is law**
+
+---
+
+## 13. PROTECTED MASTER ARTIFACTS (NEVER DELETE)
+
+- `templates/MASTER-WORKFORCE-V3-BACKUP.pine`
+- `Desktop/WORKFORCE-V3-FULL.pine`
+- `templates/tradingview-entry-committee-v3.json`
+- `Desktop/WORKFORCE-PLAN.txt`
+- This file: `C:\Users\Shiel\.cursorrules`
+
+---
+
+## 14. CONTINUITY AMENDMENT (PERMANENT)
+
+This architectural profile, 3-layer committee logic, query-on-trigger budget guard, strict 1.5% risk math, ITM delta 0.60–0.70 execution target, and agile thousands-scale capital model are **locked**.
+
+Every future Cursor session **must**:
+
+1. Read this `.cursorrules` first when working under `C:\Users\Shiel`
+2. Frame all code and advice against this thesis automatically
+3. Treat Phase 0 MACD as production until Phase 1 is explicitly invoked
+4. Extend proven strategies — **not** reinvent the wheel
+
+**END OF LOCKED ARCHITECTURE**

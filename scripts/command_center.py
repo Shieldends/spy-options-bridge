@@ -20,6 +20,7 @@ SCRIPTS = Path(__file__).resolve().parent
 DESKTOP = Path(r"C:\Users\Shiel\Desktop")
 SYNC_DIR = Path(r"C:\Users\Shiel\Projects\spy-hybrid-v3\sync")
 HEALTH_URL = "https://spy-options-bridge.onrender.com/health"
+HEALTH_TIMEOUTS = (30.0, 60.0, 90.0)
 LOG_PATH = DESKTOP / "COMMAND-CENTER-LOG.txt"
 DEFAULT_STATUS_EMAIL = "shieldinc850@gmail.com"
 INTERVAL_SEC = 60
@@ -88,22 +89,86 @@ def worker_command(script: str, extra_args: list[str]) -> list[str]:
     return [str(py), str(SCRIPTS / script), *extra_args]
 
 
-def fetch_health(timeout: float = 30) -> tuple[bool, str]:
+def fetch_health(timeout: float = 60) -> tuple[bool, str]:
+    last_err = "unknown"
+    waits = HEALTH_TIMEOUTS if timeout <= 30 else (timeout, *HEALTH_TIMEOUTS)
+    for wait in waits:
+        try:
+            req = urllib.request.Request(
+                HEALTH_URL,
+                headers={"User-Agent": f"{PROJECT_NAME}/1.0"},
+            )
+            with urllib.request.urlopen(req, timeout=wait) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+                data = json.loads(raw)
+                ver = data.get("version", "?")
+                configured = data.get("configured", False)
+                risk = (data.get("tv_pause_risk") or {}).get("level", "?")
+                return True, f"HTTP {resp.status} version={ver} configured={configured} tv_risk={risk}"
+        except urllib.error.HTTPError as exc:
+            last_err = f"HTTP {exc.code}"
+        except Exception as exc:
+            last_err = f"FAIL: {type(exc).__name__}"
+    return False, last_err
+
+
+def dedupe_workers() -> None:
+    script = SCRIPTS / "dedupe_spy_workers.py"
+    if not script.is_file():
+        return
+    py = python_exe()
     try:
-        req = urllib.request.Request(
-            HEALTH_URL,
-            headers={"User-Agent": f"{PROJECT_NAME}/1.0"},
+        subprocess.run([str(py), str(script)], cwd=str(ROOT), capture_output=True, timeout=60)
+        log_line("dedupe_spy_workers completed")
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        log_line(f"dedupe_spy_workers skipped: {type(exc).__name__}")
+
+
+def worker_already_running(script: str) -> bool:
+    """Avoid duplicate worker if same script already in a python process."""
+    if sys.platform != "win32":
+        return False
+    needle = script.replace("\\", "/")
+    ps = (
+        "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
+        f"Where-Object {{ $_.CommandLine -match [regex]::Escape('{needle}') }} | "
+        "Select-Object -First 1 -ExpandProperty ProcessId"
+    )
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            capture_output=True,
+            text=True,
+            timeout=20,
         )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-            data = json.loads(raw)
-            ver = data.get("version", "?")
-            configured = data.get("configured", False)
-            return True, f"HTTP {resp.status} version={ver} configured={configured}"
-    except urllib.error.HTTPError as exc:
-        return False, f"HTTP {exc.code}"
-    except Exception as exc:
-        return False, f"FAIL: {type(exc).__name__}"
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    pid = (proc.stdout or "").strip()
+    return bool(pid and pid.isdigit())
+
+
+def supervisor_already_running() -> bool:
+    """Another command_center supervisor (console or GUI) already active."""
+    if sys.platform != "win32":
+        return False
+    my_pid = os.getpid()
+    ps = (
+        "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
+        "Where-Object {{ $_.CommandLine -match 'command_center(\\.py|_gui\\.py)' "
+        f"-and $_.ProcessId -ne {my_pid} }} | "
+        "Select-Object -First 1 -ExpandProperty ProcessId"
+    )
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    pid = (proc.stdout or "").strip()
+    return bool(pid and pid.isdigit())
 
 
 def spawn_worker(name: str, script: str, extra_args: list[str]) -> subprocess.Popen[bytes]:
@@ -175,6 +240,9 @@ def mark_todo_items() -> None:
 def spawn_all_workers() -> dict[str, subprocess.Popen[bytes]]:
     procs: dict[str, subprocess.Popen[bytes]] = {}
     for name, script, args in WORKERS:
+        if worker_already_running(script):
+            log_line(f"skip {name}: {script} already running")
+            continue
         procs[name] = spawn_worker(name, script, args)
     return procs
 
@@ -199,13 +267,30 @@ def supervise_loop(procs: dict[str, subprocess.Popen[bytes]]) -> None:
 
 def main() -> int:
     _load_dotenv()
+    if supervisor_already_running():
+        log_line("another command_center supervisor already running — exit without spawn")
+        print("Command center supervisor already running — not starting a duplicate.")
+        return 0
     print_banner()
     LOG_PATH.write_text(
         f"{PROJECT_NAME} session started {datetime.now(ET).isoformat()}\n",
         encoding="utf-8",
     )
 
+    auto_arm = DESKTOP / "OPERATOR-AUTO-ARM.txt"
+    if auto_arm.is_file():
+        try:
+            sys.path.insert(0, str(SCRIPTS))
+            import operator_gateway as og  # noqa: E402
+
+            granted = og.try_auto_grant_from_marker()
+            if granted:
+                log_line(f"auto operator grant: {granted.name}")
+        except Exception as exc:
+            log_line(f"auto operator grant skipped: {type(exc).__name__}")
+
     mark_todo_items()
+    dedupe_workers()
 
     for path in OPEN_PATHS:
         open_notepad(path)
@@ -215,7 +300,7 @@ def main() -> int:
     procs = spawn_all_workers()
     log_line(
         "auto-run: dual_sync (60s) + bridge_keepalive + redundant_test_loop "
-        "until 9:30 ET or STOP file"
+        "(pauses 9:30-16:00 ET; STOP file halts)"
     )
     try:
         sys.path.insert(0, str(SCRIPTS))

@@ -1,0 +1,37 @@
+SPY OPTIONS BRIDGE — LIVE MARKET RUN (read this only)
+====================================================
+
+DO NOT replace main.py with Redis / hybrid_v3 sample code from chat.
+That sample does NOT trade on Alpaca.
+
+LIVE SERVICE (Phase 0)
+----------------------
+URL:     https://spy-options-bridge.onrender.com/entry
+Health:  https://spy-options-bridge.onrender.com/health
+Folder:  C:\Users\Shiel\spy-options-bridge
+File:    main.py (v5.5.0+)
+
+TradingView webhook URL (paste exactly):
+https://spy-options-bridge.onrender.com/entry
+
+Message: copy from templates\tradingview-entry-autofill.json
+(JSON only — no MACD default text)
+
+WATCH DURING MARKET HOURS (Mon-Fri 9:30 AM - 4:00 PM Eastern)
+-----------------------------------------------------------
+1. TradingView → Alert log → webhook "delivered"
+2. Alpaca paper → Orders → SPY multi-leg spread
+3. After fill → bot places take-profit + stop (auto)
+
+YOU DO NOT NEED
+---------------
+- PowerShell / terminal open in Cursor
+- Redis code
+- spy-hybrid-v3 folder for live trading
+- Other folders "running" on the right side
+
+FUTURE (NOT TODAY)
+------------------
+Redis + core/hybrid_v3.py scaffold → spy-hybrid-v3 only after "implement Phase 1"
+
+Last verified by Cursor: 2026-06-03

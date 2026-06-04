@@ -21,7 +21,7 @@ from team_email import (  # noqa: E402
 )
 
 HEALTH_URL = "https://spy-options-bridge.onrender.com/health"
-MIN_VERSION = "5.5.8"
+MIN_VERSION = "5.5.9"
 ET = ZoneInfo("America/New_York")
 
 
@@ -50,11 +50,14 @@ def main() -> int:
     if args.test:
         ok_status, ok_perm = send_test_and_permission_sample()
         sent = ok_status or ok_perm
-        print(
-            "test+permission sample sent"
-            if sent
-            else "email disabled or failed — GUI Setup Email or SETUP-EMAIL-AUTOMATION.bat"
-        )
+        if sent:
+            print("test+permission sample sent — check inbox/spam for [SPY Command Center]")
+        else:
+            print(
+                "email failed — run SETUP-EMAIL-AUTOMATION.bat with a NEW 16-char Google App Password\n"
+                "(Google Account → Security → 2-Step Verification → App passwords → Mail).\n"
+                "535 BadCredentials = wrong password type or typo; normal Gmail password will not work."
+            )
         return 0 if sent else 1
 
     ok, data = fetch_health()

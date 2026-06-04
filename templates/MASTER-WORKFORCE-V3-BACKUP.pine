@@ -1,0 +1,136 @@
+//@version=5
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  MASTER BACKUP — SPY Workforce Committee V3 (Phase 1 Backbone)            ║
+// ║  DO NOT DELETE. Production today = spy-macd-bridge-signals.pine (separate)  ║
+// ║  Copy to TradingView only AFTER MACD live test is satisfactory.             ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+indicator("SPY Workforce Committee V3 [MASTER]", overlay=false, max_labels_count=500)
+
+// ─── Inputs ───────────────────────────────────────────────────────────────────
+grpCommittee = "Committee"
+lookbackNote   = input.string("Python verifies insider/DP in last X hours", "Async lookback", group=grpCommittee)
+lookbackHours  = input.int(24, "Lookback hours (sent to bridge)", minval=1, maxval=168, group=grpCommittee)
+
+grpVol = "L2 Structural"
+volLen     = input.int(20, "Volume MA length", group=grpVol)
+volSigma   = input.float(2.0, "Volume σ threshold", step=0.1, group=grpVol)
+useVwapBreak = input.bool(true, "Require VWAP / structure confirm", group=grpVol)
+
+grpStat = "L3 Statistical"
+bbLen    = input.int(20, "BB length", group=grpStat)
+bbMult   = input.float(2.0, "BB mult", group=grpStat)
+kcLen    = input.int(20, "KC length", group=grpStat)
+kcMult   = input.float(1.5, "KC mult", group=grpStat)
+macdFast = input.int(12, "MACD fast", group=grpStat)
+macdSlow = input.int(26, "MACD slow", group=grpStat)
+macdSig  = input.int(9, "MACD signal", group=grpStat)
+
+grpRisk = "Capital rules (Pine proxies — bridge enforces in Phase 2+)"
+accountEquity = input.float(3000, "Account equity ($)", group=grpRisk)
+riskPct       = input.float(1.5, "Max risk per trade (%)", step=0.1, group=grpRisk)
+macroVolMult  = input.float(1.15, "VIX vs SMA = high vol", step=0.05, group=grpRisk)
+
+grpLiq = "Liquidity guardrails (SPY default passes)"
+minAdvM = input.float(2.0, "Min ADV (millions shares)", group=grpLiq)
+priceMin = input.float(10, "Min price", group=grpLiq)
+priceMax = input.float(150, "Max price", group=grpLiq)
+
+// ─── L1 BEHAVIORAL (chart proxies; Quiver insider = Python lookback) ─────────
+vix    = request.security("VIX", timeframe.period, close, gaps=barmerge.gaps_off)
+vixSma = ta.sma(vix, 20)
+vixOk  = vix < vixSma * 1.10
+
+qqq    = request.security("QQQ", timeframe.period, close)
+rs     = close / qqq
+rsOk   = rs > ta.sma(rs, 10)
+
+// L1 GREEN when macro not stressed and relative strength favors SPY
+layerBehavioral = vixOk and rsOk
+
+// ─── L2 STRUCTURAL — volume 2σ + optional VWAP break ─────────────────────────
+volMa  = ta.sma(volume, volLen)
+volSd  = ta.stdev(volume, volLen)
+volZ   = volSd > 0 ? (volume - volMa) / volSd : 0.0
+volBreak = volZ >= volSigma
+
+vwapVal = ta.vwap(hlc3)
+structBreak = close > vwapVal
+layerStructural = volBreak and (useVwapBreak ? structBreak : true)
+layerStructural := layerStructural and volZ > 0.25
+
+// ─── L3 STATISTICAL — BB/KC squeeze release + MACD cross up ───────────────────
+basis = ta.sma(close, bbLen)
+dev   = bbMult * ta.stdev(close, bbLen)
+bbUpper = basis + dev
+bbLower = basis - dev
+
+kcMa = ta.sma(close, kcLen)
+kcR  = ta.sma(ta.tr(true), kcLen) * kcMult
+kcUpper = kcMa + kcR
+kcLower = kcMa - kcR
+
+squeezeOn = bbUpper < kcUpper and bbLower > kcLower
+squeezeRelease = squeezeOn[1] and not squeezeOn
+
+[macdLine, signalLine, histLine] = ta.macd(close, macdFast, macdSlow, macdSig)
+macdCrossUp = ta.crossover(macdLine, signalLine)
+macdBull    = macdLine > signalLine
+
+layerStatistical = (squeezeRelease or macdCrossUp) and macdBull
+
+// IV proxy on chart (ORATS IV rank = Python query-on-trigger in Phase 3)
+ivProxyHigh = vix > vixSma * macroVolMult
+ivRegime = ivProxyHigh ? 2 : vix > vixSma ? 1 : 0  // 0=low,1=mid,2=high → credit vs long in Phase 3
+
+// ─── COMMITTEE VOTE ───────────────────────────────────────────────────────────
+committeeOK = layerBehavioral and layerStructural and layerStatistical
+macroVolHigh = ivProxyHigh
+sizeMultiplier = macroVolHigh and committeeOK ? 0.5 : 1.0
+
+maxRiskDollars = accountEquity * (riskPct / 100.0)
+
+// Liquidity (SPY on chart always passes; kept for future single-name mode)
+liquidityOK = close >= priceMin and close <= priceMax  // ADV check in Python
+
+workforceEntry = committeeOK and macdCrossUp and liquidityOK
+workforceWarning = ta.crossunder(macdLine, signalLine)
+
+// ─── Plots for webhook placeholders (use in alert Message) ─────────────────────
+plot(committeeOK ? 1 : 0, "committeePass", display=display.none)
+plot(layerBehavioral ? 1 : 0, "layerBehavioral", display=display.none)
+plot(layerStructural ? 1 : 0, "layerStructural", display=display.none)
+plot(layerStatistical ? 1 : 0, "layerStatistical", display=display.none)
+plot(macroVolHigh ? 1 : 0, "macroVolHigh", display=display.none)
+plot(sizeMultiplier, "sizeMultiplier", display=display.none)
+plot(ivRegime, "ivRegime", display=display.none)
+plot(lookbackHours, "lookbackHours", display=display.none)
+plot(maxRiskDollars, "maxRiskDollars", display=display.none)
+
+// ─── Visuals ──────────────────────────────────────────────────────────────────
+plot(macdLine, "MACD", color=color.blue)
+plot(signalLine, "Signal", color=color.orange)
+plot(histLine, "Hist", color=color.gray, style=plot.style_columns)
+plot(volZ, "Vol Z", color=color.purple)
+hline(volSigma, "Vol +2σ", color=color.gray)
+bgcolor(committeeOK ? color.new(color.green, 88) : color.new(color.red, 90))
+plotchar(squeezeOn, "SQZ", "S", location.top, size=size.tiny, color=color.yellow)
+
+// ─── Alerts (Phase 1 — use MESSAGE template from tradingview-entry-committee-v3.json) ─
+alertcondition(
+     workforceEntry,
+     title="Workforce V3 Entry (All Layers)",
+     message="workforce_v3_entry")
+
+alertcondition(
+     workforceWarning,
+     title="Workforce V3 Warning (MACD Down)",
+     message="workforce_v3_warning")
+
+// Optional: dynamic alert() — enable after pasting webhook secret in alert UI only
+if workforceEntry
+    alert(
+         "WORKFORCE_ENTRY|" +
+         "committeePass=1|" +
+         "sizeMult=" + str.tostring(sizeMultiplier) + "|" +
+         "lookbackH=" + str.tostring(lookbackHours),
+         alert.freq_once_per_bar_close)

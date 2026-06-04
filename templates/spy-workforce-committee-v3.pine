@@ -1,0 +1,55 @@
+//@version=5
+indicator("SPY Workforce Committee v3 (DESIGN — do not replace MACD until Phase 1 go)", overlay=false)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PHASE 1 DESIGN SCRIPT — pair with NEW alert; keep MACD script for production today.
+// Three layers must ALL vote YES for committeeOK. Entry timing still uses MACD cross UP.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// --- L1 BEHAVIORAL (initiator) — proxies where ETF fundamentals are thin ---
+vix = request.security("VIX", timeframe.period, close, gaps=barmerge.gaps_off)
+vixElevated = vix > ta.sma(vix, 20) * 1.10
+qqq = request.security("QQQ", timeframe.period, close)
+spy = close
+rsSpyQqq = spy / qqq
+rsRising = rsSpyQqq > ta.sma(rsSpyQqq, 10)
+// Put credit favorable when vol not extreme and relative structure stable
+layerBehavioral = not vixElevated and rsRising
+
+// --- L2 STRUCTURAL (volume gatekeeper) ---
+volMean = ta.sma(volume, 20)
+volStd = ta.stdev(volume, 20)
+volZ = volStd > 0 ? (volume - volMean) / volStd : 0.0
+vwapVal = ta.vwap(hlc3)
+layerStructural = volZ > 2.0 or close > vwapVal * 1.001
+layerStructural := layerStructural and volZ > 0.3  // block dead tape
+
+// --- L3 STATISTICAL (execution filter) ---
+atr = ta.atr(14)
+atrLow = atr < ta.lowest(atr, 20) * 1.05
+atrExpanding = atr > atr[1]
+[macdLine, signalLine, _] = ta.macd(close, 12, 26, 9)
+macdCrossUp = ta.crossover(macdLine, signalLine)
+layerStatistical = (atrLow and atrExpanding or macdCrossUp) and macdLine > signalLine
+
+// --- COMMITTEE VOTE ---
+committeeOK = layerBehavioral and layerStructural and layerStatistical
+macroVolHigh = vix > ta.sma(vix, 20) * 1.15
+sizeHalf = macroVolHigh and committeeOK
+
+// Fire only when committee unanimous AND MACD entry cross
+workforceEntry = committeeOK and macdCrossUp
+workforceWarning = ta.crossunder(macdLine, signalLine)
+
+alertcondition(workforceEntry, title="Workforce Entry All Layers", message="workforce_entry")
+alertcondition(workforceWarning, title="Workforce Warning MACD Down", message="workforce_warning")
+
+plot(macdLine, color=color.blue, title="MACD")
+plot(signalLine, color=color.orange, title="Signal")
+plot(volZ, color=color.purple, title="Vol Z-Score")
+hline(2.0, "Vol 2σ", color=color.gray)
+bgcolor(committeeOK ? color.new(color.green, 90) : color.new(color.red, 92))
+plotchar(committeeOK, "OK", "✓", location.top, size=size.tiny, color=color.green)
+plotchar(layerBehavioral, "B", "B", location.bottom, size=size.tiny)
+plotchar(layerStructural, "S", "S", location.bottom, size=size.tiny)
+plotchar(layerStatistical, "T", "T", location.bottom, size=size.tiny)

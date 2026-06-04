@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import os
 import subprocess
 import sys
@@ -89,6 +90,9 @@ def _mark_google_bat_only() -> None:
 
 def save_app_password_only(smtp_pass: str, *, email_to: str = DEFAULT_TO) -> None:
     """GUI path: inbox fixed to DEFAULT_TO — user only types app password."""
+    smtp_pass = smtp_pass.strip().replace(" ", "")
+    if len(smtp_pass) != 16:
+        raise ValueError("App password must be 16 characters (Google Mail app password)")
     save_gmail_credentials(DEFAULT_TO, smtp_pass, email_from=DEFAULT_TO, email_to=email_to)
 
 
@@ -118,6 +122,13 @@ def save_gmail_credentials(
     )
 
 
+def _read_app_password(*, visible: bool) -> str:
+    if visible:
+        print("Characters WILL show on screen — use only on your private PC")
+        return input("Gmail app password (16 chars, visible): ").strip().replace(" ", "")
+    return getpass("Gmail app password (16 chars, hidden): ").strip().replace(" ", "")
+
+
 def run_test_send() -> int:
     py = ROOT / ".venv" / "Scripts" / "python.exe"
     if not py.exists():
@@ -129,7 +140,17 @@ def run_test_send() -> int:
     return proc.returncode
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Interactive local .env setup for Gmail SMTP alerts (no secrets printed)."
+    )
+    parser.add_argument(
+        "--visible",
+        action="store_true",
+        help="Show app password as you type (private PC only; default is hidden getpass).",
+    )
+    args = parser.parse_args(argv)
+
     print("=" * 60)
     print("SETUP EMAIL AUTOMATION — local .env only (never commit passwords)")
     print("=" * 60)
@@ -142,9 +163,12 @@ def main() -> int:
     if not smtp_user:
         smtp_user = default_user or "you@gmail.com"
 
-    smtp_pass = getpass("Gmail app password (16 chars, hidden): ").strip().replace(" ", "")
+    smtp_pass = _read_app_password(visible=args.visible)
     if not smtp_pass:
         print("No password entered — aborting .env update.")
+        return 1
+    if len(smtp_pass) != 16:
+        print(f"App password must be 16 characters after removing spaces (got {len(smtp_pass)}). Try again.")
         return 1
 
     email_from = input(f"EMAIL_FROM [{smtp_user}]: ").strip() or smtp_user

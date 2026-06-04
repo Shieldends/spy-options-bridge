@@ -34,9 +34,11 @@ GENERAL_MIN_INTERVAL_SEC = 300
 CYCLE_MIN_INTERVAL_SEC = 900
 
 REPLY_PROTOCOL_DOC = (
-    "Approve by replying YES to shieldinc850@gmail.com (same inbox). "
-    "Reply NO to skip. Team reads your reply manually — no auto Gmail login. "
-    "Future IMAP only with explicit user OK."
+    "Reply from shieldinc850@gmail.com (same inbox) — reply YES in the subject thread. "
+    "YES / OK / GRANT → 12h operator grant + approve pending. "
+    "APPROVE → pending only. DEPLOY → deploy markers + grant. STOP → stop workers. "
+    "NO / DENY / CANCEL → reject. Keep PENDING-ID in the reply. "
+    "Poll once: launchers\\CHECK-EMAIL-APPROVALS.bat (does not start workers)."
 )
 
 # Legacy constants (tests / imports)
@@ -58,6 +60,12 @@ def _paragraph(text: str) -> str:
 def _subject(kind: TeamKind, short_title: str) -> str:
     title = _paragraph(short_title).strip() or "Update"
     return f"{PREFIX} {kind}: {title}"
+
+
+def approval_subject(label: str) -> str:
+    """Outbound approval-request subject — inbox filter: NEED APPROVAL."""
+    title = _paragraph(label).strip() or "Action"
+    return f"{PREFIX} NEED APPROVAL - {title}"
 
 
 def _append_team_recall(subject: str) -> None:
@@ -150,13 +158,82 @@ def send_permission_request(
     paragraph: str,
     *,
     settings: dict[str, Any] | None = None,
+    pending_id: str | None = None,
 ) -> bool:
+    action_id = pending_id or "manual"
+    return send_approval_needed(
+        action_id,
+        short_title,
+        _paragraph(paragraph),
+        settings=settings,
+    )
+
+
+def send_approval_needed(
+    action_id: str,
+    short_title: str,
+    detail: str,
+    *,
+    settings: dict[str, Any] | None = None,
+) -> bool:
+    """NEED APPROVAL email with action id + reply YES / NO instructions."""
     body = (
-        f"{_paragraph(paragraph)}\n\n"
-        "Reply YES to approve. Reply NO to skip.\n\n"
+        f"NEED APPROVAL — action id: {action_id}\n\n"
+        f"{_paragraph(detail)}\n\n"
+        f"PENDING-ID: {action_id}\n"
+        "Reply YES (or OK / DEPLOY) in this email thread to approve.\n"
+        "Reply NO to deny.\n\n"
         f"{REPLY_PROTOCOL_DOC}"
     )
-    return send_team_email("permission", short_title, body, settings=settings, bypass_rate_limit=True)
+    subject = approval_subject(short_title)
+    ok = send_email_alert(subject, _paragraph(body), settings=settings)
+    if ok:
+        _append_team_recall(subject)
+    return ok
+
+
+def send_deploy_approval_request(
+    *,
+    settings: dict[str, Any] | None = None,
+) -> tuple[bool, str]:
+    """Email deploy/git-push bundle approval; returns (sent, pending_id)."""
+    import email_approval as erg  # noqa: WPS433 — local scripts import
+
+    cfg = erg.load_config()
+    erg.ensure_email_command_control_doc(cfg)
+    cc_folder = Path(cfg["paths"]["command_center_folder"])
+    entry = erg.create_pending_request(
+        cfg,
+        kind="deploy_bundle",
+        title="Deploy bundle (git push + Render Manual Deploy)",
+        detail=(
+            "After code push: Render dashboard → spy-options-bridge → Manual Deploy. "
+            f"Markers written to {cc_folder} on approval."
+        ),
+        expires_hours=24,
+        extra={
+            "steps": [
+                "git push from spy-options-bridge (if local changes)",
+                "Render dashboard → Manual Deploy",
+                "Confirm /health version",
+            ],
+            "bat_hint": r"C:\Users\Shiel\Desktop\RUN-OPERATOR-ACTION.bat",
+        },
+    )
+    pending_id = entry["id"]
+    paragraph = (
+        f"Deploy bundle approval requested. PENDING-ID: {pending_id}. "
+        "Reply YES or DEPLOY to grant 12h operator session and write DEPLOY-APPROVED.txt. "
+        "Reply NO to cancel. One-click after OK: Desktop\\RUN-OPERATOR-ACTION.bat or "
+        "Command Center → Check email replies."
+    )
+    ok = send_approval_needed(
+        pending_id,
+        "Deploy bundle approval",
+        paragraph,
+        settings=settings,
+    )
+    return ok, pending_id
 
 
 def send_report_summary(

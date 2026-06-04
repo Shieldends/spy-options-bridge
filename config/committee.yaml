@@ -1,0 +1,46 @@
+# Workforce committee — OFF until Phase 2 (live MACD unchanged)
+mode: off  # off | monitor | strict
+
+lookback_hours: 24
+query_on_trigger: true
+
+thresholds:
+  behavioral_min_score: 0.55
+  structural_vol_z_min: 2.0
+
+size_rules:
+  macro_vol_high_multiplier: 0.5
+  vix_sma_mult: 1.15
+
+iv_routing:
+  low: long_call_itm
+  mid: put_credit_spread
+  high: put_credit_spread
+
+liquidity:
+  min_adv_millions: 2.0
+  price_min: 10
+  price_max: 150
+
+risk_defaults:
+  account_equity: 3000
+  max_risk_pct: 1.5
+
+# ITM delta 0.60-0.70 routing — Phase 4 bridge options chain scan
+execution_phase4:
+  target_delta_min: 0.60
+  target_delta_max: 0.70
+  front_month: true
+
+paid_integrations:
+  quiver:
+    enabled: false
+    layer: behavioral
+    query_on_trigger_only: true
+  unusual_whales:
+    enabled: false
+    layer: structural
+    lookback_minutes: 15
+  orats:
+    enabled: false
+    layer: statistical

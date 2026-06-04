@@ -1,0 +1,240 @@
+# Operator protocol v1 — user-granted agent actions on Windows (default DENY).
+
+#
+
+# SECURITY (read before enabling):
+
+# - Never store passwords, API keys, or webhook secrets in OPERATOR-GRANT.json.
+
+# - Cursor/agents must NOT self-grant from chat; user runs GRANT bat (Y/N).
+
+# - Revoke immediately: delete C:\Users\Shiel\Desktop\OPERATOR-GRANT.json
+
+# - Audit log never includes secrets; gateway redacts sensitive patterns.
+
+# - v1 "real movement" = launch apps / open URLs (Start-Process, os.startfile).
+
+#   Tier `automate` (mouse/keyboard UI) is OFF — enable only after explicit v2 setup.
+
+
+
+default_policy: deny
+
+# ARM-FOR-OPEN: pre-grant session tier for market day (arm_for_open.py / START TEAM + marker)
+auto_grant_on_arm: true
+arm_grant_hours: 12
+
+paths:
+
+  user_root: "C:\\Users\\Shiel"
+
+  bridge_root: "C:\\Users\\Shiel\\spy-options-bridge"
+
+  grant_file: "C:\\Users\\Shiel\\Desktop\\OPERATOR-GRANT.json"
+
+  audit_log: "C:\\Users\\Shiel\\Desktop\\OPERATOR-AUDIT.log"
+
+  command_center_folder: "C:\\Users\\Shiel\\Desktop\\SPY-Command-Center"
+
+
+
+grant_minutes:
+
+  observe: 30
+
+  launch: 60
+
+  shell: 60
+
+  session: 60
+
+  automate: 30
+
+
+
+# Tier → allowed --action values
+
+tiers:
+
+  observe:
+
+    actions: [health]
+
+  launch:
+
+    actions: [launch, open]
+
+  shell:
+
+    actions: [shell]
+
+  session:
+
+    actions: [launch, open, shell, program, url]
+
+  # Reserved v2 — pywinauto/pyautogui; not grantable from default bats
+
+  automate:
+
+    actions: []
+
+
+
+health_urls:
+
+  - "https://spy-options-bridge.onrender.com/health"
+
+
+
+# launch: .bat / .exe / .cmd under user_root, exact or listed
+
+launch_whitelist:
+
+  - "C:\\Users\\Shiel\\Desktop\\SPY-LIVE-COMMAND-CENTER.bat"
+
+  - "C:\\Users\\Shiel\\Desktop\\RUN-LAB.bat"
+
+  - "C:\\Users\\Shiel\\Desktop\\RUN-SCENARIO-LAB.bat"
+
+  - "C:\\Users\\Shiel\\Desktop\\BRIDGE-KEEPALIVE.bat"
+
+  - "C:\\Users\\Shiel\\Desktop\\DUAL-SYNC-LOOP.bat"
+
+  - "C:\\Users\\Shiel\\Desktop\\BURST-PAPER-100.bat"
+
+  - "C:\\Users\\Shiel\\Desktop\\GRANT-OPERATOR-SESSION.bat"
+
+  - "C:\\Users\\Shiel\\Desktop\\GRANT-OPERATOR-FULL.bat"
+
+  - "C:\\Users\\Shiel\\Desktop\\RUN-OPERATOR-ACTION.bat"
+  - "C:\\Users\\Shiel\\Desktop\\ARM-FOR-OPEN-ONE-CLICK.bat"
+
+
+
+launch_extensions: [".bat", ".exe", ".cmd"]
+
+
+
+# open: files or folders (explorer)
+
+open_whitelist:
+
+  - "C:\\Users\\Shiel\\Desktop"
+
+  - "C:\\Users\\Shiel\\spy-options-bridge"
+
+  - "C:\\Users\\Shiel\\spy-options-bridge\\scripts"
+
+  - "C:\\Users\\Shiel\\spy-options-bridge\\docs"
+
+  - "C:\\Users\\Shiel\\Desktop\\SPY-Command-Center"
+
+
+
+# program: Start-Process exe — alias or full path (must resolve to whitelist)
+
+program_whitelist:
+
+  aliases:
+
+    cursor:
+
+      exe: "C:\\Users\\Shiel\\AppData\\Local\\Programs\\cursor\\Cursor.exe"
+
+    cursor_project:
+
+      exe: "C:\\Users\\Shiel\\AppData\\Local\\Programs\\cursor\\Cursor.exe"
+
+      args: ["C:\\Users\\Shiel\\spy-options-bridge"]
+
+    notepad:
+
+      exe: "C:\\Windows\\System32\\notepad.exe"
+
+  paths:
+
+    - "C:\\Users\\Shiel\\AppData\\Local\\Programs\\cursor\\Cursor.exe"
+
+    - "C:\\Windows\\System32\\notepad.exe"
+
+    - "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+
+    - "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"
+
+
+
+# url: os.startfile https — prefix match (Alpaca/TradingView in browser, not exe)
+
+url_whitelist:
+
+  - "https://spy-options-bridge.onrender.com/"
+
+  - "https://app.alpaca.markets/"
+
+  - "https://www.tradingview.com/"
+
+  - "https://tradingview.com/"
+
+
+
+# Windows services — EMPTY = deny all service_start/service_stop
+
+service_whitelist: []
+
+
+
+# shell: first token or full command must match a prefix (no pipes/redirection)
+
+shell_whitelist:
+
+  - "pytest tests/"
+
+  - "pytest tests/test_operator_gateway.py"
+
+  - "python scripts/"
+
+  - ".venv\\Scripts\\python.exe scripts/"
+
+  - "python -m pytest"
+
+
+
+scripts_prefix_whitelist:
+
+  - "C:\\Users\\Shiel\\spy-options-bridge\\scripts\\"
+
+
+# Email reply → operator grant + pending action (scripts/email_approval.py; poll: email_command_listener.py)
+email_command:
+  enabled: true
+  subject_prefix: "[SPY Command Center]"
+  allowed_inbox: "shieldinc850@gmail.com"
+  email_reply_grant_hours: 12
+  imap_host: imap.gmail.com
+  imap_port: 993
+  imap_mailbox: INBOX
+  poll_interval_sec: 120
+  pending_file: "C:\\Users\\Shiel\\Desktop\\PENDING-ACTION.json"
+  processed_uids_file: "C:\\Users\\Shiel\\Desktop\\SPY-Command-Center\\OPERATOR-EMAIL-PROCESSED.json"
+  sms_email_gateway: "your_phone@txt.att.net"
+  reply_keyword_map:
+    "YES": [grant_session, approve_pending]
+    "OK": [grant_session, approve_pending]
+    "GRANT": [grant_session, approve_pending]
+    "APPROVE": [approve_pending]
+    "DEPLOY": [render_deploy_nudge, grant_session, approve_pending]
+    "STOP": [stop_team]
+    "NO": [deny_pending]
+    "DENY": [deny_pending]
+    "CANCEL": [deny_pending]
+  allowed_actions_from_email:
+    - grant_session
+    - approve_pending
+    - deny_pending
+    - render_deploy_nudge
+    - git_push_reminder
+    - start_team
+    - stop_team
+    - cancel_orders
+
+

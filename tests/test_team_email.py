@@ -12,6 +12,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 from team_email import (  # noqa: E402
     PREFIX,
+    approval_subject,
     bridge_notify,
     reset_rate_limits_for_tests,
     send_permission,
@@ -56,10 +57,18 @@ def test_bridge_notify_skips_chasing(monkeypatch):
     assert called == []
 
 
+def test_approval_subject_contains_need_approval():
+    subj = approval_subject("Deploy bundle approval")
+    assert "need approval" in subj.lower()
+    assert subj.startswith(f"{PREFIX} NEED APPROVAL -")
+
+
 def test_permission_body_has_yes_no(monkeypatch):
     bodies: list[str] = []
+    subjects: list[str] = []
 
     def fake_send(subject: str, body: str, **kwargs):
+        subjects.append(subject)
         bodies.append(body)
         return True
 
@@ -67,9 +76,11 @@ def test_permission_body_has_yes_no(monkeypatch):
     monkeypatch.setattr("team_email._append_team_recall", lambda s: None)
     reset_rate_limits_for_tests()
     send_permission("Approve burst at open?", headline="Burst")
+    assert "need approval" in subjects[0].lower()
     assert "Reply YES" in bodies[0]
     assert "Reply NO" in bodies[0]
     send_permission_request("Sample", "Need OK?")
+    assert "need approval" in subjects[-1].lower()
     assert "Reply YES" in bodies[-1]
 
 

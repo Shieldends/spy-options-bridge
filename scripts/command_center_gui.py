@@ -53,6 +53,7 @@ class CommandCenterApp(tk.Tk):
         self._health_thread: threading.Thread | None = None
         self._check_vars: dict[str, tk.BooleanVar] = {}
         self._status_var = tk.StringVar(value="Ready — click RENDER STATUS or START TEAM")
+        self._email_approval_var = tk.StringVar(value="Email approval: idle")
         self._live_banner_var = tk.StringVar(value="LIVE RUN: checking…")
         self._prefs_var = tk.StringVar(value="")
 
@@ -62,6 +63,31 @@ class CommandCenterApp(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(500, self._refresh_checklist_ui)
         self.after(600, self._update_live_banner)
+        self.after(800, self._refresh_email_approval_status)
+        self.after(30000, self._schedule_email_approval_refresh)
+
+    def _schedule_email_approval_refresh(self) -> None:
+        self._refresh_email_approval_status()
+        self.after(30000, self._schedule_email_approval_refresh)
+
+    def _refresh_email_approval_status(self) -> None:
+        try:
+            import email_approval as erg  # noqa: E402
+
+            summary = erg.pending_summary()
+            if summary.startswith("awaiting"):
+                self._email_approval_var.set(f"⏳ {summary}")
+            elif summary.startswith("pending expired"):
+                self._email_approval_var.set(f"⚠ {summary}")
+            else:
+                grant = erg.og.read_grant(erg.load_config())
+                ok, reason = erg.og.grant_status(grant)
+                if ok:
+                    self._email_approval_var.set("Email approval: operator grant active")
+                else:
+                    self._email_approval_var.set(f"Email approval: idle ({reason})")
+        except Exception as exc:
+            self._email_approval_var.set(f"Email approval: status error ({type(exc).__name__})")
 
     def _build_ui(self) -> None:
         notebook = ttk.Notebook(self)
@@ -100,20 +126,32 @@ class CommandCenterApp(tk.Tk):
             justify=tk.CENTER,
         ).grid(row=2, column=0, columnspan=2, pady=(0, 8), sticky="ew")
 
+        tk.Label(
+            main,
+            textvariable=self._email_approval_var,
+            font=("Segoe UI", 10, "bold"),
+            fg="#630",
+            wraplength=520,
+            justify=tk.CENTER,
+        ).grid(row=3, column=0, columnspan=2, pady=(0, 6), sticky="ew")
+
         buttons: list[tuple[str, callable]] = [
             ("START TEAM", self._start_team),
             ("WHAT'S LEFT?", self._whats_left),
             ("OPTIONAL: Setup Email", self._setup_email_dialog),
             ("SEND TEST + PERMISSION SAMPLE", self._test_permission_email),
+            ("Request approval email", self._request_deploy_email_approval),
+            ("CHECK EMAIL REPLIES", self._check_email_replies),
             ("EMAIL ME LATEST REPORT", self._email_latest_report),
             ("OPEN REPORTS", self._open_reports),
             ("OPEN GROK SYNC", self._open_grok_sync),
             ("THURSDAY BURST (9:31 ET)", self._thursday_burst),
             ("STOP ALL", self._stop_all),
             ("RENDER STATUS", self._render_status),
+            ("Operator: grant session", self._operator_grant_session),
         ]
         for idx, (label, cmd) in enumerate(buttons):
-            row, col = divmod(idx + 3, 2)
+            row, col = divmod(idx + 4, 2)
             ttk.Button(main, text=label, command=cmd, width=22).grid(
                 row=row, column=col, padx=6, pady=6, sticky="ew"
             )
@@ -141,7 +179,6 @@ class CommandCenterApp(tk.Tk):
                 text=text,
                 variable=var,
                 command=lambda k=key: self._on_check_toggle(k),
-                wraplength=480,
             )
             cb.pack(anchor=tk.W, pady=4, padx=4)
 
@@ -206,6 +243,16 @@ class CommandCenterApp(tk.Tk):
         if self.procs and any(p.poll() is None for p in self.procs.values()):
             messagebox.showinfo(TITLE, "Team workers already running.")
             return
+        auto_arm = DESKTOP / "OPERATOR-AUTO-ARM.txt"
+        if auto_arm.is_file():
+            try:
+                import operator_gateway as og  # noqa: E402
+
+                granted = og.try_auto_grant_from_marker()
+                if granted:
+                    self._set_status(f"Auto operator grant → {granted.name}")
+            except Exception as exc:
+                self._set_status(f"Auto grant skipped: {type(exc).__name__}")
         cc.mark_todo_items()
         self.procs = cc.spawn_all_workers()
         self._set_status("START TEAM — 3 workers spawned")
@@ -267,6 +314,13 @@ class CommandCenterApp(tk.Tk):
             if not pwd:
                 messagebox.showerror(TITLE, "Enter app password.", parent=dlg)
                 return
+            if len(pwd) != 16:
+                messagebox.showerror(
+                    TITLE,
+                    "App password must be exactly 16 characters (remove spaces from Google's display).",
+                    parent=dlg,
+                )
+                return
             try:
                 email_setup.save_app_password_only(pwd)
                 email_setup._mark_google_bat_only()
@@ -279,9 +333,10 @@ class CommandCenterApp(tk.Tk):
             self._set_status("Email .env saved (password not shown)")
             messagebox.showinfo(
                 TITLE,
-                "Local .env saved.\n\n"
-                "Next: Desktop CONFIRM-RENDER-EMAIL.bat (one click) — same SMTP on Render, Manual Deploy.\n\n"
-                "Then: SEND TEST + PERMISSION SAMPLE.",
+                "Local .env saved (not verified yet).\n\n"
+                "Click SEND TEST + PERMISSION SAMPLE — you must see "
+                "[SPY Command Center] in shieldinc850@gmail.com.\n\n"
+                "If test fails: new Google App Password (16 chars), save again.",
             )
 
         ttk.Button(dlg, text="Save", command=save).pack(pady=12)
@@ -339,6 +394,67 @@ class CommandCenterApp(tk.Tk):
                 except Exception:
                     pass
             self.after(0, lambda: self._finish_test_email(msg, code))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _request_deploy_email_approval(self) -> None:
+        if not messagebox.askyesno(
+            TITLE,
+            f"Email deploy approval request to {USER_EMAIL}?\n\n"
+            "Reply YES or DEPLOY from that inbox to grant 12h operator session "
+            "and write DEPLOY-APPROVED.txt on Desktop\\SPY-Command-Center.",
+        ):
+            return
+        self._set_status("Sending deploy approval email…")
+        cc._load_dotenv()
+        sys.path.insert(0, str(SCRIPTS))
+        import team_email as te  # noqa: E402
+
+        def run() -> None:
+            ok, pending_id = te.send_deploy_approval_request()
+            if ok:
+                msg = f"Deploy approval sent — awaiting email OK ({pending_id})"
+            else:
+                msg = "Deploy email failed — run OPTIONAL Setup Email first."
+            self.after(0, lambda: self._set_status(msg))
+            self.after(0, self._refresh_email_approval_status)
+            if ok:
+                self.after(
+                    0,
+                    lambda: messagebox.showinfo(
+                        TITLE,
+                        f"{msg}\n\nReply YES or DEPLOY to the permission email.",
+                    ),
+                )
+            else:
+                self.after(0, lambda: messagebox.showwarning(TITLE, msg))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _check_email_replies(self) -> None:
+        self._set_status("Checking inbox for Command Center replies…")
+        cc._load_dotenv()
+        sys.path.insert(0, str(SCRIPTS))
+
+        def run() -> None:
+            try:
+                import email_command_listener as ecl  # noqa: E402
+                import email_approval as erg  # noqa: E402
+
+                results = ecl.poll_inbox_once()
+                if not results:
+                    msg = "No new permission replies (or IMAP not configured)."
+                else:
+                    parts = []
+                    for res in results:
+                        flag = "OK" if res.get("ok") else "skip"
+                        parts.append(f"{flag}: {'; '.join(res.get('messages') or [])}")
+                    msg = " | ".join(parts)
+            except Exception as exc:
+                msg = f"Email check failed: {type(exc).__name__}"
+            self.after(0, lambda: self._set_status(msg))
+            self.after(0, self._refresh_email_approval_status)
+            self.after(0, lambda: messagebox.showinfo(TITLE, msg))
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -420,6 +536,40 @@ class CommandCenterApp(tk.Tk):
         messagebox.showinfo(
             "Render /health",
             f"{cc.HEALTH_URL}\n\n{'OK' if ok else 'WARN'}\n{detail}",
+        )
+
+    def _operator_grant_session(self) -> None:
+        if not messagebox.askyesno(
+            TITLE,
+            "Grant operator SESSION for 60 minutes?\n\n"
+            "Writes Desktop\\OPERATOR-GRANT.json.\n"
+            "Revoke: delete that file.",
+        ):
+            return
+        py = ROOT / ".venv" / "Scripts" / "python.exe"
+        gw = SCRIPTS / "operator_gateway.py"
+        try:
+            proc = subprocess.run(
+                [str(py), str(gw), "--grant-tier", "session"],
+                cwd=str(ROOT),
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except OSError as exc:
+            messagebox.showerror(TITLE, f"Grant failed: {exc}")
+            return
+        if proc.returncode != 0:
+            messagebox.showerror(
+                TITLE,
+                (proc.stderr or proc.stdout or "grant failed")[:400],
+            )
+            return
+        self._set_status("Operator session granted (60 min)")
+        messagebox.showinfo(
+            TITLE,
+            "Grant written:\nC:\\Users\\Shiel\\Desktop\\OPERATOR-GRANT.json\n\n"
+            "Revoke anytime: delete that file.",
         )
 
     def _on_close(self) -> None:

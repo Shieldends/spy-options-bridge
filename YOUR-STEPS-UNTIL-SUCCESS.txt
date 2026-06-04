@@ -1,0 +1,33 @@
+YOUR STEPS UNTIL SUCCESS | put credit spreads on Alpaca paper
+David Kennedy / shieldinc850 | shieldinc850@gmail.com | 2026-06-04
+DONE = FILLED orders, balance moves, positions, logs PASS
+
+1. BEFORE BED OR BEFORE OPEN — launchers\ARM-FOR-OPEN-ONE-CLICK.bat once
+   Check Desktop\ARM-FOR-OPEN.log for OK
+
+2. COMMAND CENTER — Desktop\SPY-Command-Center\SPY-LIVE-COMMAND.bat
+   START TEAM → banner LIVE RUN READY
+
+3. TRADINGVIEW one-time — MACD Entry ON | Warning ON | webhooks → Render
+
+4. 9:30 AM ET — watch Alpaca paper (no click if working)
+   TV Entry → /entry | orders should go FILLED (Phase 0 live proof)
+
+5. 9:31 AM ET — burst
+   ARM ran? SPY-BURST-931-ET auto | else Desktop\BURST-PAPER-100.bat
+   Or GUI THURSDAY BURST | read BURST-PAPER-LOG + BURST-931-SCHEDULE.log
+
+6. SUCCESS — Alpaca FILLED | balance moved | SPY option positions
+   REDUNDANT-TEST-LOG PASS > FAIL | RENDER STATUS configured true
+   Optional inbox [SPY Command Center]
+
+7. IF FAIL — click: EMAIL ME LATEST REPORT | RENDER STATUS | OPEN REPORTS
+   Read REDUNDANT-TEST-LOG tail | Cursor: one FAIL line, no secrets
+
+8. AFTER CLOSE — STOP ALL | optional delete OPERATOR-GRANT.json
+
+9. OPTIONAL GROK — OPEN GROK SYNC | grok_outbox.md | cursor_inbox.md
+
+10. REVOKE — delete C:\Users\Shiel\Desktop\OPERATOR-GRANT.json
+
+REMEMBER: 9:31 burst = plumbing | 9:30 MACD = trade path | ARM + START TEAM + TV ON daily

@@ -1,13 +1,17 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Run pre-open validation matrix; write Desktop results (no secrets)."""
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+import yaml
 
 import httpx
 
@@ -49,13 +53,105 @@ def add(matrix: str, test: str, status: str, note: str = "") -> None:
 
 
 def market_session_open(now: datetime | None = None) -> bool:
-    """True Mon–Fri 9:30–16:00 ET (paper fill proof window)."""
+    """True Monâ€“Fri 9:30â€“16:00 ET (paper fill proof window)."""
     now = now or datetime.now(ET)
     if now.weekday() >= 5:
         return False
     open_t = now.replace(hour=9, minute=30, second=0, microsecond=0)
     close_t = now.replace(hour=16, minute=0, second=0, microsecond=0)
     return open_t <= now < close_t
+
+
+def pre_open_pressure_enabled() -> bool:
+    """YAML flag: log burst reminder in redundant loop (does not enable live /entry)."""
+    cfg_path = ROOT / "config" / "preopen.yaml"
+    if not cfg_path.exists():
+        return False
+    try:
+        data = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+        return data.get("pre_open_pressure") is True
+    except Exception:
+        return False
+
+
+def pre_open_test_aggressive() -> bool:
+    """Live /entry + burst in --fast redundant cycles only when PRE_OPEN_TEST_AGGRESSIVE is set."""
+    raw = os.environ.get("PRE_OPEN_TEST_AGGRESSIVE", "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return False
+
+
+_RENDER_GET_TIMEOUTS = (30.0, 60.0, 90.0)
+
+
+def _render_get(path: str) -> httpx.Response:
+    last: Exception | None = None
+    for attempt, timeout in enumerate(_RENDER_GET_TIMEOUTS, start=1):
+        try:
+            return httpx.get(f"{RENDER}{path}", timeout=timeout)
+        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.ConnectError) as exc:
+            last = exc
+            if attempt < len(_RENDER_GET_TIMEOUTS):
+                time.sleep(min(10 * attempt, 30))
+    assert last is not None
+    raise last
+
+
+def _render_post(path: str, body: dict, timeout: float = 30.0) -> httpx.Response:
+    waits = (timeout, min(timeout * 2, 90.0), 90.0)
+    last: Exception | None = None
+    for wait in waits:
+        try:
+            return httpx.post(f"{RENDER}{path}", json=body, timeout=wait)
+        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.ConnectError) as exc:
+            last = exc
+    assert last is not None
+    raise last
+
+
+def render_ping_ok() -> bool:
+    """True if Render responds (cold starts may need long timeouts)."""
+    try:
+        _render_get("/ping")
+        return True
+    except Exception:
+        return False
+
+
+def dry_webhook_auth(matrix: str, env: dict[str, str]) -> None:
+    """POST /entry with bad secret — proves Render rejects before Alpaca submit."""
+    bad = {**{
+        "webhookSecret": "dry-run-invalid",
+        "ticker": "SPY",
+        "action": "PUT_CREDIT_SPREAD",
+        "signalPrice": 590.0,
+        "quantity": 1,
+    }}
+    try:
+        r = _render_post("/entry", bad, timeout=30)
+        data = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+        msg = str(data.get("message", "")).lower() if isinstance(data, dict) else ""
+        ok = r.status_code == 401 or (
+            r.status_code == 200
+            and isinstance(data, dict)
+            and data.get("success") is False
+            and "secret" in msg
+        )
+        note = f"HTTP {r.status_code}"
+        if r.status_code == 401:
+            note += " auth rejected (expected)"
+        elif ok:
+            note += " (legacy 200+success:false)"
+        else:
+            note += " (expect 401 or 200+success:false+secret msg)"
+        add(matrix, "POST /entry auth dry", "PASS" if ok else "FAIL", note)
+    except Exception as exc:
+        note = str(exc)[:200]
+        status = "LIMIT" if "timed out" in note.lower() or "timeout" in note.lower() else "FAIL"
+        add(matrix, "POST /entry auth dry", status, note)
 
 
 def run_cmd(matrix: str, test: str, args: list[str], timeout: float = 300) -> None:
@@ -137,21 +233,39 @@ def alpaca_checks(env: dict[str, str]) -> None:
     except Exception as exc:
         add("C", "Recent mleg orders", "FAIL", str(exc)[:200])
 
+    run_cmd("C", "cancel_open_orders dry", ["scripts/cancel_open_orders.py", "--dry-run"], timeout=60)
+
 
 def render_get(matrix: str, test: str, path: str) -> None:
     try:
-        r = httpx.get(f"{RENDER}{path}", timeout=30)
+        r = _render_get(path)
         data = r.json()
         if path == "/health":
+            risk = data.get("tv_pause_risk") or {}
             note = (
                 f"version={data.get('version')} configured={data.get('configured')} "
-                f"paper_force={data.get('paper_force_min_fill')} entry_min_credit={data.get('entry_min_credit')}"
+                f"paper_force={data.get('paper_force_min_fill')} entry_min_credit={data.get('entry_min_credit')} "
+                f"tv_risk={risk.get('level', '?')} open_mleg={data.get('open_mleg_count', '?')}"
             )
         else:
             note = json.dumps(data)[:180]
         add(matrix, test, "PASS" if r.is_success else "FAIL", note)
     except Exception as exc:
         add(matrix, test, "FAIL", str(exc)[:200])
+
+
+def health_tv_pause_ok() -> tuple[bool, str]:
+    """True when /health tv_pause_risk is green or yellow (not red)."""
+    try:
+        data = _render_get("/health").json()
+        risk = data.get("tv_pause_risk") or {}
+        level = str(risk.get("level", "unknown"))
+        ok = level in ("green", "yellow")
+        reasons = risk.get("reasons") or []
+        note = f"level={level} reasons={reasons[:3]}"
+        return ok, note
+    except Exception as exc:
+        return False, str(exc)[:200]
 
 
 DESKTOP_BATS = (
@@ -189,9 +303,20 @@ def run_matrix(*, fast: bool = False) -> tuple[int, int, list[tuple[str, str, st
         add("A", "main.py import smoke", "FAIL", str(exc)[:200])
 
     # B
-    render_get("B", "GET /health", "/health")
-    render_get("B", "GET /ping", "/ping")
+    render_up = render_ping_ok()
+    render_down_note = (
+        "Render unreachable (read timeout). Run Desktop BRIDGE-KEEPALIVE.bat or wake Render, then re-run."
+    )
+    if render_up:
+        render_get("B", "GET /health", "/health")
+        render_get("B", "GET /ping", "/ping")
+        ok, note = health_tv_pause_ok()
+        add("B", "GET /health tv_pause_risk", "PASS" if ok else "WARN", note)
+    else:
+        add("B", "GET /health", "LIMIT", render_down_note)
+        add("B", "GET /ping", "LIMIT", render_down_note)
 
+    aggressive = pre_open_test_aggressive()
     body_base = {
         "webhookSecret": secret(env),
         "ticker": "SPY",
@@ -202,29 +327,43 @@ def run_matrix(*, fast: bool = False) -> tuple[int, int, list[tuple[str, str, st
         "strikeOffsetLong": -6,
         "quantity": 1,
     }
-    post_json("B", "POST /entry", "/entry", {**body_base, "limitCredit": 0.55, "fillMode": "aggressive"})
-    post_json("B", "POST /exercise/entry", "/exercise/entry", {**body_base, "fillMode": "exercise"})
-    burst_n = 1 if fast else 3
-    post_json(
-        "B",
-        f"POST /exercise/burst count={burst_n}",
-        f"/exercise/burst?count={burst_n}&interval=1",
-        {**body_base, "fillMode": "exercise", "burstCount": burst_n, "skipExits": True},
-        timeout=300 if fast else 600,
-    )
-    post_json(
-        "B",
-        "POST /warning overrideAutoClose",
-        "/warning",
-        {
-            "webhookSecret": secret(env),
-            "ticker": "SPY",
-            "signalPrice": 590.0,
-            "strikeOffsetShort": -5,
-            "strikeOffsetLong": -6,
-            "overrideAutoClose": True,
-        },
-    )
+    if fast and not aggressive:
+        if render_up:
+            dry_webhook_auth("B", env)
+        else:
+            add("B", "POST /entry auth dry", "LIMIT", render_down_note)
+        add(
+            "B",
+            "POST /entry live",
+            "LIMIT",
+            "PRE_OPEN_TEST_AGGRESSIVE=false â€” use BURST-PAPER-100.bat at 9:31 ET",
+        )
+        add("B", "POST /exercise/* burst", "LIMIT", "fast cycle skips live orders")
+        add("B", "POST /warning", "LIMIT", "fast cycle skips warning webhook")
+    else:
+        post_json("B", "POST /entry", "/entry", {**body_base, "limitCredit": 0.55, "fillMode": "aggressive"})
+        post_json("B", "POST /exercise/entry", "/exercise/entry", {**body_base, "fillMode": "exercise"})
+        burst_n = (10 if aggressive else 1) if fast else 3
+        post_json(
+            "B",
+            f"POST /exercise/burst count={burst_n}",
+            f"/exercise/burst?count={burst_n}&interval=1",
+            {**body_base, "fillMode": "exercise", "burstCount": burst_n, "skipExits": True},
+            timeout=300 if fast else 600,
+        )
+        post_json(
+            "B",
+            "POST /warning overrideAutoClose",
+            "/warning",
+            {
+                "webhookSecret": secret(env),
+                "ticker": "SPY",
+                "signalPrice": 590.0,
+                "strikeOffsetShort": -5,
+                "strikeOffsetLong": -6,
+                "overrideAutoClose": True,
+            },
+        )
 
     # C
     alpaca_checks(env)
@@ -244,25 +383,28 @@ def run_matrix(*, fast: bool = False) -> tuple[int, int, list[tuple[str, str, st
                 "D",
                 "prep_market_open.py",
                 "LIMIT",
-                "After hours — re-run 9:30–16:00 ET for fill proof",
+                "After hours â€” re-run 9:30â€“16:00 ET for fill proof",
             )
             add(
                 "D",
                 "burst_paper_fills.py --count 3",
                 "LIMIT",
-                "After hours — use BURST-PAPER-100.bat at 9:31 ET",
+                "After hours â€” use BURST-PAPER-100.bat at 9:31 ET",
             )
     for bat in DESKTOP_BATS:
         p = Path(r"C:\Users\Shiel\Desktop") / bat
         add("D", f"Desktop {bat}", "PASS" if p.exists() else "FAIL", str(p))
 
     # F
-    try:
-        hr = httpx.get(f"{RENDER}/health", timeout=20).json()
-        ver = str(hr.get("version", "?"))
-        add("F", "Render deploy version", "PASS" if ver >= "5.5.8" else "WARN", f"live={ver}")
-    except Exception as exc:
-        add("F", "Render deploy version", "FAIL", str(exc)[:200])
+    if not render_up:
+        add("F", "Render deploy version", "LIMIT", render_down_note)
+    else:
+        try:
+            hr = _render_get("/health").json()
+            ver = str(hr.get("version", "?"))
+            add("F", "Render deploy version", "PASS" if ver >= "5.5.9" else "WARN", f"live={ver}")
+        except Exception as exc:
+            add("F", "Render deploy version", "FAIL", str(exc)[:200])
 
     pass_n = sum(1 for _, s, _ in rows if s == "PASS")
     fail_n = sum(1 for _, s, _ in rows if s == "FAIL")
@@ -271,7 +413,7 @@ def run_matrix(*, fast: bool = False) -> tuple[int, int, list[tuple[str, str, st
 
 def format_report(ts: str, pass_n: int, fail_n: int, row_list: list[tuple[str, str, str]]) -> str:
     lines = [
-        "SPY OPTIONS BRIDGE — PRE-OPEN TEST MATRIX",
+        "SPY OPTIONS BRIDGE â€” PRE-OPEN TEST MATRIX",
         f"Generated: {ts}",
         "No secrets in this file.",
         "",

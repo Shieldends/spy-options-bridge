@@ -1,0 +1,39 @@
+COMMAND CENTER — WHAT'S NEW | David Kennedy / shieldinc850 | 2026-06-04
+
+BEFORE vs NOW
+Many .bat windows → one GUI: Desktop\SPY-Command-Center\SPY-LIVE-COMMAND.bat
+Tabs Commands | Checklist | Help | banner LIVE RUN READY | Render health ~60s
+
+START TEAM — 3 workers
+dual_sync_loop (60s) | bridge_keepalive | redundant_test_loop (5 min)
+Matches console center; optional startup email
+
+STOP ALL
+Kills 3 workers | writes Desktop\STOP-REDUNDANT-TESTS.txt
+Close app asks to stop workers first
+
+OPERATOR: GRANT SESSION
+60 min → Desktop\OPERATOR-GRANT.json | revoke: delete file
+ARM grant ~12h (arm_for_open.py)
+
+CHECKLIST TAB
+Email, Render, TV alerts, Alpaca flat → USER-TODO-CHECKLIST.json
+WHAT'S LEFT? shows up to 3 open items
+
+ARM-FOR-OPEN-ONE-CLICK (replaces many bats)
+launchers\ARM-FOR-OPEN-ONE-CLICK.bat once before open
+Grant, clear STOP, supervisor, SPY-BURST-931-ET weekdays 9:31, grok brief
+Log: Desktop\ARM-FOR-OPEN.log
+
+MANDATORY BURST 9:31 ET
+100 paper fills prove bridge + Alpaca
+Auto if ARM ran | else BURST-PAPER-100.bat or GUI THURSDAY BURST
+Logs: BURST-931-SCHEDULE.log | BURST-PAPER-LOG.txt (RTH for fills)
+
+REDUNDANT TEST LOOP FIX
+Stops 9:30 ET Mon–Fri | honors STOP file | auth dry 200+reject=PASS
+Typical --once 21 PASS | log REDUNDANT-TEST-LOG.txt
+
+UNCHANGED — Phase 0
+spy-macd-bridge-signals.pine | TV Entry+Warning → Render → Alpaca paper
+PUT credit spread aggressive | committee OFF until implement Phase 1

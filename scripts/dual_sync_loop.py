@@ -10,6 +10,11 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+SCRIPTS = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPTS))
+
+from security_utils import redact_line  # noqa: E402
+
 SYNC_DIR = Path(r"C:\Users\Shiel\Projects\spy-hybrid-v3\sync")
 APPEND_SYNC = Path(r"C:\Users\Shiel\Projects\spy-hybrid-v3\scripts\append_sync.py")
 LOG_PATH = Path(r"C:\Users\Shiel\Desktop\DUAL-SYNC-LOG.txt")
@@ -19,7 +24,7 @@ ET = ZoneInfo("America/New_York")
 
 
 def log(msg: str) -> None:
-    line = f"{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S ET')} {msg}"
+    line = f"{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S ET')} {redact_line(msg)}"
     print(line)
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with LOG_PATH.open("a", encoding="utf-8") as fh:
@@ -46,9 +51,9 @@ def run_append_sync() -> int:
         text=True,
     )
     if proc.stdout.strip():
-        log(proc.stdout.strip())
+        log(redact_line(proc.stdout.strip()))
     if proc.returncode != 0:
-        log(f"append_sync exit {proc.returncode}: {proc.stderr.strip()}")
+        log(f"append_sync exit {proc.returncode}: {redact_line(proc.stderr.strip())}")
     else:
         log("append_sync OK")
     return proc.returncode

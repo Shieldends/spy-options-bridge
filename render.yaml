@@ -36,6 +36,8 @@ services:
         value: "8"
       - key: ENTRY_MIN_CREDIT
         value: "0.01"
+      - key: AUTO_CANCEL_CONFLICTING_ORDERS
+        value: true
       - key: AUTO_TAKE_PROFIT
         value: true
       - key: TAKE_PROFIT_PCT

@@ -7,9 +7,31 @@ import os
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from pathlib import Path
 from typing import Any, Protocol
 
 logger = logging.getLogger(__name__)
+
+ROOT = Path(__file__).resolve().parent
+_dotenv_loaded = False
+
+
+def _load_dotenv() -> None:
+    """Load local .env into os.environ once (never log values)."""
+    global _dotenv_loaded
+    if _dotenv_loaded:
+        return
+    env_path = ROOT / ".env"
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            key = key.strip()
+            if key and key not in os.environ:
+                os.environ[key] = val.strip().strip('"').strip("'")
+    _dotenv_loaded = True
 
 
 class EmailSettingsLike(Protocol):
@@ -22,13 +44,19 @@ class EmailSettingsLike(Protocol):
     email_to: str
 
 
+def normalize_smtp_password(raw: str) -> str:
+    """Google app passwords: 16 letters, no spaces/quotes."""
+    return raw.strip().strip('"').strip("'").replace(" ", "")
+
+
 def _settings_from_env() -> dict[str, Any]:
+    _load_dotenv()
     return {
         "email_enabled": os.getenv("EMAIL_ENABLED", "").lower() in ("1", "true", "yes"),
         "smtp_host": os.getenv("SMTP_HOST", ""),
         "smtp_port": int(os.getenv("SMTP_PORT", "587") or "587"),
         "smtp_user": os.getenv("SMTP_USER", ""),
-        "smtp_password": os.getenv("SMTP_PASSWORD", ""),
+        "smtp_password": normalize_smtp_password(os.getenv("SMTP_PASSWORD", "")),
         "email_from": os.getenv("EMAIL_FROM", ""),
         "email_to": os.getenv("EMAIL_TO", ""),
     }
@@ -91,6 +119,12 @@ def send_email_alert(
             server.sendmail(from_addr, [a.strip() for a in to_addr.split(",") if a.strip()], msg.as_string())
         logger.info("Email sent: %s", subject)
         return True
+    except smtplib.SMTPAuthenticationError as exc:
+        logger.warning(
+            "Email auth failed: %s — use a Google App Password (16 chars), not your normal Gmail password",
+            exc,
+        )
+        return False
     except Exception as exc:
         logger.warning("Email failed (silent): %s — %s", subject, exc)
         return False

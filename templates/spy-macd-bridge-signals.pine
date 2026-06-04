@@ -1,0 +1,17 @@
+//@version=5
+indicator("SPY Bridge MACD Signals", overlay=false)
+
+// Entry: MACD line crosses UP through signal (open put credit spread via /entry webhook)
+// Warning: MACD line crosses DOWN (danger — use /warning webhook on a SECOND alert)
+
+[macdLine, signalLine, histLine] = ta.macd(close, 12, 26, 9)
+
+entryCrossUp = ta.crossover(macdLine, signalLine)
+warningCrossDown = ta.crossunder(macdLine, signalLine)
+
+alertcondition(entryCrossUp, title="Entry MACD Cross Up", message="entry_signal")
+alertcondition(warningCrossDown, title="Warning MACD Cross Down", message="warning_signal")
+
+plot(macdLine, color=color.blue, title="MACD")
+plot(signalLine, color=color.orange, title="Signal")
+plot(histLine, color=color.gray, title="Histogram", style=plot.style_columns)
