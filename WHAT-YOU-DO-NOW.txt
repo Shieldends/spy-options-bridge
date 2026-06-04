@@ -12,11 +12,13 @@ IMPLEMENTED (repo — push + Manual Deploy)
   Render guard — main.py + render.yaml v5.5.11
 
 YOUR STEPS
-  1. Git push → Render Manual Deploy
-  2. GET /health → version 5.5.11
-  3. Do NOT run BURST-PAPER-100 during live MACD window
-  4. Unset REDUNDANT_BURST_EACH_CYCLE on PC if set
-  5. RTH: PUSH-PAPER-FILL-TEST.bat + PAPER-PNL-AUDIT.bat --try-entry
+  1. DONE — git push (5b74119). YOU: Render Manual Deploy today
+     → ideally OUTSIDE the next MACD window (or a gap you accept)
+  2. Confirm /health → version 5.5.11 (still 5.5.10 until deploy)
+  3. UNTIL 5.5.11 LIVE: no large bursts — most likely OOM trigger
+  4. After 5.5.11: still avoid BURST-PAPER-100 during live MACD
+  5. Unset REDUNDANT_BURST_EACH_CYCLE on PC if set
+  6. Off-hours: PUSH-PAPER-FILL-TEST.bat + PAPER-PNL-AUDIT.bat --try-entry
 
 NOT STARTED
   Track D (0dte hold) — reply go D after fills look good

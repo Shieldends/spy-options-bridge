@@ -439,7 +439,8 @@ def _worker_creationflags() -> int:
         return 0
     flags = subprocess.CREATE_NEW_PROCESS_GROUP
     breakaway = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
-    return flags | breakaway
+    no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    return flags | breakaway | no_window
 
 
 def spawn_worker(name: str, script: str, extra_args: list[str]) -> subprocess.Popen[bytes]:
@@ -512,9 +513,19 @@ def mark_todo_items() -> None:
         )
 
 
+def should_spawn_worker(name: str, script: str) -> bool:
+    """Redundant pre-open loop must not respawn during live market hours."""
+    if script == "redundant_test_loop.py" and not redundant_expected_up():
+        return False
+    return True
+
+
 def spawn_all_workers(*, fresh_team: bool = False) -> dict[str, subprocess.Popen[bytes]]:
     procs: dict[str, subprocess.Popen[bytes]] = {}
     for name, script, args in WORKERS:
+        if not should_spawn_worker(name, script):
+            log_line(f"skip {name}: paused for live session (9:30–16:00 ET or STOP file)")
+            continue
         if not fresh_team and worker_already_running(script):
             log_line(f"skip {name}: {script} already running")
             continue
@@ -524,7 +535,11 @@ def spawn_all_workers(*, fresh_team: bool = False) -> dict[str, subprocess.Popen
 
 def ensure_team_workers(procs: dict[str, subprocess.Popen[bytes]]) -> None:
     """Restart tracked workers; spawn any helper that is down."""
+    if gui_supervisor_running():
+        return
     for name, script, args in WORKERS:
+        if not should_spawn_worker(name, script):
+            continue
         proc = procs.get(name)
         if proc is not None and proc.poll() is None:
             continue

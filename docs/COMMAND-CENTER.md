@@ -52,6 +52,32 @@ Still on Desktop: `BRIDGE-KEEPALIVE.bat`, `DUAL-SYNC-LOOP.bat`, `START-REDUNDANT
 
 Unchanged: 9:30 ET TV MACD alerts; optional 9:31 `BURST-PAPER-100.bat`. See `MARKET-OPEN-THU.txt` and `THURSDAY-LIVE-RUN.txt`.
 
+## Flashing CMD / blue PowerShell windows?
+
+Usually **not** Cursor inbox — it is extra Windows consoles:
+
+| Window | Typical source |
+|--------|----------------|
+| Black **SPY Live Command Center** | `SPY-LIVE-COMMAND-CENTER.bat` — keep **one**; close duplicates |
+| Black **ARM FOR OPEN** / **MONITOR** | `ARM-FOR-OPEN-ONE-CLICK.bat`, `MONITOR-AND-READY.bat` — closes after ~6–8s; don’t run in a loop |
+| Blue **PowerShell** | Scheduled burst, `DO-NOW-LAUNCH`, operator scripts |
+| Many small consoles | Duplicate workers — GUI **STOP ALL**, then **START TEAM** once; avoid ARM + GUI + console supervisor together |
+| Panel inside **Cursor** | Agent terminal — normal; disable auto-run in Cursor settings if it distracts |
+
+Workers spawn with **no visible console** (`CREATE_NO_WINDOW`) after pull/restart. Logs: `Desktop\COMMAND-CENTER-LOG.txt`, `DUAL-SYNC-LOG.txt`.
+
+## Cursor showing endless tracebacks?
+
+Usually the **Command Center respawn loop** (workers killed/restarted every 15–60s), not Cursor inbox itself.
+
+1. **GUI → STOP ALL** — wait 10s.
+2. Close extra black **SPY Live Command Center** / **ARM** cmd windows.
+3. **One** GUI → **START TEAM** once (do not also run console `command_center.py`).
+4. During **9:30–16:00 ET** redundant tests stay off — that is normal.
+5. In Cursor: stop the agent run; close extra chat tabs; ignore old terminal output.
+
+If `Desktop\COMMAND-CENTER-CRASH.txt` exists, open it once and share the last lines with Cursor.
+
 ## Stop
 
 - **STOP ALL** (GUI) or **Ctrl+C** (console) — kills all three child processes; creates `STOP-REDUNDANT-TESTS.txt`

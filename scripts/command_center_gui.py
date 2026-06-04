@@ -51,6 +51,7 @@ class CommandCenterApp(tk.Tk):
         cc._load_dotenv()
 
         self.procs: dict[str, subprocess.Popen[bytes]] = {}
+        self._last_worker_spawn: dict[str, float] = {}
         self._health_stop = threading.Event()
         self._health_thread: threading.Thread | None = None
         self._check_vars: dict[str, tk.BooleanVar] = {}
@@ -314,17 +315,26 @@ class CommandCenterApp(tk.Tk):
         try:
             import dedupe_spy_workers as dedupe  # noqa: E402
 
-            if any(len(dedupe.pids_for_script(s)) > 1 for s in cc.TEAM_WORKER_SCRIPTS):
+            dupes = [s for s in cc.TEAM_WORKER_SCRIPTS if len(dedupe.pids_for_script(s)) > 1]
+            if dupes:
                 cc.dedupe_worker_duplicates_only()
+                cc.log_line(f"GUI reconcile deduped: {', '.join(dupes)}")
         except Exception:
             pass
+        now = time.time()
         for name, script, args in cc.WORKERS:
+            if not cc.should_spawn_worker(name, script):
+                continue
             proc = self.procs.get(name)
             if proc is not None and proc.poll() is None:
                 continue
             if cc.worker_already_running(script):
                 continue
+            last = self._last_worker_spawn.get(name, 0.0)
+            if now - last < 45.0:
+                continue
             self.procs[name] = cc.spawn_worker(name, script, args)
+            self._last_worker_spawn[name] = now
 
     def _prune_dead_procs(self) -> None:
         dead = [name for name, p in self.procs.items() if p.poll() is not None]

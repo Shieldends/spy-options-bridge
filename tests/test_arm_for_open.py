@@ -75,6 +75,8 @@ def test_spawn_skips_dedupe_when_gui_open():
 def test_spawn_runs_dedupe_when_gui_closed():
     with (
         patch.object(afo.cc, "arm_should_skip_supervisor_ops", return_value=False),
+        patch.object(afo.cc, "team_ready_for_display", return_value=False),
+        patch.object(afo.cc, "team_workers_running", return_value=False),
         patch.object(afo, "command_center_running", return_value=True),
         patch.object(afo, "run_dedupe") as dedupe,
     ):
