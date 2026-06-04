@@ -37,9 +37,12 @@ GROK_PATHS = (
 )
 ET = ZoneInfo("America/New_York")
 BTN_FONT = ("Segoe UI", 11, "bold")
-APP_NAME = "SPY Live Command Center"
+APP_NAME = "SPY Command Center 2.0"
 TITLE = APP_NAME
 USER_EMAIL = email_setup.DEFAULT_TO
+CC_VERSION = "2.0"
+GUARDIAN_JOURNAL = DESKTOP / f"LIVE-SESSION-JOURNAL-{datetime.now(ET).strftime('%Y-%m-%d')}.txt"
+CC_LOG = DESKTOP / "COMMAND-CENTER-LOG.txt"
 
 
 class CommandCenterApp(tk.Tk):
@@ -58,8 +61,12 @@ class CommandCenterApp(tk.Tk):
         self._status_var = tk.StringVar(value="Starting… checking team and bridge")
         self._email_approval_var = tk.StringVar(value="Email approval: idle")
         self._live_banner_var = tk.StringVar(value="LIVE RUN: checking…")
-        self._prefs_var = tk.StringVar(value="")
+        self._bridge_var = tk.StringVar(value="Bridge: …")
+        self._guardian_var = tk.StringVar(value="Guardian: …")
+        self._workers_var = tk.StringVar(value="Workers: …")
+        self._handoff_var = tk.StringVar(value="Team sync: …")
 
+        self.configure(bg="#f4f4f4")
         tc.ensure_live_defaults()
         tc.set_user_prefs(email=True, burst=True)
         self._build_ui()
@@ -94,119 +101,115 @@ class CommandCenterApp(tk.Tk):
             self._email_approval_var.set(f"Email approval: status error ({type(exc).__name__})")
 
     def _build_ui(self) -> None:
-        notebook = ttk.Notebook(self)
-        notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        style = ttk.Style(self)
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
 
-        main = ttk.Frame(notebook, padding=8)
-        checklist = ttk.Frame(notebook, padding=8)
-        help_tab = ttk.Frame(notebook, padding=12)
-        notebook.add(main, text="Commands")
-        notebook.add(checklist, text="Checklist")
-        notebook.add(help_tab, text="Help")
-
+        header = tk.Frame(self, bg="#1e293b", height=52)
+        header.pack(fill=tk.X)
         tk.Label(
-            main,
-            text=APP_NAME,
-            font=("Segoe UI", 14, "bold"),
-            wraplength=520,
-            justify=tk.CENTER,
-        ).grid(row=0, column=0, columnspan=2, pady=(0, 4), sticky="ew")
+            header,
+            text=f"{APP_NAME}  ·  Guardian supervises PC helpers",
+            font=("Segoe UI", 12, "bold"),
+            fg="#f8fafc",
+            bg="#1e293b",
+        ).pack(pady=12)
+
+        notebook = ttk.Notebook(self)
+        notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
+
+        live = ttk.Frame(notebook, padding=10)
+        team = ttk.Frame(notebook, padding=10)
+        actions = ttk.Frame(notebook, padding=10)
+        notebook.add(live, text="Live")
+        notebook.add(team, text="Team")
+        notebook.add(actions, text="Actions")
 
         self._banner_label = tk.Label(
-            main,
+            live,
             textvariable=self._live_banner_var,
-            font=("Segoe UI", 16, "bold"),
+            font=("Segoe UI", 15, "bold"),
             fg="#0a5",
-            wraplength=520,
+            bg="#f4f4f4",
+            wraplength=500,
             justify=tk.CENTER,
         )
-        self._banner_label.grid(row=1, column=0, columnspan=2, pady=(4, 4), sticky="ew")
+        self._banner_label.pack(fill=tk.X, pady=(0, 10))
+
+        for var in (self._bridge_var, self._guardian_var, self._workers_var):
+            tk.Label(
+                live,
+                textvariable=var,
+                font=("Segoe UI", 10),
+                fg="#334155",
+                bg="#f4f4f4",
+                anchor=tk.W,
+                justify=tk.LEFT,
+                wraplength=500,
+            ).pack(fill=tk.X, pady=2)
+
+        tk.Label(live, text="Session journal (Guardian)", font=("Segoe UI", 9, "bold"), bg="#f4f4f4").pack(
+            anchor=tk.W, pady=(10, 4)
+        )
+        self._journal_text = tk.Text(live, height=10, wrap=tk.WORD, font=("Consolas", 9), state=tk.DISABLED)
+        self._journal_text.pack(fill=tk.BOTH, expand=True)
 
         tk.Label(
-            main,
-            textvariable=self._prefs_var,
+            team,
+            textvariable=self._handoff_var,
             font=("Segoe UI", 10),
-            fg="#036",
-            wraplength=520,
-            justify=tk.CENTER,
-        ).grid(row=2, column=0, columnspan=2, pady=(0, 8), sticky="ew")
-
+            wraplength=500,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(0, 8))
         tk.Label(
-            main,
+            team,
             textvariable=self._email_approval_var,
-            font=("Segoe UI", 10, "bold"),
+            font=("Segoe UI", 10),
             fg="#630",
-            wraplength=520,
-            justify=tk.CENTER,
-        ).grid(row=3, column=0, columnspan=2, pady=(0, 6), sticky="ew")
+            wraplength=500,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(0, 8))
 
-        buttons: list[tuple[str, callable]] = [
-            ("START TEAM", self._start_team),
-            ("WHAT'S LEFT?", self._whats_left),
-            ("OPTIONAL: Setup Email", self._setup_email_dialog),
-            ("SEND TEST + PERMISSION SAMPLE", self._test_permission_email),
-            ("Request approval email", self._request_deploy_email_approval),
-            ("CHECK EMAIL REPLIES", self._check_email_replies),
-            ("EMAIL ME LATEST REPORT", self._email_latest_report),
-            ("OPEN REPORTS", self._open_reports),
-            ("TRIGGER PROOF REPORT", self._open_trigger_proof),
-            ("RUN TRIGGER PROOF", self._run_trigger_proof),
-            ("OPEN GROK SYNC", self._open_grok_sync),
-            ("THURSDAY BURST (9:31 ET)", self._thursday_burst),
-            ("STOP ALL", self._stop_all),
-            ("RENDER STATUS", self._render_status),
-            ("Operator: grant session", self._operator_grant_session),
-        ]
-        for idx, (label, cmd) in enumerate(buttons):
-            row, col = divmod(idx + 4, 2)
-            ttk.Button(main, text=label, command=cmd, width=22).grid(
-                row=row, column=col, padx=6, pady=6, sticky="ew"
-            )
-        main.columnconfigure(0, weight=1)
-        main.columnconfigure(1, weight=1)
+        for label, cmd in (
+            ("Open Grok + Cursor sync", self._open_grok_sync),
+            ("Open readiness reports", self._open_reports),
+            ("What's left?", self._whats_left),
+        ):
+            ttk.Button(team, text=label, command=cmd).pack(fill=tk.X, pady=4)
 
-        canvas = tk.Canvas(checklist, highlightthickness=0)
-        scroll = ttk.Scrollbar(checklist, orient=tk.VERTICAL, command=canvas.yview)
-        inner = ttk.Frame(canvas)
-        inner.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all")),
-        )
-        canvas.create_window((0, 0), window=inner, anchor="nw")
-        canvas.configure(yscrollcommand=scroll.set)
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scroll.pack(side=tk.RIGHT, fill=tk.Y)
-
+        ttk.Separator(team).pack(fill=tk.X, pady=8)
         for key in tc.DEFAULT_ITEMS:
             var = tk.BooleanVar(value=False)
             self._check_vars[key] = var
-            text = tc.LABELS.get(key, key)
-            cb = ttk.Checkbutton(
-                inner,
-                text=text,
+            ttk.Checkbutton(
+                team,
+                text=tc.LABELS.get(key, key),
                 variable=var,
                 command=lambda k=key: self._on_check_toggle(k),
-            )
-            cb.pack(anchor=tk.W, pady=4, padx=4)
+            ).pack(anchor=tk.W, pady=2)
 
-        ttk.Button(
-            checklist, text="Refresh checklist", command=self._refresh_checklist_ui
-        ).pack(pady=6)
+        primary: list[tuple[str, callable]] = [
+            ("Start Guardian", self._start_guardian),
+            ("Stop Guardian", self._stop_guardian),
+            ("EOD report now", self._run_eod_report),
+            ("Stop all workers", self._stop_all),
+            ("Render status", self._render_status),
+        ]
+        for label, cmd in primary:
+            ttk.Button(actions, text=label, command=cmd).pack(fill=tk.X, pady=6, ipady=4)
 
-        help_text = (
-            "SPY Live Command Center — the app (one window).\n\n"
-            "• START TEAM — starts or reconnects monitoring (safe to click again).\n"
-            "• Green READY banner = all 3 helpers running on this PC (not just this window).\n"
-            "• Flat Alpaca (no positions) is normal until a live MACD cross — not burst/scenario tests.\n"
-            "• TRIGGER PROOF REPORT = bridge/webhook speed; TV MACD still needs alert log + Activities.\n"
-            "• ARM bat refreshes grant/burst; won't kill workers while this app is open.\n"
-            "• TradingView → Render → Alpaca path unchanged.\n"
-            "• Desktop .bat files remain for advanced / single-layer debugging.\n\n"
-            "Phase 2 master plan — locked until live test proven."
-        )
-        ttk.Label(help_tab, text=help_text, justify=tk.LEFT, wraplength=500).pack(
-            anchor=tk.W
-        )
+        ttk.Label(actions, text="More (email / tests)", font=("Segoe UI", 9, "bold")).pack(anchor=tk.W, pady=(12, 4))
+        more = ttk.Frame(actions)
+        more.pack(fill=tk.X)
+        for label, cmd in (
+            ("Setup email", self._setup_email_dialog),
+            ("Test email", self._test_permission_email),
+            ("Request approval", self._request_deploy_email_approval),
+            ("Check email replies", self._check_email_replies),
+            ("Email latest report", self._email_latest_report),
+            ("Operator grant", self._operator_grant_session),
+        ):
+            ttk.Button(more, text=label, command=cmd).pack(fill=tk.X, pady=2)
 
         bar = ttk.Label(
             self,
@@ -221,8 +224,18 @@ class CommandCenterApp(tk.Tk):
         ts = datetime.now(ET).strftime("%H:%M:%S ET")
         self._status_var.set(f"{ts} | {msg}")
 
+    def _guardian_on(self) -> bool:
+        try:
+            import cc_guardian_ctl as gctl  # noqa: E402
+
+            return gctl.guardian_running()
+        except Exception:
+            return False
+
     def _team_running(self) -> bool:
-        """True when banner should show READY (see team_ready_for_display)."""
+        """READY when Guardian is on or core workers are up."""
+        if self._guardian_on():
+            return True
         if cc.team_ready_for_display():
             return True
         return bool(self.procs) and any(p.poll() is None for p in self.procs.values())
@@ -304,8 +317,44 @@ class CommandCenterApp(tk.Tk):
 
     def _schedule_banner_refresh(self) -> None:
         self._reconcile_team_helpers()
+        self._refresh_live_panel()
         self._update_live_banner()
         self.after(15000, self._schedule_banner_refresh)
+
+    def _tail_file(self, path: Path, n: int = 12) -> str:
+        if not path.is_file():
+            return f"(no {path.name} yet)"
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        return "\n".join(lines[-n:]) if lines else "(empty)"
+
+    def _refresh_live_panel(self) -> None:
+        ok, detail = cc.fetch_health()
+        self._bridge_var.set(f"Bridge: {'OK' if ok else 'WARN'} | {detail}")
+        try:
+            import cc_guardian_ctl as gctl  # noqa: E402
+
+            self._guardian_var.set(f"Guardian: {gctl.status_line()}")
+        except Exception as exc:
+            self._guardian_var.set(f"Guardian: error ({type(exc).__name__})")
+        status = cc.team_worker_status()
+        n = sum(1 for v in status.values() if v)
+        self._workers_var.set(f"Workers: {n}/3 core helpers ({status})")
+        try:
+            from live_session_guardian import journal_path  # noqa: E402
+
+            jpath = journal_path()
+        except Exception:
+            jpath = GUARDIAN_JOURNAL
+        text = self._tail_file(jpath, 14)
+        self._journal_text.configure(state=tk.NORMAL)
+        self._journal_text.delete("1.0", tk.END)
+        self._journal_text.insert(tk.END, text)
+        self._journal_text.configure(state=tk.DISABLED)
+        inbox = SYNC_DIR / "cursor_inbox.md"
+        if inbox.is_file():
+            lines = inbox.read_text(encoding="utf-8", errors="replace").splitlines()
+            handoff = next((ln for ln in reversed(lines) if "handoff" in ln.lower() or ln.startswith("### [")), "")
+            self._handoff_var.set(handoff[:200] if handoff else "Team sync: (no recent handoff line)")
 
     def _reconcile_team_helpers(self) -> None:
         """Dedupe duplicate helpers only — auto-respawn fights console supervisor (20min loops)."""
@@ -328,15 +377,70 @@ class CommandCenterApp(tk.Tk):
             del self.procs[name]
 
     def _bootstrap_team_state(self) -> None:
-        """On open: detect existing workers, refresh banner, start health polling."""
+        """On open: prefer Guardian supervisor (CC 2.0)."""
         cc.stop_stale_console_supervisors()
         self._prune_dead_procs()
+        grant = DESKTOP / "OPERATOR-GRANT.json"
+        if grant.is_file() and not self._guardian_on():
+            self._start_guardian(quiet=True)
         if self._team_running():
-            self._set_status("Team on standby — leave this window open or minimized")
+            self._set_status("Guardian / team active — this window is your desk")
             self._start_health_loop()
         else:
-            self._set_status("Click START TEAM once — will not auto-restart team")
+            self._set_status("Actions tab → Start Guardian (recommended)")
+        self._refresh_live_panel()
         self._update_live_banner()
+
+    def _start_guardian(self, *, quiet: bool = False) -> None:
+        cc.stop_stale_console_supervisors()
+        try:
+            import cc_guardian_ctl as gctl  # noqa: E402
+
+            ok, msg = gctl.start_guardian()
+        except Exception as exc:
+            ok, msg = False, f"{type(exc).__name__}"
+        self._set_status(msg)
+        self._refresh_live_panel()
+        self._update_live_banner()
+        self._start_health_loop()
+        if ok and not quiet:
+            messagebox.showinfo(TITLE, f"{msg}\n\nMACD path uses Render — Guardian babysits this PC only.")
+
+    def _stop_guardian(self) -> None:
+        try:
+            import cc_guardian_ctl as gctl  # noqa: E402
+
+            ok, msg = gctl.stop_guardian()
+        except Exception as exc:
+            ok, msg = False, str(exc)
+        self._set_status(msg)
+        self._refresh_live_panel()
+        self._update_live_banner()
+
+    def _run_eod_report(self) -> None:
+        self._set_status("Building EOD report…")
+        py = cc.python_exe()
+        proc = subprocess.run(
+            [str(py), str(SCRIPTS / "eod_session_report.py"), "--email"],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+        )
+        if proc.returncode == 0:
+            self._set_status("EOD report written to Desktop (+ email if SMTP ok)")
+            day = datetime.now(ET).strftime("%Y-%m-%d")
+            path = DESKTOP / f"EOD-SESSION-REPORT-{day}.txt"
+            if path.is_file():
+                cc.open_notepad(path)
+        else:
+            self._set_status(f"EOD report failed (code {proc.returncode})")
+
+    def _start_team(self, *, quiet: bool = False, auto: bool = False) -> None:
+        """Legacy name — CC 2.0 uses Guardian."""
+        self._start_guardian(quiet=quiet or auto)
 
     def _refresh_checklist_ui(self) -> None:
         tc.ensure_live_defaults()
@@ -350,47 +454,6 @@ class CommandCenterApp(tk.Tk):
         tc.set_item(key, done)
         tc.write_human_summary()
         self._set_status(f"Checklist: {tc.LABELS.get(key, key)} → {'done' if done else 'open'}")
-
-    def _start_team(self, *, quiet: bool = False, auto: bool = False) -> None:
-        cc.stop_stale_console_supervisors()
-        self._prune_dead_procs()
-        if self._team_running():
-            self._set_status("Team already running — banner READY (no popup)")
-            self._update_live_banner()
-            self._start_health_loop()
-            return
-        auto_arm = DESKTOP / "OPERATOR-AUTO-ARM.txt"
-        if auto_arm.is_file():
-            try:
-                import operator_gateway as og  # noqa: E402
-
-                granted = og.try_auto_grant_from_marker()
-                if granted:
-                    self._set_status(f"Auto operator grant → {granted.name}")
-            except Exception as exc:
-                self._set_status(f"Auto grant skipped: {type(exc).__name__}")
-        if cc.clear_redundant_stop_file():
-            self._set_status("Cleared STOP file — redundant tests can run")
-        cc.mark_todo_items()
-        cc.dedupe_worker_duplicates_only()
-        spawned = cc.spawn_all_workers(fresh_team=False)
-        self.procs.update(spawned)
-        n_new = len(spawned)
-        n_up = sum(1 for ok in cc.team_worker_status().values() if ok)
-        self._set_status(f"START TEAM — {n_up}/3 helpers up ({n_new} started now)")
-        self._update_live_banner()
-        self._start_health_loop()
-        if n_new > 0:
-            self._email_team_started()
-        if quiet or auto:
-            return
-        if not self._team_running():
-            _one_dialog(
-                TITLE,
-                f"Only {n_up}/3 helpers detected.\n\n"
-                "Wait 10 seconds and check the banner, or click START TEAM once more.",
-                kind="info",
-            )
 
     def _start_health_loop(self) -> None:
         self._health_stop.clear()
@@ -702,12 +765,13 @@ class CommandCenterApp(tk.Tk):
         )
 
     def _on_close(self) -> None:
-        if self._team_running():
+        if self._guardian_on() or self._team_running():
             if messagebox.askyesno(
                 TITLE,
-                "Monitoring helpers are still running.\n\n"
-                "Stop all and close app? (Choose No to leave team running in background.)",
+                "Guardian or workers still running.\n\n"
+                "Stop Guardian + workers and close? (No = leave Guardian in background.)",
             ):
+                self._stop_guardian()
                 self._stop_all(quiet=True)
         cc.release_gui_lock()
         self.destroy()

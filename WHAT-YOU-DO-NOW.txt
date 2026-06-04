@@ -1,30 +1,26 @@
-﻿SPY LIVE SESSION | 2026-06-04 afternoon
-=====================================
+﻿SPY Command Center 2.0 + Guardian | 2026-06-04
+================================================
 
-PRIORITY TODAY (Cursor running for you)
-  • LIVE-SESSION-GUARDIAN — keeps Render warm + dual_sync/keepalive until 16:05 ET
-  • EOD-SESSION-REPORT — auto ~16:05 ET weekdays + email if SMTP ok
-  • MACD path: TV → Render 5.5.11 → Alpaca (unchanged)
+YOU APPROVED: Guardian + go CC2
 
-YOU — ZERO STEPS REQUIRED FOR LIVE ALERTS
-  Bridge is green. Guardian salvages PC helpers without Command Center GUI.
+DEFAULT (use this)
+  launchers\START-GUARDIAN.bat   — headless babysitter until 4:05 PM ET
+  OR open launchers\SPY-LIVE-COMMAND-CENTER.bat → Actions → Start Guardian
 
-IF YOU WANT THE GUI (optional)
-  1. launchers\CLEAR-GUI-LOCK.bat (only if open failed before)
-  2. launchers\SPY-LIVE-COMMAND-CENTER.bat — uses pythonw + error dialog (not black console)
+GUI 2.0 (optional desk)
+  Live tab   — bridge + journal tail
+  Team tab   — Grok/Cursor sync + checklist
+  Actions    — Start/Stop Guardian, EOD report, Render status
 
-COMMAND CENTER 2.0
-  Plan: docs\COMMAND-CENTER-2.0.md
-  Approval email sent: NEED APPROVAL - Command Center 2.0 sprint after EOD
-  Reply YES or go CC2 when ready (not during active MACD unless urgent)
+LIVE MACD (unchanged)
+  TradingView → Render 5.5.11 → Alpaca paper
 
-TODAY SUCCESS = truth in EOD report
-  Desktop\EOD-SESSION-REPORT-2026-06-04.txt (after close)
-  Desktop\LIVE-SESSION-JOURNAL-2026-06-04.txt (live log)
-  Alpaca Activities for MACD fills
+EOD
+  Auto ~4:05 PM: Desktop\EOD-SESSION-REPORT-*.txt + email
+  Or GUI: Actions → EOD report now
 
 DO NOT
-  BURST-PAPER-100 during MACD | ARM + GUI together | full DEDUPE bat
+  Old START TEAM spawn wars | BURST-100 during MACD | ARM + Guardian fight
 
 BRIDGE
   https://spy-options-bridge.onrender.com/health

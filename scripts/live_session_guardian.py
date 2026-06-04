@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from datetime import datetime
@@ -162,16 +163,32 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     log("GUARDIAN | session guardian started (live MACD path; no auto-trading)")
-    if args.once:
-        one_cycle(repair=not args.no_repair)
+    if not args.once:
+        try:
+            import cc_guardian_ctl as gctl  # noqa: E402
+
+            gctl.write_guardian_pid(os.getpid())
+        except Exception:
+            pass
+    try:
+        if args.once:
+            one_cycle(repair=not args.no_repair)
+            return 0
+
+        while session_active():
+            one_cycle(repair=not args.no_repair)
+            time.sleep(max(60, int(args.interval)))
+
+        log("GUARDIAN | market window ended — guardian stopping")
         return 0
+    finally:
+        if not args.once:
+            try:
+                import cc_guardian_ctl as gctl  # noqa: E402
 
-    while session_active():
-        one_cycle(repair=not args.no_repair)
-        time.sleep(max(60, int(args.interval)))
-
-    log("GUARDIAN | market window ended — guardian stopping")
-    return 0
+                gctl.clear_guardian_pid()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

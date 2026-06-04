@@ -1,6 +1,6 @@
 # Command Center 2.0 — architecture (plan, not scrap)
 
-**Status:** Plan for post-close build. **Today:** live MACD + `live_session_guardian.py` (no GUI required).
+**Status:** **ACTIVE (go CC2)** — Guardian default supervisor; GUI **2.0** three tabs (Live / Team / Actions).
 
 ## Vision
 
