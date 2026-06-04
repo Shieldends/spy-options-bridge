@@ -19,7 +19,8 @@ from team_email import notify_health_fail  # noqa: E402
 
 RENDER_PING = "https://spy-options-bridge.onrender.com/ping"
 RENDER_WAKE = "https://spy-options-bridge.onrender.com/health"
-INTERVAL_SEC = 300
+INTERVAL_SEC_MARKET = 60  # TV webhook timeout is 3s — keep Render warm during RTH
+INTERVAL_SEC_OFF = 300
 PING_TIMEOUTS = (30.0, 60.0, 90.0)
 FAIL_EMAIL_THRESHOLD = 3
 ET = ZoneInfo("America/New_York")
@@ -28,6 +29,16 @@ ET = ZoneInfo("America/New_York")
 def should_ping() -> bool:
     """Weekdays only — ping overnight so TV webhooks are not first cold-start victim."""
     return datetime.now(ET).weekday() < 5
+
+
+def ping_interval_sec() -> int:
+    """Faster pings during live session so Render answers TV within 3 seconds."""
+    try:
+        from run_preopen_matrix import market_session_open  # noqa: E402
+
+        return INTERVAL_SEC_MARKET if market_session_open() else INTERVAL_SEC_OFF
+    except Exception:
+        return INTERVAL_SEC_OFF
 
 
 def ping_once() -> bool:
@@ -49,7 +60,9 @@ def ping_once() -> bool:
 
 
 def main() -> int:
-    print("bridge_keepalive: /ping every 5 min, active Mon–Fri 24h ET")
+    print(
+        "bridge_keepalive: /health+/ping every 60s (RTH) or 5 min (off-hours), Mon-Fri ET"
+    )
     print(f"target={RENDER_PING}")
     consecutive_fails = 0
     while True:
@@ -66,11 +79,11 @@ def main() -> int:
                         "Check Render dashboard or Manual Deploy."
                     )
                     consecutive_fails = 0
-            time.sleep(INTERVAL_SEC)
+            time.sleep(ping_interval_sec())
         else:
             consecutive_fails = 0
             ts = datetime.now(ET).strftime("%H:%M:%S ET")
-            print(f"{ts} weekend — sleep 60s")
+            print(f"{ts} weekend - sleep 60s")
             time.sleep(60)
 
 

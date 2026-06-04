@@ -1,5 +1,5 @@
 """
-spy-options-bridge v5.5.9 — ALPACA PAPER (default broker)
+spy-options-bridge v5.5.10 — ALPACA PAPER (default broker)
 
 TradingView webhook → Render → Alpaca multi-leg SPY put credit spreads.
 
@@ -1864,6 +1864,92 @@ async def process_entry_alert(settings: Settings, signal: TradingViewSignal) -> 
         await notify(settings, "Entry Failed", str(exc), "CRITICAL")
 
 
+async def process_warning_alert(
+    settings: Settings,
+    warning: WarningSignal,
+    msg: str,
+    distance: float,
+    survival: float,
+    protocol_notes: list[str],
+) -> None:
+    """Run warning notify + optional Alpaca close (TradingView gets instant 200 first)."""
+    dry_run = not settings.is_live
+    notifications: dict = {}
+    notify_body = (
+        f"{msg}\nSurvival odds (expire OTM / keep premium): **{survival * 100:.1f}%**\n"
+        + "\n".join(f"- {n}" for n in protocol_notes)
+    )
+    notifications["warning"] = await notify(
+        settings,
+        "DANGER — Warning Protocol",
+        notify_body,
+        "CRITICAL",
+    )
+
+    if warning.override_auto_close:
+        await notify(
+            settings,
+            "Warning — Override Active",
+            f"{msg}\nAuto-close SKIPPED (overrideAutoClose=true). Survival odds: {survival * 100:.1f}%",
+            "WARNING",
+        )
+        return
+
+    should_close = warning.force_auto_close or settings.auto_close_on_warning
+    if not should_close:
+        return
+
+    if not settings.use_alpaca or not settings.alpaca_configured:
+        return
+
+    positions = await fetch_alpaca_positions(settings)
+    spreads = find_put_credit_spreads_in_positions(
+        positions,
+        warning.ticker,
+        short_strike=warning.short_strike,
+        long_strike=warning.long_strike,
+    )
+
+    if not spreads:
+        await notify(
+            settings,
+            "Warning — No Spread Found",
+            f"{msg}\nNo open put credit spread matched short strike ${warning.short_strike:.2f}.",
+            "WARNING",
+        )
+        return
+
+    spread = spreads[0]
+    close_debit = resolve_warning_close_debit(spread, settings, override_debit=warning.close_debit)
+    leg_syms = {leg.symbol for leg in spread.legs}
+
+    if settings.warning_cancel_resting_exits and not dry_run:
+        n = await cancel_alpaca_open_orders_for_symbols(settings, leg_syms)
+        if n:
+            protocol_notes.append(
+                f"Canceled {n} resting order(s) on spread legs before emergency close"
+            )
+
+    close_payload = build_alpaca_close_payload(spread, close_debit)
+    close_payload["time_in_force"] = "day"
+    close_payload["_meta"] = {
+        "warning_close": True,
+        "close_debit": close_debit,
+        "survival_odds": survival,
+    }
+
+    await notify(
+        settings,
+        "Warning — Auto-Close Submitting",
+        f"{msg}\nClosing spread at ${close_debit:.2f} debit (multi-leg). Survival odds were {survival * 100:.1f}%.",
+        "CRITICAL",
+    )
+
+    close_order = await submit_alpaca_order(settings, close_payload, dry_run=dry_run)
+    if not close_order.success:
+        await notify(settings, "Warning — Auto-Close Failed", close_order.message, "CRITICAL")
+
+
 def coerce_signal(payload: dict, settings: Settings) -> TradingViewSignal:
     merged = {
         "strikeOffsetShort": settings.default_strike_offset_short,
@@ -1885,7 +1971,7 @@ def coerce_signal(payload: dict, settings: Settings) -> TradingViewSignal:
 
 app = FastAPI(
     title="spy-options-bridge",
-    version="5.5.9",
+    version="5.5.10",
     description="TradingView → Alpaca Paper multi-leg SPY credit spreads + auto GTC exits",
 )
 
@@ -1897,7 +1983,7 @@ async def startup_log() -> None:
     s = get_settings()
     broker_label = "Alpaca Paper" if s.use_alpaca else "Tastytrade Cert"
     logger.info(
-        "spy-options-bridge v5.5.9 started | broker=%s (%s) | configured=%s | mode=%s | auto_tp=%s auto_sl=%s chase=%s paper_force=%s auto_cancel=%s",
+        "spy-options-bridge v5.5.10 started | broker=%s (%s) | configured=%s | mode=%s | auto_tp=%s auto_sl=%s chase=%s paper_force=%s auto_cancel=%s",
         s.broker,
         broker_label,
         s.configured,
@@ -1935,7 +2021,7 @@ async def health() -> dict[str, Any]:
     tv_pause_risk = build_tv_pause_risk(s, preflight)
     return {
         "status": "ok" if tv_pause_risk["level"] != "red" else "degraded",
-        "version": "5.5.9",
+        "version": "5.5.10",
         "burst_endpoint": "/exercise/burst",
         "auto_take_profit": str(s.auto_take_profit),
         "auto_stop_loss": str(s.auto_stop_loss),
@@ -1967,7 +2053,7 @@ async def health() -> dict[str, Any]:
 @app.get("/ping")
 async def ping() -> dict[str, str]:
     """Lightweight keep-alive for cron pings (prevents Render free-tier cold starts)."""
-    return {"status": "ok", "version": "5.5.9"}
+    return {"status": "ok", "version": "5.5.10"}
 
 
 def _burst_paper_guard(settings: Settings) -> str | None:
@@ -2301,6 +2387,7 @@ async def entry_endpoint(
 @app.post("/warning", response_model=WarningResponse)
 async def warning_endpoint(
     request: Request,
+    background_tasks: BackgroundTasks,
     x_webhook_secret: str | None = Header(default=None, alias="X-Webhook-Secret"),
 ) -> WarningResponse:
     """
@@ -2361,140 +2448,49 @@ async def warning_endpoint(
         danger_pct=settings.danger_zone_pct,
     )
 
-    notifications: dict = {}
-    action_taken = "no_danger"
-    close_order: OrderResult | None = None
-    positions_matched = 0
-
-    if danger and msg:
-        notify_body = (
-            f"{msg}\nSurvival odds (expire OTM / keep premium): **{survival * 100:.1f}%**\n"
-            + "\n".join(f"- {n}" for n in protocol_notes)
-        )
-        notifications["warning"] = await notify(
-            settings,
-            "DANGER — Warning Protocol",
-            notify_body,
-            "CRITICAL",
-        )
-
     if not danger:
         return WarningResponse(
             danger_zone=False,
             risk_warning=None,
             distance_pct=round(distance * 100, 3),
-            action_taken=action_taken,
+            action_taken="no_danger",
             survival_odds_expire_otm=survival,
             protocol_notes=protocol_notes,
-            notifications=notifications,
+            notifications={},
         )
 
-    if warning.override_auto_close:
-        action_taken = "notify_only_override"
-        await notify(
-            settings,
-            "Warning — Override Active",
-            f"{msg}\nAuto-close SKIPPED (overrideAutoClose=true). Survival odds: {survival * 100:.1f}%",
-            "WARNING",
-        )
+    if not msg:
         return WarningResponse(
-            danger_zone=True,
-            risk_warning=msg,
+            danger_zone=False,
+            risk_warning=None,
             distance_pct=round(distance * 100, 3),
-            action_taken=action_taken,
+            action_taken="no_danger",
             survival_odds_expire_otm=survival,
             protocol_notes=protocol_notes,
-            notifications=notifications,
+            notifications={},
         )
 
-    should_close = warning.force_auto_close or settings.auto_close_on_warning
-    if not should_close:
-        action_taken = "notify_only_disabled"
-        return WarningResponse(
-            danger_zone=True,
-            risk_warning=msg,
-            distance_pct=round(distance * 100, 3),
-            action_taken=action_taken,
-            survival_odds_expire_otm=survival,
-            protocol_notes=protocol_notes,
-            notifications=notifications,
-        )
-
-    if not settings.use_alpaca or not settings.alpaca_configured:
-        action_taken = "notify_only_no_broker"
-        return WarningResponse(
-            danger_zone=True,
-            risk_warning=msg,
-            distance_pct=round(distance * 100, 3),
-            action_taken=action_taken,
-            survival_odds_expire_otm=survival,
-            protocol_notes=protocol_notes,
-            notifications=notifications,
-        )
-
-    positions = await fetch_alpaca_positions(settings)
-    spreads = find_put_credit_spreads_in_positions(
-        positions,
-        warning.ticker,
-        short_strike=warning.short_strike,
-        long_strike=warning.long_strike,
-    )
-    positions_matched = len(spreads)
-
-    if not spreads:
-        action_taken = "danger_no_matching_position"
-        await notify(
-            settings,
-            "Warning — No Spread Found",
-            f"{msg}\nNo open put credit spread matched short strike ${warning.short_strike:.2f}.",
-            "WARNING",
-        )
-        return WarningResponse(
-            danger_zone=True,
-            risk_warning=msg,
-            distance_pct=round(distance * 100, 3),
-            action_taken=action_taken,
-            survival_odds_expire_otm=survival,
-            protocol_notes=protocol_notes,
-            positions_matched=0,
-            notifications=notifications,
-        )
-
-    spread = spreads[0]
-    close_debit = resolve_warning_close_debit(spread, settings, override_debit=warning.close_debit)
-    leg_syms = {leg.symbol for leg in spread.legs}
-
-    if settings.warning_cancel_resting_exits and not dry_run:
-        n = await cancel_alpaca_open_orders_for_symbols(settings, leg_syms)
-        if n:
-            protocol_notes.append(f"Canceled {n} resting order(s) on spread legs before emergency close")
-
-    close_payload = build_alpaca_close_payload(spread, close_debit)
-    close_payload["time_in_force"] = "day"
-    close_payload["_meta"] = {
-        "warning_close": True,
-        "close_debit": close_debit,
-        "survival_odds": survival,
-    }
-
-    await notify(
+    notes_copy = list(protocol_notes)
+    background_tasks.add_task(
+        process_warning_alert,
         settings,
-        "Warning — Auto-Close Submitting",
-        f"{msg}\nClosing spread at ${close_debit:.2f} debit (multi-leg). Survival odds were {survival * 100:.1f}%.",
-        "CRITICAL",
+        warning,
+        msg,
+        distance,
+        survival,
+        notes_copy,
     )
-
-    close_order = await submit_alpaca_order(settings, close_payload, dry_run=dry_run)
-    action_taken = "auto_close_submitted" if close_order.success else "auto_close_failed"
-
-    return WarningResponse(
-        danger_zone=True,
-        risk_warning=msg,
-        distance_pct=round(distance * 100, 3),
-        action_taken=action_taken,
-        survival_odds_expire_otm=survival,
-        protocol_notes=protocol_notes,
-        close_order=close_order,
-        positions_matched=positions_matched,
-        notifications=notifications,
+    logger.info("Queued background warning for %s", warning.ticker)
+    return JSONResponse(  # type: ignore[return-value]
+        status_code=200,
+        content={
+            "danger_zone": True,
+            "risk_warning": msg,
+            "distance_pct": round(distance * 100, 3),
+            "action_taken": "accepted",
+            "survival_odds_expire_otm": survival,
+            "protocol_notes": notes_copy,
+            "processing": True,
+            "notifications": {},
+        },
     )

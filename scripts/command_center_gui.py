@@ -52,7 +52,7 @@ class CommandCenterApp(tk.Tk):
         self._health_stop = threading.Event()
         self._health_thread: threading.Thread | None = None
         self._check_vars: dict[str, tk.BooleanVar] = {}
-        self._status_var = tk.StringVar(value="Ready — click RENDER STATUS or START TEAM")
+        self._status_var = tk.StringVar(value="Starting… checking team and bridge")
         self._email_approval_var = tk.StringVar(value="Email approval: idle")
         self._live_banner_var = tk.StringVar(value="LIVE RUN: checking…")
         self._prefs_var = tk.StringVar(value="")
@@ -62,9 +62,10 @@ class CommandCenterApp(tk.Tk):
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(500, self._refresh_checklist_ui)
-        self.after(600, self._update_live_banner)
+        self.after(600, self._bootstrap_team_state)
         self.after(800, self._refresh_email_approval_status)
         self.after(30000, self._schedule_email_approval_refresh)
+        self.after(15000, self._schedule_banner_refresh)
 
     def _schedule_email_approval_refresh(self) -> None:
         self._refresh_email_approval_status()
@@ -108,14 +109,15 @@ class CommandCenterApp(tk.Tk):
             justify=tk.CENTER,
         ).grid(row=0, column=0, columnspan=2, pady=(0, 4), sticky="ew")
 
-        tk.Label(
+        self._banner_label = tk.Label(
             main,
             textvariable=self._live_banner_var,
             font=("Segoe UI", 16, "bold"),
             fg="#0a5",
             wraplength=520,
             justify=tk.CENTER,
-        ).grid(row=1, column=0, columnspan=2, pady=(4, 4), sticky="ew")
+        )
+        self._banner_label.grid(row=1, column=0, columnspan=2, pady=(4, 4), sticky="ew")
 
         tk.Label(
             main,
@@ -188,7 +190,9 @@ class CommandCenterApp(tk.Tk):
 
         help_text = (
             "SPY Live Command Center — the app (one window).\n\n"
-            "• START TEAM — dual sync, bridge keepalive, redundant tests (same as console center).\n"
+            "• START TEAM — starts or reconnects monitoring (safe to click again).\n"
+            "• Green READY banner = all 3 helpers running on this PC (not just this window).\n"
+            "• ARM bat refreshes grant/burst; won't kill workers while this app is open.\n"
             "• TradingView → Render → Alpaca Thursday path is unchanged.\n"
             "• Desktop .bat files remain for advanced / single-layer debugging.\n\n"
             "Phase 2 master plan — locked until live test proven."
@@ -211,20 +215,86 @@ class CommandCenterApp(tk.Tk):
         self._status_var.set(f"{ts} | {msg}")
 
     def _team_running(self) -> bool:
+        """True when banner should show READY (see team_ready_for_display)."""
+        if cc.team_ready_for_display():
+            return True
         return bool(self.procs) and any(p.poll() is None for p in self.procs.values())
 
+    def _team_status_label(self) -> tuple[str, str]:
+        """Banner text and tk label foreground color."""
+        if cc.team_ready_for_display():
+            if cc._market_session_open_now():
+                return "READY — live session (redundant tests pause at 9:30 ET)", "#0a5"
+            return "READY — team monitoring (TV → Render → Alpaca)", "#0a5"
+        status = cc.team_worker_status()
+        n = sum(1 for ok in status.values() if ok)
+        if n > 0:
+            missing = []
+            for s, ok in status.items():
+                if ok:
+                    continue
+                if s == "redundant_test_loop.py" and not cc.redundant_expected_up():
+                    continue
+                missing.append(s.replace("_loop.py", "").replace(".py", "").replace("_", " "))
+            if not missing and status.get("dual_sync_loop.py") and status.get("bridge_keepalive.py"):
+                return "READY — team monitoring (TV → Render → Alpaca)", "#0a5"
+            need = ", ".join(missing) if missing else "redundant test"
+            return f"PARTIAL — click START TEAM ({n}/3 up; need {need})", "#b60"
+        return "OFF — click START TEAM once to start monitoring", "#a00"
+
     def _update_live_banner(self) -> None:
-        if self._team_running():
-            self._live_banner_var.set("LIVE RUN: READY")
-        else:
-            self._live_banner_var.set("NEEDS: click START TEAM")
+        text, color = self._team_status_label()
+        self._live_banner_var.set(text)
+        self._banner_label.configure(fg=color)
         data = tc.load_checklist()
         parts: list[str] = []
         if data.get("user_wants_email", True):
-            parts.append("Email alerts ON (you confirmed)")
+            parts.append("Email alerts ON")
         if data.get("user_wants_burst", True):
-            parts.append("Burst 9:31 ET ON (you confirmed)")
-        self._prefs_var.set("YOU WANT: " + " | ".join(parts) if parts else "")
+            parts.append("Burst 9:31 ET ON")
+        grant_ok = (DESKTOP / "OPERATOR-GRANT.json").is_file()
+        parts.append("Operator grant OK" if grant_ok else "No operator grant (ARM or grant button)")
+        self._prefs_var.set(" · ".join(parts))
+
+    def _schedule_banner_refresh(self) -> None:
+        self._reconcile_team_helpers()
+        self._update_live_banner()
+        self.after(15000, self._schedule_banner_refresh)
+
+    def _reconcile_team_helpers(self) -> None:
+        """Keep READY accurate: respawn helpers that died without a full START TEAM click."""
+        self._prune_dead_procs()
+        if not (DESKTOP / "OPERATOR-GRANT.json").is_file():
+            return
+        try:
+            import dedupe_spy_workers as dedupe  # noqa: E402
+
+            if any(len(dedupe.pids_for_script(s)) > 1 for s in cc.TEAM_WORKER_SCRIPTS):
+                cc.dedupe_worker_duplicates_only()
+        except Exception:
+            pass
+        for name, script, args in cc.WORKERS:
+            proc = self.procs.get(name)
+            if proc is not None and proc.poll() is None:
+                continue
+            if cc.worker_already_running(script):
+                continue
+            self.procs[name] = cc.spawn_worker(name, script, args)
+
+    def _prune_dead_procs(self) -> None:
+        dead = [name for name, p in self.procs.items() if p.poll() is not None]
+        for name in dead:
+            del self.procs[name]
+
+    def _bootstrap_team_state(self) -> None:
+        """On open: detect existing workers, refresh banner, start health polling."""
+        self._prune_dead_procs()
+        if self._team_running():
+            self._set_status("Team on standby — leave this window open or minimized")
+            self._start_health_loop()
+        else:
+            self._set_status("Click START TEAM once — will not auto-restart team")
+        self._update_live_banner()
 
     def _refresh_checklist_ui(self) -> None:
         tc.ensure_live_defaults()
@@ -239,9 +309,12 @@ class CommandCenterApp(tk.Tk):
         tc.write_human_summary()
         self._set_status(f"Checklist: {tc.LABELS.get(key, key)} → {'done' if done else 'open'}")
 
-    def _start_team(self) -> None:
-        if self.procs and any(p.poll() is None for p in self.procs.values()):
-            messagebox.showinfo(TITLE, "Team workers already running.")
+    def _start_team(self, *, quiet: bool = False, auto: bool = False) -> None:
+        self._prune_dead_procs()
+        if self._team_running():
+            self._set_status("Team already running — banner READY (no popup)")
+            self._update_live_banner()
+            self._start_health_loop()
             return
         auto_arm = DESKTOP / "OPERATOR-AUTO-ARM.txt"
         if auto_arm.is_file():
@@ -253,17 +326,28 @@ class CommandCenterApp(tk.Tk):
                     self._set_status(f"Auto operator grant → {granted.name}")
             except Exception as exc:
                 self._set_status(f"Auto grant skipped: {type(exc).__name__}")
+        if cc.clear_redundant_stop_file():
+            self._set_status("Cleared STOP file — redundant tests can run")
         cc.mark_todo_items()
-        self.procs = cc.spawn_all_workers()
-        self._set_status("START TEAM — 3 workers spawned")
+        cc.dedupe_worker_duplicates_only()
+        spawned = cc.spawn_all_workers(fresh_team=False)
+        self.procs.update(spawned)
+        n_new = len(spawned)
+        n_up = sum(1 for ok in cc.team_worker_status().values() if ok)
+        self._set_status(f"START TEAM — {n_up}/3 helpers up ({n_new} started now)")
         self._update_live_banner()
         self._start_health_loop()
-        self._email_team_started()
-        messagebox.showinfo(
-            TITLE,
-            "Team started:\n• dual_sync_loop (60s)\n• bridge_keepalive\n• redundant_test_loop (5 min)\n\n"
-            "Use STOP ALL before closing the window.",
-        )
+        if n_new > 0:
+            self._email_team_started()
+        if quiet or auto:
+            return
+        if not self._team_running():
+            _one_dialog(
+                TITLE,
+                f"Only {n_up}/3 helpers detected.\n\n"
+                "Wait 10 seconds and check the banner, or click START TEAM once more.",
+                kind="info",
+            )
 
     def _start_health_loop(self) -> None:
         self._health_stop.clear()
@@ -275,6 +359,7 @@ class CommandCenterApp(tk.Tk):
                 ok, detail = cc.fetch_health()
                 msg = f"health {'OK' if ok else 'WARN'} | {detail}"
                 self.after(0, lambda m=msg: self._set_status(m))
+                self.after(0, self._update_live_banner)
 
         self._health_thread = threading.Thread(target=loop, daemon=True)
         self._health_thread.start()
@@ -522,8 +607,9 @@ class CommandCenterApp(tk.Tk):
             cc.kill_worker(proc)
             cc.log_line(f"gui stopped: {name}")
         self.procs.clear()
+        cc.stop_team_workers()
         self._update_live_banner()
-        self._set_status("STOP ALL — workers killed, STOP file created")
+        self._set_status("STOP ALL — helpers stopped, STOP file created")
         if not quiet:
             messagebox.showinfo(
                 TITLE,
@@ -573,19 +659,61 @@ class CommandCenterApp(tk.Tk):
         )
 
     def _on_close(self) -> None:
-        if self.procs and any(p.poll() is None for p in self.procs.values()):
-            if not messagebox.askyesno(
-                TITLE, "Workers still running. Stop all and exit?"
+        if self._team_running():
+            if messagebox.askyesno(
+                TITLE,
+                "Monitoring helpers are still running.\n\n"
+                "Stop all and close app? (Choose No to leave team running in background.)",
             ):
-                return
-        self._stop_all(quiet=True)
+                self._stop_all(quiet=True)
+        cc.release_gui_lock()
         self.destroy()
 
 
+def _one_dialog(title: str, msg: str, *, kind: str = "info") -> None:
+    """Single popup (one Tk root) — avoids stacked or duplicate dialog boxes."""
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        root.attributes("-topmost", True)
+    except tk.TclError:
+        pass
+    try:
+        if kind == "error":
+            messagebox.showerror(title, msg, parent=root)
+        else:
+            messagebox.showinfo(title, msg, parent=root)
+    finally:
+        root.destroy()
+
+
 def main() -> int:
-    app = CommandCenterApp()
-    app.mainloop()
-    return 0
+    cc.consolidate_to_one_gui()
+    if not cc.try_acquire_gui_lock():
+        return 0
+    try:
+        app = CommandCenterApp()
+        app.mainloop()
+        cc.release_gui_lock()
+        return 0
+    except Exception as exc:
+        crash = DESKTOP / "COMMAND-CENTER-CRASH.txt"
+        try:
+            import traceback
+
+            crash.write_text(traceback.format_exc(), encoding="utf-8")
+        except OSError:
+            pass
+        try:
+            _one_dialog(
+                TITLE,
+                f"Command Center closed due to an error.\n\n{type(exc).__name__}: {exc}\n\n"
+                f"Details: {crash}",
+                kind="error",
+            )
+        except Exception:
+            pass
+        return 1
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@
 C:\Users\Shiel\Desktop\BRIDGE-KEEPALIVE.bat
 ```
 
-Runs `scripts/bridge_keepalive.py` — pings every **5 minutes**, **8:00–17:00 ET** Mon–Fri.
+Runs `scripts/bridge_keepalive.py` — pings every **60 seconds during RTH** (9:30–16:00 ET Mon–Fri) and **5 minutes** off-hours, weekdays.
 
 ## External cron (optional)
 
