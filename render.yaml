@@ -27,15 +27,19 @@ services:
       - key: AUTO_CHASE_ENTRY_FILL
         value: true
       - key: ENTRY_CHASE_WAIT_SECONDS
-        value: "2"
+        value: "4"
       - key: ENTRY_CHASE_POLL_SECONDS
         value: "1.5"
       - key: ENTRY_CHASE_MAX_ATTEMPTS
-        value: "15"
+        value: "25"
       - key: ENTRY_CHASE_FLOOR_EXTRA_POLLS
-        value: "8"
+        value: "15"
       - key: ENTRY_MIN_CREDIT
         value: "0.01"
+      - key: BURST_MAX_COUNT
+        value: "10"
+      - key: MAX_CONCURRENT_CHASE_TASKS
+        value: "2"
       - key: AUTO_CANCEL_CONFLICTING_ORDERS
         value: true
       - key: AUTO_TAKE_PROFIT

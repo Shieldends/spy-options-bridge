@@ -30,6 +30,8 @@ Supervisor thread: every 60s `GET /health` → `Desktop\COMMAND-CENTER-LOG.txt`
 
 **Grok:** Poll `grok_outbox.md` intent is inverse — Grok **reads** inbox, **writes** outbox. Cursor **reads** outbox when working; `dual_sync_loop` propagates via `append_sync.py`.
 
+**Cursor handoff when fixes land:** `launchers\HANDOFF-TO-CURSOR.bat "summary"` or `scripts\cursor_handoff.py` — appends to `cursor_inbox.md` (RULES + ACTIONS COMPLETE). ARM auto-handoffs; `dual_sync_loop` drains `sync\fixes_pending.jsonl`. See `docs\CURSOR-HANDOFF.md`.
+
 **User:** Leave Grok + Cursor sessions open; no secret paste in chat. Status email from `EMAIL_TO` in `.env` (default shieldinc850@gmail.com) for SMTP alerts only.
 
 ## Energy loop

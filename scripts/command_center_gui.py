@@ -25,6 +25,8 @@ DESKTOP = Path(r"C:\Users\Shiel\Desktop")
 SYNC_DIR = Path(r"C:\Users\Shiel\Projects\spy-hybrid-v3\sync")
 STOP_FILE = Path(r"C:\Users\Shiel\Desktop\STOP-REDUNDANT-TESTS.txt")
 BURST_BAT = DESKTOP / "BURST-PAPER-100.bat"
+TRIGGER_PROOF = DESKTOP / "TRIGGER-CHAIN-PROOF.txt"
+TRIGGER_PROOF_BAT = DESKTOP / "RUN-TRIGGER-CHAIN-PROOF.bat"
 REPORT_PATHS = (
     DESKTOP / "LIVE-RUN-READINESS-REPORT.txt",
     DESKTOP / "FINAL-TEAM-AUDIT.txt",
@@ -146,6 +148,8 @@ class CommandCenterApp(tk.Tk):
             ("CHECK EMAIL REPLIES", self._check_email_replies),
             ("EMAIL ME LATEST REPORT", self._email_latest_report),
             ("OPEN REPORTS", self._open_reports),
+            ("TRIGGER PROOF REPORT", self._open_trigger_proof),
+            ("RUN TRIGGER PROOF", self._run_trigger_proof),
             ("OPEN GROK SYNC", self._open_grok_sync),
             ("THURSDAY BURST (9:31 ET)", self._thursday_burst),
             ("STOP ALL", self._stop_all),
@@ -192,8 +196,10 @@ class CommandCenterApp(tk.Tk):
             "SPY Live Command Center — the app (one window).\n\n"
             "• START TEAM — starts or reconnects monitoring (safe to click again).\n"
             "• Green READY banner = all 3 helpers running on this PC (not just this window).\n"
+            "• Flat Alpaca (no positions) is normal until a live MACD cross — not burst/scenario tests.\n"
+            "• TRIGGER PROOF REPORT = bridge/webhook speed; TV MACD still needs alert log + Activities.\n"
             "• ARM bat refreshes grant/burst; won't kill workers while this app is open.\n"
-            "• TradingView → Render → Alpaca Thursday path is unchanged.\n"
+            "• TradingView → Render → Alpaca path unchanged.\n"
             "• Desktop .bat files remain for advanced / single-layer debugging.\n\n"
             "Phase 2 master plan — locked until live test proven."
         )
@@ -254,7 +260,46 @@ class CommandCenterApp(tk.Tk):
             parts.append("Burst 9:31 ET ON")
         grant_ok = (DESKTOP / "OPERATOR-GRANT.json").is_file()
         parts.append("Operator grant OK" if grant_ok else "No operator grant (ARM or grant button)")
+        parts.append(self._trigger_proof_hint())
         self._prefs_var.set(" · ".join(parts))
+
+    def _trigger_proof_hint(self) -> str:
+        if not TRIGGER_PROOF.is_file():
+            return "Trigger proof: not run"
+        try:
+            for line in TRIGGER_PROOF.read_text(encoding="utf-8").splitlines():
+                if line.startswith("PASS="):
+                    return f"Trigger proof {line.strip()}"
+            mtime = datetime.fromtimestamp(TRIGGER_PROOF.stat().st_mtime, tz=ET).strftime(
+                "%H:%M ET"
+            )
+            return f"Trigger proof @ {mtime}"
+        except OSError:
+            return "Trigger proof: unreadable"
+
+    def _open_trigger_proof(self) -> None:
+        if not TRIGGER_PROOF.is_file():
+            self._set_status("Run RUN TRIGGER PROOF first")
+            messagebox.showinfo(
+                TITLE,
+                "No report yet.\n\nDouble-click Desktop\\RUN-TRIGGER-CHAIN-PROOF.bat\n"
+                "or click RUN TRIGGER PROOF here.",
+            )
+            return
+        subprocess.Popen(["notepad.exe", str(TRIGGER_PROOF)])
+        self._set_status(f"Opened {TRIGGER_PROOF.name}")
+
+    def _run_trigger_proof(self) -> None:
+        if not TRIGGER_PROOF_BAT.is_file():
+            self._set_status("Missing RUN-TRIGGER-CHAIN-PROOF.bat on Desktop")
+            return
+        self._set_status("Running trigger chain proof…")
+        subprocess.Popen(
+            ["cmd", "/c", "start", "/wait", str(TRIGGER_PROOF_BAT)],
+            cwd=str(DESKTOP),
+        )
+        self.after(2000, self._update_live_banner)
+        self._set_status("Trigger proof finished — open TRIGGER PROOF REPORT")
 
     def _schedule_banner_refresh(self) -> None:
         self._reconcile_team_helpers()

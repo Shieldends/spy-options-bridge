@@ -29,6 +29,20 @@ def test_worker_command_includes_redundant_interval():
     assert "300" in cmd
 
 
+def test_team_ready_core_without_redundant(monkeypatch):
+    monkeypatch.setattr(
+        cc,
+        "team_worker_status",
+        lambda: {
+            "dual_sync_loop.py": True,
+            "bridge_keepalive.py": True,
+            "redundant_test_loop.py": False,
+        },
+    )
+    monkeypatch.setattr(cc, "_market_session_open_now", lambda: True)
+    assert cc.team_ready_for_display() is True
+
+
 def test_fetch_health_parses_version(monkeypatch):
     class FakeResp:
         status = 200

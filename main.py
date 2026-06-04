@@ -1,5 +1,5 @@
 """
-spy-options-bridge v5.5.10 — ALPACA PAPER (default broker)
+spy-options-bridge v5.5.11 — ALPACA PAPER (default broker)
 
 TradingView webhook → Render → Alpaca multi-leg SPY put credit spreads.
 
@@ -57,7 +57,10 @@ logger = logging.getLogger(__name__)
 
 _app_started_mono = time.monotonic()
 _preflight_cache: dict[str, Any] = {"ts": 0.0, "data": {}}
+_burst_in_progress = False
+_chase_semaphore: asyncio.Semaphore | None = None
 PREFLIGHT_CACHE_SEC = 30.0
+BURST_ATTEMPTS_RESPONSE_CAP = 5
 PREFLIGHT_TIMEOUT_SEC = 4.0
 ET = ZoneInfo("America/New_York")
 CERT_URL = "https://api.cert.tastyworks.com"
@@ -129,6 +132,8 @@ class Settings(BaseSettings):
     # fixed | auto | aggressive | exercise | fill — exercise/fill lean low for paper fills
     max_quantity: int = Field(default=0, alias="MAX_QUANTITY")
     # 0 = no cap; set e.g. 10 to limit spreads per alert
+    burst_max_count: int = Field(default=10, alias="BURST_MAX_COUNT")
+    max_concurrent_chase_tasks: int = Field(default=2, alias="MAX_CONCURRENT_CHASE_TASKS")
 
     @property
     def is_live(self) -> bool:
@@ -1496,6 +1501,26 @@ def spread_with_credit(spread: SpreadPackage, credit: float) -> SpreadPackage:
     )
 
 
+def _chase_semaphore_for(settings: Settings) -> asyncio.Semaphore:
+    global _chase_semaphore
+    limit = max(1, int(settings.max_concurrent_chase_tasks))
+    if _chase_semaphore is None:
+        _chase_semaphore = asyncio.Semaphore(limit)
+    return _chase_semaphore
+
+
+def _burst_response_payload(result: dict[str, Any]) -> dict[str, Any]:
+    """Keep JSON small on Render free tier (avoid huge attempts[] in memory)."""
+    attempts = result.get("attempts")
+    if not isinstance(attempts, list):
+        return result
+    out = {k: v for k, v in result.items() if k != "attempts"}
+    out["attempts_total"] = len(attempts)
+    out["attempts_sample"] = attempts[-BURST_ATTEMPTS_RESPONSE_CAP:]
+    out["attempts_omitted"] = max(0, len(attempts) - BURST_ATTEMPTS_RESPONSE_CAP)
+    return out
+
+
 async def alpaca_place_exits_after_fill(
     settings: Settings,
     spread: SpreadPackage,
@@ -1507,6 +1532,39 @@ async def alpaca_place_exits_after_fill(
     if not settings.is_live or not settings.alpaca_configured:
         return
 
+    sem = _chase_semaphore_for(settings)
+    try:
+        await asyncio.wait_for(sem.acquire(), timeout=0.5)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Chase slot busy (max=%s) — skipping background chase for %s",
+            settings.max_concurrent_chase_tasks,
+            entry_order_id[:8],
+        )
+        await notify(
+            settings,
+            "Entry Chase Deferred",
+            f"Order {entry_order_id[:8]}… queued while server busy — check Alpaca Orders",
+            "WARNING",
+            send_email=False,
+        )
+        return
+
+    try:
+        await _alpaca_place_exits_after_fill_locked(
+            settings, spread, entry_order_id, initial_credit=initial_credit
+        )
+    finally:
+        sem.release()
+
+
+async def _alpaca_place_exits_after_fill_locked(
+    settings: Settings,
+    spread: SpreadPackage,
+    entry_order_id: str,
+    *,
+    initial_credit: float | None = None,
+) -> None:
     start_credit = initial_credit if initial_credit is not None else float(spread.metadata["limit_credit"])
     if settings.auto_chase_entry_fill:
         filled = await wait_and_chase_alpaca_entry_fill(settings, entry_order_id, start_credit)
@@ -1702,35 +1760,50 @@ async def run_burst_attempts(
     skip_exits: bool = True,
 ) -> dict[str, Any]:
     """Sequential paper burst: min credit, sync chase, cancel stale before next."""
-    count = max(1, min(int(count), 200))
+    global _burst_in_progress
+    if _burst_in_progress:
+        return {
+            "success": False,
+            "burst_count": 0,
+            "filled_count": 0,
+            "message": "Burst already running on this instance — wait and retry",
+            "attempts_total": 0,
+            "attempts_sample": [],
+        }
+    cap = max(1, int(settings.burst_max_count))
+    count = max(1, min(int(count), cap))
     attempts: list[dict[str, Any]] = []
-    for i in range(count):
-        if i > 0 and interval_sec > 0:
-            await asyncio.sleep(interval_sec)
-        attempt = await submit_entry_sync_chase(settings, signal, skip_exits=skip_exits)
-        attempt["attempt"] = i + 1
-        attempts.append(attempt)
-        logger.info(
-            "Burst %s/%s order=%s filled=%s status=%s",
-            i + 1,
-            count,
-            (attempt.get("order_id") or "")[:8],
-            attempt.get("filled"),
-            attempt.get("status"),
+    _burst_in_progress = True
+    try:
+        for i in range(count):
+            if i > 0 and interval_sec > 0:
+                await asyncio.sleep(interval_sec)
+            attempt = await submit_entry_sync_chase(settings, signal, skip_exits=skip_exits)
+            attempt["attempt"] = i + 1
+            attempts.append(attempt)
+            logger.info(
+                "Burst %s/%s order=%s filled=%s status=%s",
+                i + 1,
+                count,
+                (attempt.get("order_id") or "")[:8],
+                attempt.get("filled"),
+                attempt.get("status"),
+            )
+        filled_count = sum(1 for a in attempts if a.get("filled"))
+        await notify(
+            settings,
+            "Burst Complete",
+            f"Paper burst finished: {filled_count}/{count} filled",
+            "SUCCESS" if filled_count > 0 else "WARNING",
         )
-    filled_count = sum(1 for a in attempts if a.get("filled"))
-    await notify(
-        settings,
-        "Burst Complete",
-        f"Paper burst finished: {filled_count}/{count} filled",
-        "SUCCESS" if filled_count > 0 else "WARNING",
-    )
-    return {
-        "success": filled_count > 0,
-        "burst_count": count,
-        "filled_count": filled_count,
-        "attempts": attempts,
-    }
+        return {
+            "success": filled_count > 0,
+            "burst_count": count,
+            "filled_count": filled_count,
+            "attempts": attempts,
+        }
+    finally:
+        _burst_in_progress = False
 
 
 async def submit_entry_from_signal(
@@ -1971,7 +2044,7 @@ def coerce_signal(payload: dict, settings: Settings) -> TradingViewSignal:
 
 app = FastAPI(
     title="spy-options-bridge",
-    version="5.5.10",
+    version="5.5.11",
     description="TradingView → Alpaca Paper multi-leg SPY credit spreads + auto GTC exits",
 )
 
@@ -1983,7 +2056,7 @@ async def startup_log() -> None:
     s = get_settings()
     broker_label = "Alpaca Paper" if s.use_alpaca else "Tastytrade Cert"
     logger.info(
-        "spy-options-bridge v5.5.10 started | broker=%s (%s) | configured=%s | mode=%s | auto_tp=%s auto_sl=%s chase=%s paper_force=%s auto_cancel=%s",
+        "spy-options-bridge v5.5.11 started | broker=%s (%s) | configured=%s | mode=%s | auto_tp=%s auto_sl=%s chase=%s paper_force=%s auto_cancel=%s",
         s.broker,
         broker_label,
         s.configured,
@@ -2021,7 +2094,7 @@ async def health() -> dict[str, Any]:
     tv_pause_risk = build_tv_pause_risk(s, preflight)
     return {
         "status": "ok" if tv_pause_risk["level"] != "red" else "degraded",
-        "version": "5.5.10",
+        "version": "5.5.11",
         "burst_endpoint": "/exercise/burst",
         "auto_take_profit": str(s.auto_take_profit),
         "auto_stop_loss": str(s.auto_stop_loss),
@@ -2053,7 +2126,7 @@ async def health() -> dict[str, Any]:
 @app.get("/ping")
 async def ping() -> dict[str, str]:
     """Lightweight keep-alive for cron pings (prevents Render free-tier cold starts)."""
-    return {"status": "ok", "version": "5.5.10"}
+    return {"status": "ok", "version": "5.5.11"}
 
 
 def _burst_paper_guard(settings: Settings) -> str | None:
@@ -2064,15 +2137,21 @@ def _burst_paper_guard(settings: Settings) -> str | None:
     return None
 
 
-def _parse_burst_count(payload: dict[str, Any], query_count: int | None) -> int:
+def _parse_burst_count(
+    payload: dict[str, Any],
+    query_count: int | None,
+    *,
+    max_count: int = 10,
+) -> int:
+    cap = max(1, int(max_count))
     raw = payload.pop("burstCount", None) or payload.pop("burst_count", None)
     if raw is not None:
         try:
-            return max(1, min(int(raw), 200))
+            return max(1, min(int(raw), cap))
         except (TypeError, ValueError):
             pass
     if query_count is not None:
-        return max(1, min(int(query_count), 200))
+        return max(1, min(int(query_count), cap))
     return 1
 
 
@@ -2086,7 +2165,7 @@ async def exercise_burst_endpoint(
     """
     Paper validation burst: N sequential exercise fills (min $0.05 credit, sync chase).
     Query: ?count=N&interval=2  or JSON burstCount + webhookSecret.
-    Max 200 per request; use scripts/burst_paper_fills.py for long runs with client-side pacing.
+    Max BURST_MAX_COUNT per request (default 10 on Render); use burst_paper_fills.py for client-side pacing.
     """
     settings = get_settings()
     dry_run = not settings.is_live
@@ -2108,7 +2187,7 @@ async def exercise_burst_endpoint(
     if auth_err:
         return webhook_auth_json_response(auth_err, dry_run=dry_run, kind="entry")
 
-    burst_n = _parse_burst_count(payload, count)
+    burst_n = _parse_burst_count(payload, count, max_count=settings.burst_max_count)
     interval_sec = float(payload.pop("burstInterval", payload.pop("burst_interval", interval)) or interval)
 
     payload = dict(payload)
@@ -2140,13 +2219,14 @@ async def exercise_burst_endpoint(
             content={"success": False, "message": str(exc), "dry_run": dry_run},
         )
 
+    slim = _burst_response_payload(result)
     return JSONResponse(
         status_code=200,
         content={
-            "success": result["success"],
-            "message": f"Burst complete: {result['filled_count']}/{result['burst_count']} filled",
+            "success": slim["success"],
+            "message": f"Burst complete: {slim['filled_count']}/{slim['burst_count']} filled",
             "dry_run": dry_run,
-            **result,
+            **slim,
         },
     )
 
@@ -2190,7 +2270,7 @@ async def exercise_entry_endpoint(
     payload["fillMode"] = "exercise"
     payload.setdefault("action", "PUT_CREDIT_SPREAD")
 
-    burst_n = _parse_burst_count(payload, None)
+    burst_n = _parse_burst_count(payload, None, max_count=settings.burst_max_count)
     if burst_n > 1:
         try:
             signal = coerce_signal(payload, settings)
@@ -2216,13 +2296,14 @@ async def exercise_entry_endpoint(
                 status_code=200,
                 content={"success": False, "message": str(exc), "dry_run": dry_run},
             )
+        slim = _burst_response_payload(result)
         return JSONResponse(
             status_code=200,
             content={
-                "success": result["success"],
-                "message": f"Burst complete: {result['filled_count']}/{result['burst_count']} filled",
+                "success": slim["success"],
+                "message": f"Burst complete: {slim['filled_count']}/{slim['burst_count']} filled",
                 "dry_run": dry_run,
-                **result,
+                **slim,
             },
         )
 
@@ -2305,7 +2386,7 @@ async def entry_endpoint(
 
     burst_raw = payload.get("burstCount") or payload.get("burst_count")
     if burst_raw is not None and settings.is_alpaca_paper:
-        burst_n = _parse_burst_count(dict(payload), None)
+        burst_n = _parse_burst_count(dict(payload), None, max_count=settings.burst_max_count)
         if burst_n > 1:
             guard = _burst_paper_guard(settings)
             if guard:
@@ -2344,14 +2425,15 @@ async def entry_endpoint(
                     status_code=200,
                     content={"success": False, "message": str(exc), "dry_run": dry_run, "notifications": {}},
                 )
+            slim = _burst_response_payload(result)
             return JSONResponse(  # type: ignore[return-value]
                 status_code=200,
                 content={
-                    "success": result["success"],
-                    "message": f"Burst complete: {result['filled_count']}/{result['burst_count']} filled",
+                    "success": slim["success"],
+                    "message": f"Burst complete: {slim['filled_count']}/{slim['burst_count']} filled",
                     "dry_run": dry_run,
                     "notifications": {},
-                    **result,
+                    **slim,
                 },
             )
 

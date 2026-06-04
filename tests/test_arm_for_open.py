@@ -61,6 +61,34 @@ def test_arm_writes_session_grant_12h(arm_env):
     assert 11.5 <= hours <= 12.5
 
 
+def test_spawn_skips_dedupe_when_gui_open():
+    with (
+        patch.object(afo.cc, "arm_should_skip_supervisor_ops", return_value=True),
+        patch.object(afo.cc, "gui_team_active", return_value=True),
+        patch.object(afo, "run_dedupe") as dedupe,
+    ):
+        skipped = afo.spawn_command_center()
+    assert skipped is True
+    dedupe.assert_not_called()
+
+
+def test_spawn_runs_dedupe_when_gui_closed():
+    with (
+        patch.object(afo.cc, "arm_should_skip_supervisor_ops", return_value=False),
+        patch.object(afo, "command_center_running", return_value=True),
+        patch.object(afo, "run_dedupe") as dedupe,
+    ):
+        skipped = afo.spawn_command_center()
+    assert skipped is False
+    dedupe.assert_called_once()
+
+
+def test_append_sync_brief_gui_preserved(arm_env):
+    afo.append_sync_brief(gui_team_preserved=True)
+    text = (arm_env["sync"] / "grok_outbox.md").read_text(encoding="utf-8")
+    assert "GUI Command Center team preserved" in text
+
+
 def test_arm_full_flow_mocked(arm_env):
     stop = arm_env["desktop"] / "STOP-REDUNDANT-TESTS.txt"
     stop.write_text("stop\n", encoding="utf-8")

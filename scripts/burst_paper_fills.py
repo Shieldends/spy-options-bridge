@@ -177,6 +177,12 @@ def main() -> int:
 
     base_url = "http://127.0.0.1:8000" if args.local else RENDER
     log_file = Path(args.log)
+    if not args.local and args.batch_size > 10:
+        print(
+            "WARN: Render caps /exercise/burst at 10 per request (OOM guard). "
+            "Use --batch-size 5 or keep default 1; total --count can stay high."
+        )
+        args.batch_size = min(args.batch_size, 10)
 
     hr = httpx.get(f"{base_url}/health", timeout=30)
     if not hr.is_success:

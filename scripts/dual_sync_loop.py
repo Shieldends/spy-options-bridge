@@ -25,7 +25,10 @@ ET = ZoneInfo("America/New_York")
 
 def log(msg: str) -> None:
     line = f"{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S ET')} {redact_line(msg)}"
-    print(line)
+    try:
+        print(line)
+    except UnicodeEncodeError:
+        print(line.encode("ascii", errors="replace").decode("ascii"))
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with LOG_PATH.open("a", encoding="utf-8") as fh:
         fh.write(line + "\n")
@@ -69,13 +72,21 @@ def heartbeat_cycle(prev_mtime: dict[str, float]) -> dict[str, float]:
     changed = [n for n in WATCH_FILES if cur_mtime.get(n, 0) != prev_mtime.get(n, 0)]
     change_note = f" changed={','.join(changed)}" if changed else ""
     log(f"HEARTBEAT | {' | '.join(parts)}{change_note}")
+    try:
+        from cursor_handoff import drain_pending_fixes  # noqa: E402
+
+        n = drain_pending_fixes()
+        if n:
+            log(f"cursor handoff drained {n} pending fix(es)")
+    except Exception as exc:
+        log(f"cursor handoff drain skipped: {type(exc).__name__}")
     run_append_sync()
     return cur_mtime
 
 
 def main() -> int:
     log(
-        "dual_sync_loop started — HEARTBEAT every 60s; "
+        "dual_sync_loop started - HEARTBEAT every 60s; "
         "Grok appends grok_outbox; Cursor reads grok_outbox each cycle"
     )
     prev = {name: 0.0 for name in WATCH_FILES}

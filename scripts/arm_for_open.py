@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 import time
@@ -15,7 +16,9 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 
+import command_center as cc  # noqa: E402
 import operator_gateway as og  # noqa: E402
+from cursor_handoff import handoff_arm_session  # noqa: E402
 
 DESKTOP = Path(r"C:\Users\Shiel\Desktop")
 SYNC_DIR = Path(r"C:\Users\Shiel\Projects\spy-hybrid-v3\sync")
@@ -48,6 +51,13 @@ def python_exe() -> Path:
     return venv if venv.exists() else Path(sys.executable)
 
 
+def _utf8_child_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
+
+
 def confirm_arm(*, yes: bool, countdown_sec: int = 5) -> bool:
     if yes:
         log("confirm: --yes (non-interactive)")
@@ -55,7 +65,7 @@ def confirm_arm(*, yes: bool, countdown_sec: int = 5) -> bool:
     _safe_print("")
     _safe_print("ARM FOR OPEN - minimal mode")
     _safe_print(f"  - Session operator grant ({og.load_config().get('arm_grant_hours', 12)}h)")
-    _safe_print("  - Command center supervisor (if not running)")
+    _safe_print("  - Command center supervisor (if not running; skipped when GUI is open)")
     _safe_print("  - Clear STOP-REDUNDANT-TESTS.txt")
     _safe_print("  - 9:31 ET burst task (weekdays)")
     _safe_print("")
@@ -111,23 +121,97 @@ def command_center_running() -> bool:
     return bool(pid and pid.isdigit())
 
 
-def spawn_command_center() -> None:
+def _supervisor_pids() -> list[int]:
+    if sys.platform != "win32":
+        return []
+    ps = (
+        "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
+        "Where-Object { $_.CommandLine -match 'command_center(\\.py|_gui\\.py)' } | "
+        "Select-Object -ExpandProperty ProcessId"
+    )
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return []
+    out: list[int] = []
+    for line in (proc.stdout or "").splitlines():
+        line = line.strip()
+        if line.isdigit():
+            out.append(int(line))
+    return sorted(set(out))
+
+
+def run_dedupe(
+    *,
+    exclude_pids: list[int] | None = None,
+    only: list[str] | None = None,
+) -> None:
     py = python_exe()
     dedupe = SCRIPTS / "dedupe_spy_workers.py"
-    if dedupe.is_file():
-        try:
-            subprocess.run([str(py), str(dedupe)], cwd=str(ROOT), capture_output=True, timeout=60)
-            log("dedupe_spy_workers completed")
-        except (subprocess.TimeoutExpired, OSError) as exc:
-            log(f"dedupe_spy_workers skipped: {type(exc).__name__}")
-    if command_center_running():
-        log("command_center already running — skip spawn")
+    if not dedupe.is_file():
         return
+    cmd = [str(py), str(dedupe)]
+    for script in only or []:
+        cmd.extend(["--only", script])
+    for pid in exclude_pids or []:
+        cmd.extend(["--exclude-pid", str(pid)])
+    try:
+        subprocess.run(
+            cmd,
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+        )
+        log("dedupe_spy_workers completed")
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        log(f"dedupe_spy_workers skipped: {type(exc).__name__}")
+
+
+def spawn_command_center() -> bool:
+    """Start console supervisor unless GUI Command Center is managing workers. Returns True if skipped."""
+    if cc.arm_should_skip_supervisor_ops():
+        log("GUI open — skip console spawn (use the open Command Center window)")
+        return True
+    if cc.team_ready_for_display():
+        log("Team already on standby — skip console spawn (open SPY-LIVE-COMMAND.bat only if you want the window)")
+        return True
+    if cc.team_workers_running() and cc.command_center_running():
+        log("console supervisor + helpers already running — skip spawn")
+        return False
+    run_dedupe(exclude_pids=[], only=["command_center.py", "command_center_gui.py"])
+    if command_center_running():
+        log("command_center already running - skip spawn")
+        return False
+    time.sleep(2)
+    if command_center_running():
+        log("command_center already running (after wait) - skip spawn")
+        return False
     py = python_exe()
     cmd = [str(py), str(SCRIPTS / "command_center.py")]
-    flags = subprocess.CREATE_NEW_CONSOLE if sys.platform == "win32" else 0
-    subprocess.Popen(cmd, cwd=str(ROOT), creationflags=flags)
+    flags = 0
+    if sys.platform == "win32":
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    subprocess.Popen(cmd, cwd=str(ROOT), creationflags=flags, env=_utf8_child_env())
     log("spawned command_center.py supervisor")
+    time.sleep(6)
+    keep = _supervisor_pids()
+    if keep:
+        run_dedupe(
+            exclude_pids=[max(keep)],
+            only=["command_center.py", "command_center_gui.py"],
+        )
+        log(f"post-spawn dedupe kept supervisor PID {max(keep)}")
+    return False
 
 
 def register_burst_task(*, skip_schtask: bool = False) -> None:
@@ -166,14 +250,19 @@ def register_burst_task(*, skip_schtask: bool = False) -> None:
         log(f"schtask WARN exit={proc.returncode}: {out[:200]}")
 
 
-def append_sync_brief() -> None:
+def append_sync_brief(*, gui_team_preserved: bool = False) -> None:
     ts = datetime.now(ET).strftime("%Y-%m-%d %H:%M ET")
     outbox = SYNC_DIR / "grok_outbox.md"
     outbox.parent.mkdir(parents=True, exist_ok=True)
+    supervisor_line = (
+        "- GUI Command Center team preserved (ARM skipped dedupe/console spawn)\n"
+        if gui_team_preserved
+        else "- Command center supervisor running\n"
+    )
     block = (
         f"\n\n---\n## {ts} — ARMED minimal mode\n"
         "- Operator session grant (market day)\n"
-        "- Command center supervisor running\n"
+        f"{supervisor_line}"
         "- Redundant tests cleared; burst 9:31 ET scheduled\n"
         "- Revoke operator: delete Desktop\\OPERATOR-GRANT.json\n"
         "- Full stop: Command Center STOP ALL\n"
@@ -202,9 +291,14 @@ def arm(*, yes: bool = False, skip_schtask: bool = False, create_marker: bool = 
 
     write_arm_grant(cfg)
     clear_stop_file()
-    spawn_command_center()
+    gui_preserved = spawn_command_center()
     register_burst_task(skip_schtask=skip_schtask)
-    append_sync_brief()
+    append_sync_brief(gui_team_preserved=gui_preserved)
+    try:
+        handoff_arm_session(gui_team_preserved=gui_preserved)
+        log("cursor handoff written → sync/cursor_inbox.md")
+    except Exception as exc:
+        log(f"cursor handoff skipped: {type(exc).__name__}")
     if create_marker:
         touch_auto_arm_marker()
 

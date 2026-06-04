@@ -16,5 +16,6 @@ Operator: grant via ARM only; revoke = delete Desktop\OPERATOR-GRANT.json.
 
 Grok: append fill diagnostics to Projects\spy-hybrid-v3\sync\grok_outbox.md on FAIL.
 Cursor: bridge/deploy; read sync\cursor_inbox.md RULES + ACTIONS COMPLETE section.
+After code fixes: launchers\HANDOFF-TO-CURSOR.bat "summary" (auto on ARM + dual_sync drain).
 
 Logs: Desktop\BURST-PAPER-LOG.txt, REDUNDANT-TEST-LOG.txt, ARM-FOR-OPEN.log

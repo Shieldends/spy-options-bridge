@@ -1,0 +1,25 @@
+﻿SPY Render OOM fix + go A+E | 2026-06-04
+========================================
+
+RENDER MEMORY (on our side — deploy v5.5.11)
+  Cause: large /exercise/burst (e.g. count=100) on free tier ~512MB
+  Fix: BURST_MAX_COUNT=10, max 2 chase tasks, slim API response
+  Live MACD: brief 502 if Render restarts — avoid BURST-PAPER-100 during session
+  Doc: docs\RENDER-MEMORY.md
+
+IMPLEMENTED (repo — push + Manual Deploy)
+  go A+E — fill chase env + PAPER-FILL-TEST + PAPER-PNL-AUDIT
+  Render guard — main.py + render.yaml v5.5.11
+
+YOUR STEPS
+  1. Git push → Render Manual Deploy
+  2. GET /health → version 5.5.11
+  3. Do NOT run BURST-PAPER-100 during live MACD window
+  4. Unset REDUNDANT_BURST_EACH_CYCLE on PC if set
+  5. RTH: PUSH-PAPER-FILL-TEST.bat + PAPER-PNL-AUDIT.bat --try-entry
+
+NOT STARTED
+  Track D (0dte hold) — reply go D after fills look good
+
+BRIDGE
+  https://spy-options-bridge.onrender.com/health

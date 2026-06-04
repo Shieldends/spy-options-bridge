@@ -47,7 +47,10 @@ def _load_dotenv() -> None:
 def log_line(msg: str) -> None:
     ts = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
     line = f"{ts} {msg}"
-    print(line)
+    try:
+        print(line)
+    except UnicodeEncodeError:
+        print(line.encode("ascii", errors="replace").decode("ascii"))
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with LOG_PATH.open("a", encoding="utf-8") as fh:
         fh.write(line + "\n")
@@ -58,7 +61,7 @@ def should_stop() -> str | None:
         return f"STOP file present: {STOP_FILE}"
     now = datetime.now(ET)
     if market_session_open(now):
-        return "Market open reached (9:30 AM ET) — live run begins"
+        return "Market open reached (9:30 AM ET) - live run begins"
     return None
 
 
@@ -188,7 +191,7 @@ def main() -> int:
 
     if STOP_FILE.exists():
         STOP_FILE.unlink(missing_ok=True)
-        log_line("Cleared old STOP file — starting fresh")
+        log_line("Cleared old STOP file - starting fresh")
 
     log_line(f"redundant_test_loop started interval={args.interval}s (Ctrl+C or STOP file or 9:30 ET to end)")
 

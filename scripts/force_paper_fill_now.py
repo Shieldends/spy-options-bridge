@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
-"""Fire one paper entry via Render and poll Alpaca until filled or timeout."""
+"""Fire one paper entry via Render /exercise/entry (sync chase) and poll Alpaca."""
 from __future__ import annotations
 
-import os
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import httpx
 
 ROOT = Path(__file__).resolve().parents[1]
 ENV = ROOT / ".env"
+RENDER = "https://spy-options-bridge.onrender.com"
+RESULT_PATH = Path(r"C:\Users\Shiel\Desktop\PAPER-FILL-TEST-RESULT.txt")
+ET = ZoneInfo("America/New_York")
 
 
 def load_env() -> dict[str, str]:
@@ -26,6 +30,14 @@ def load_env() -> dict[str, str]:
     return out
 
 
+def write_result(lines: list[str]) -> None:
+    ts = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
+    body = "\n".join([f"PAPER FILL TEST | {ts}", ""] + lines) + "\n"
+    RESULT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    RESULT_PATH.write_text(body, encoding="utf-8")
+    print(body)
+
+
 def main() -> int:
     env = load_env()
     secret = env.get("WEBHOOK_SECRET", "")
@@ -34,7 +46,7 @@ def main() -> int:
     base = env.get("APCA_API_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
 
     if not secret:
-        print("WEBHOOK_SECRET missing in .env")
+        write_result(["FAIL: WEBHOOK_SECRET missing in .env"])
         return 1
 
     signal_price = 590.0
@@ -55,7 +67,6 @@ def main() -> int:
                     break
             except Exception as exc:
                 print("quote fallback:", exc)
-    print(f"signalPrice={signal_price:.2f}")
 
     body = {
         "webhookSecret": secret,
@@ -67,39 +78,33 @@ def main() -> int:
         "strikeOffsetLong": -6,
         "quantity": 1,
         "fillMode": "exercise",
-        "limitCredit": 0.55,
     }
-    print(f"POST /entry signalPrice={signal_price}")
-    r = httpx.post("https://spy-options-bridge.onrender.com/entry", json=body, timeout=120)
-    data = r.json()
-    print("HTTP", r.status_code, data.get("message"))
+    print(f"POST {RENDER}/exercise/entry signalPrice={signal_price:.2f}")
+    try:
+        r = httpx.post(f"{RENDER}/exercise/entry", json=body, timeout=180)
+        data = r.json()
+    except Exception as exc:
+        write_result([f"FAIL: HTTP {type(exc).__name__}: {exc}"])
+        return 1
 
-    if not key or not sec:
-        print("No Alpaca keys in .env — check Alpaca orders manually in ~30s")
-        return 0
+    filled = bool(data.get("filled"))
+    status = data.get("status", "?")
+    oid = str(data.get("order_id") or "")[:12]
+    msg = data.get("message", "")
 
-    h = {"Apca-Api-Key-Id": key, "Apca-Api-Secret-Key": sec}
-    deadline = time.time() + 90
-    last_id = None
-    while time.time() < deadline:
-        orr = httpx.get(f"{base}/v2/orders?status=all&limit=5&direction=desc", headers=h, timeout=20)
-        if orr.is_success:
-            for o in orr.json():
-                if o.get("order_class") != "mleg":
-                    continue
-                oid = o.get("id")
-                st = o.get("status")
-                lp = o.get("limit_price")
-                if oid != last_id:
-                    print(f"order {oid[:8]}… status={st} limit={lp}")
-                    last_id = oid
-                if st == "filled":
-                    print("FILLED — check Alpaca Positions tab")
-                    return 0
-        time.sleep(4)
-
-    print("Not filled in 90s — check Alpaca Orders (may still be new near close)")
-    return 1
+    lines = [
+        f"HTTP {r.status_code}",
+        f"filled={'YES' if filled else 'NO'}",
+        f"status={status}",
+        f"order_id={oid}",
+        f"message={msg}",
+        "",
+        "Check Alpaca APP → Activities (not Orders tab alone).",
+    ]
+    if not filled:
+        lines.append("Tip: run during RTH 9:30-16 ET; check open_mleg_count on /health.")
+    write_result(lines)
+    return 0 if filled else 1
 
 
 if __name__ == "__main__":

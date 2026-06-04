@@ -26,12 +26,13 @@ def test_parse_burst_count_from_json():
 
 def test_parse_burst_count_from_query():
     payload = {"ticker": "SPY"}
-    assert _parse_burst_count(payload, 25) == 25
+    assert _parse_burst_count(payload, 25, max_count=25) == 25
+    assert _parse_burst_count(payload, 25) == 10  # default cap
 
 
 def test_parse_burst_count_clamps():
-    payload = {"burstCount": 999}
-    assert _parse_burst_count(payload, None) == 200
+    assert _parse_burst_count({"burstCount": 999}, None, max_count=10) == 10
+    assert _parse_burst_count({"burstCount": 999}, None, max_count=200) == 200
 
 
 def test_burst_paper_guard_requires_paper(monkeypatch):
