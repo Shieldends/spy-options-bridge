@@ -1,5 +1,5 @@
 """
-spy-options-bridge v5.5.11 — ALPACA PAPER (default broker)
+spy-options-bridge v5.5.12 — ALPACA PAPER (default broker)
 
 TradingView webhook → Render → Alpaca multi-leg SPY put credit spreads.
 
@@ -22,6 +22,7 @@ Endpoints:
   POST /entry           — Alpaca mleg entry + GTC take-profit + GTC stop-loss
   POST /webhook         — alias for /entry
   POST /warning         — danger zone: notify + optional auto-close spread
+  POST /close-put       — conservative batched buy-to-close for short puts
   POST /exercise/entry  — sync paper fill test (exercise mode, chase fill)
   POST /exercise/burst  — paper-only N-fill burst (?count=N or burstCount)
 """
@@ -196,6 +197,7 @@ def get_settings() -> Settings:
 class SpreadStrategy(str, Enum):
     PUT_CREDIT_SPREAD = "put_credit_spread"
     CALL_CREDIT_SPREAD = "call_credit_spread"
+    SHORT_PUT = "short_put"
 
 
 class TradingViewSignal(BaseModel):
@@ -212,6 +214,7 @@ class TradingViewSignal(BaseModel):
     expiration: str = "0dte"
     dte_filter: str | None = Field(default=None, alias="dteFilter")
     action: str = "enter"
+    entry_batch_size: int | None = Field(default=None, alias="entryBatchSize")
 
     model_config = {"populate_by_name": True}
 
@@ -248,12 +251,18 @@ class TradingViewSignal(BaseModel):
 
     @model_validator(mode="after")
     def resolve_strategy(self) -> "TradingViewSignal":
-        if self.action in {"PUT_CREDIT_SPREAD", "PUT CREDIT SPREAD"}:
+        if self.action in {"SHORT_PUT", "SHORT PUT", "SELL_PUT", "SELL PUT"}:
+            self.strategy = SpreadStrategy.SHORT_PUT
+        elif self.action in {"PUT_CREDIT_SPREAD", "PUT CREDIT SPREAD"}:
             self.strategy = SpreadStrategy.PUT_CREDIT_SPREAD
         elif self.action in {"CALL_CREDIT_SPREAD", "CALL CREDIT SPREAD"}:
             self.strategy = SpreadStrategy.CALL_CREDIT_SPREAD
         elif self.strategy is None:
             self.strategy = SpreadStrategy.PUT_CREDIT_SPREAD
+        if self.strategy == SpreadStrategy.SHORT_PUT:
+            if self.short_strike is None and self.signal_price is None:
+                raise ValueError("SHORT_PUT requires short_strike or signalPrice")
+            return self
         if self.short_strike is not None and self.long_strike is not None:
             return self
         if self.signal_price is None:
@@ -263,6 +272,39 @@ class TradingViewSignal(BaseModel):
     @property
     def uses_explicit_strikes(self) -> bool:
         return self.short_strike is not None and self.long_strike is not None
+
+    @property
+    def is_short_put(self) -> bool:
+        return self.strategy == SpreadStrategy.SHORT_PUT
+
+
+class ClosePutSignal(BaseModel):
+    """Conservative batched buy-to-close for naked short puts."""
+
+    ticker: str
+    short_strike: float | None = Field(default=None, alias="short_strike")
+    expiration: str | None = None
+    dte_filter: str | None = Field(default=None, alias="dteFilter")
+    quantity: int | None = None
+    batch_size: int = Field(default=6, alias="batchSize")
+    bid_premium: float = Field(default=0.03, alias="bidPremium")
+    chase_step: float = Field(default=0.02, alias="chaseStep")
+    max_chase_steps: int = Field(default=3, alias="maxChaseSteps")
+    close_mode: str = Field(default="conservative", alias="closeMode")
+
+    model_config = {"populate_by_name": True}
+
+    @field_validator("ticker")
+    @classmethod
+    def normalize_ticker(cls, value: str) -> str:
+        return value.upper().replace(" ", "")
+
+    @field_validator("batch_size", "quantity", mode="before")
+    @classmethod
+    def coerce_positive_int(cls, value: Any) -> int | None:
+        if value is None or value == "":
+            return None
+        return max(int(float(value)), 1)
 
 
 class WarningSignal(BaseModel):
@@ -385,6 +427,39 @@ def format_occ_symbol(underlying: str, expiration: str, option_type: str, strike
 def to_tastytrade_symbol(compact: str) -> str:
     idx = next(i for i, ch in enumerate(compact) if ch.isdigit())
     return compact[:idx].ljust(6) + compact[idx:]
+
+
+def build_short_put_package(signal: TradingViewSignal, settings: Settings) -> SpreadPackage:
+    expiration = resolve_dte_expiration(signal.expiration, signal.dte_filter or settings.default_dte_filter)
+    if signal.short_strike is not None:
+        short_strike = float(signal.short_strike)
+    else:
+        atm = _round_strike(signal.signal_price)  # type: ignore[arg-type]
+        short_strike = atm + signal.strike_offset_short
+
+    limit_credit = signal.limit_credit if signal.limit_credit is not None else settings.default_limit_credit
+    put_sym = format_occ_symbol(signal.ticker, expiration, "put", short_strike)
+
+    return SpreadPackage(
+        qty=str(signal.quantity),
+        legs=[SpreadLeg(symbol=put_sym, side="sell", position_intent="sell_to_open")],
+        metadata={
+            "underlying": signal.ticker,
+            "strategy": SpreadStrategy.SHORT_PUT.value,
+            "expiration": expiration,
+            "short_strike": short_strike,
+            "limit_credit": limit_credit,
+            "single_leg": True,
+            "dte_filter": signal.dte_filter or settings.default_dte_filter,
+            "entry_batch_size": signal.entry_batch_size,
+        },
+    )
+
+
+def build_order_from_signal(signal: TradingViewSignal, settings: Settings) -> SpreadPackage:
+    if signal.is_short_put:
+        return build_short_put_package(signal, settings)
+    return build_spread(signal, settings)
 
 
 def build_spread(signal: TradingViewSignal, settings: Settings) -> SpreadPackage:
@@ -599,6 +674,28 @@ def estimate_credit_from_quotes(
     Put/call credit spread entry: sell short leg, buy long leg.
     Natural credit ≈ short_bid - long_ask (aggressive leans lower for faster fill).
     """
+    if spread.metadata.get("single_leg") or len(spread.legs) == 1:
+        short_sym = spread.legs[0].symbol.upper()
+        short_q = quotes.get(short_sym, {})
+        short_bid = short_q.get("bid", 0.0)
+        meta: dict[str, Any] = {"short_bid": short_bid, "fill_mode": mode, "quote_source": "single_leg"}
+        if short_bid <= 0:
+            fallback = _quote_fallback_credit(cap)
+            meta["quote_source"] = "fallback_no_quotes"
+            return fallback, meta
+        if mode == "aggressive":
+            credit = max(short_bid * 0.85 - 0.02, 0.05)
+        elif mode == "exercise":
+            credit = max(short_bid * 0.55 - 0.05, 0.05)
+        else:
+            credit = max(short_bid * 0.95, 0.05)
+        credit = round(credit, 2)
+        if cap is not None and cap > 0:
+            credit = min(credit, round(cap, 2))
+            meta["cap_applied"] = cap
+        meta["limit_credit_final"] = credit
+        return credit, meta
+
     short_sym = spread.legs[0].symbol.upper()
     long_sym = spread.legs[1].symbol.upper()
     short_q = quotes.get(short_sym, {})
@@ -697,8 +794,45 @@ async def resolve_entry_limit_credit(
     )
 
 
+def snap_short_put_strike(target: float, available: list[float]) -> float:
+    """Pick nearest listed put strike at or below target (OTM short put)."""
+    if not available:
+        return target
+    candidates = [s for s in available if s <= target]
+    if candidates:
+        return max(candidates)
+    return min(available, key=lambda s: abs(s - target))
+
+
+async def align_short_put_to_alpaca(
+    settings: Settings,
+    spread: SpreadPackage,
+    signal: TradingViewSignal,
+) -> SpreadPackage:
+    expiration = str(spread.metadata["expiration"])
+    underlying = str(spread.metadata["underlying"])
+    target = float(spread.metadata["short_strike"])
+    available = await fetch_alpaca_option_strikes(settings, underlying, expiration, "put")
+    if not available:
+        logger.warning("No Alpaca strikes for %s %s short put — using computed strike", underlying, expiration)
+        return spread
+
+    snapped = snap_short_put_strike(target, available)
+    if snapped != target:
+        logger.info("Snapped %s short put strike %.2f→%.2f", underlying, target, snapped)
+
+    put_sym = format_occ_symbol(underlying, expiration, "put", snapped)
+    return SpreadPackage(
+        qty=spread.qty,
+        legs=[SpreadLeg(symbol=put_sym, side="sell", position_intent="sell_to_open")],
+        metadata={**spread.metadata, "short_strike": snapped, "strikes_snapped": snapped != target},
+    )
+
+
 async def align_spread_to_alpaca(settings: Settings, spread: SpreadPackage, signal: TradingViewSignal) -> SpreadPackage:
     """Snap strikes to Alpaca-listed contracts and rebuild OCC symbols."""
+    if spread.metadata.get("single_leg"):
+        return await align_short_put_to_alpaca(settings, spread, signal)
     if signal.uses_explicit_strikes:
         short_strike = float(signal.short_strike)  # type: ignore[arg-type]
         long_strike = float(signal.long_strike)  # type: ignore[arg-type]
@@ -798,8 +932,38 @@ def build_alpaca_mleg_payload(
     }
 
 
+def build_alpaca_single_leg_payload(
+    spread: SpreadPackage,
+    *,
+    limit_price: float,
+    opening: bool,
+    time_in_force: str = "day",
+) -> dict:
+    """Alpaca single-leg option order (naked short put or buy-to-close)."""
+    leg = spread.legs[0]
+    if opening:
+        return {
+            "symbol": leg.symbol,
+            "qty": spread.qty,
+            "side": "sell",
+            "type": "limit",
+            "limit_price": f"{round(limit_price, 2):.2f}",
+            "time_in_force": time_in_force,
+        }
+    return {
+        "symbol": leg.symbol,
+        "qty": spread.qty,
+        "side": "buy",
+        "type": "limit",
+        "limit_price": f"{round(limit_price, 2):.2f}",
+        "time_in_force": time_in_force,
+    }
+
+
 def build_alpaca_entry_payload(spread: SpreadPackage) -> dict:
     credit = float(spread.metadata["limit_credit"])
+    if spread.metadata.get("single_leg"):
+        return build_alpaca_single_leg_payload(spread, limit_price=credit, opening=True, time_in_force="day")
     return build_alpaca_mleg_payload(spread, limit_price=credit, time_in_force="day", closing=False)
 
 
@@ -1021,6 +1185,54 @@ def find_put_credit_spreads_in_positions(
                 credit = 0.35
             spreads.append(spread_from_put_credit_position(sp, lp, qty=qty, credit=abs(credit)))
     return spreads
+
+
+def find_short_puts_in_positions(
+    positions: list[dict[str, Any]],
+    ticker: str,
+    *,
+    short_strike: float | None = None,
+    expiration: str | None = None,
+    strike_tolerance: float = 0.51,
+) -> list[dict[str, Any]]:
+    """Return open short put positions (qty < 0) for ticker."""
+    ticker = ticker.upper()
+    matches: list[dict[str, Any]] = []
+    for p in positions:
+        sym = str(p.get("symbol", ""))
+        meta = parse_occ_symbol(sym)
+        if not meta or meta["underlying"] != ticker or meta["option_type"] != "put":
+            continue
+        try:
+            qty = int(float(p.get("qty", 0)))
+        except (TypeError, ValueError):
+            continue
+        if qty >= 0:
+            continue
+        if short_strike is not None and abs(meta["strike"] - short_strike) > strike_tolerance:
+            continue
+        if expiration and meta.get("expiration") != expiration:
+            continue
+        matches.append({**p, "_meta": meta, "_qty": abs(qty)})
+    return matches
+
+
+def split_batches(total_qty: int, batch_size: int) -> list[int]:
+    size = max(batch_size, 1)
+    batches: list[int] = []
+    remaining = total_qty
+    while remaining > 0:
+        chunk = min(size, remaining)
+        batches.append(chunk)
+        remaining -= chunk
+    return batches
+
+
+def conservative_close_limit(bid: float, bid_premium: float) -> float:
+    """Limit slightly above bid — faster fill, conservative style."""
+    if bid <= 0:
+        return round(bid_premium + 0.05, 2)
+    return round(bid + bid_premium, 2)
 
 
 async def fetch_alpaca_positions(settings: Settings) -> list[dict[str, Any]]:
@@ -1806,6 +2018,45 @@ async def run_burst_attempts(
         _burst_in_progress = False
 
 
+async def submit_short_put_batches(
+    settings: Settings,
+    spread: SpreadPackage,
+    signal: TradingViewSignal,
+    *,
+    dry_run: bool,
+) -> OrderResult:
+    """Split large short-put entries into smaller batches (low-liquidity tickers)."""
+    total_qty = int(spread.qty)
+    batch_size = int(spread.metadata.get("entry_batch_size") or 0)
+    if batch_size <= 0 or batch_size >= total_qty:
+        entry_payload = build_alpaca_entry_payload(spread) if settings.use_alpaca else build_entry_payload(spread)
+        return await submit_order(settings, entry_payload, dry_run=dry_run)
+
+    batches = split_batches(total_qty, batch_size)
+    last_result = OrderResult(success=False, message="No batches submitted", dry_run=dry_run)
+    filled = 0
+    for i, qty in enumerate(batches, start=1):
+        batch_spread = SpreadPackage(
+            qty=str(qty),
+            legs=spread.legs,
+            metadata={**spread.metadata, "batch_index": i, "batch_total": len(batches)},
+        )
+        payload = build_alpaca_entry_payload(batch_spread) if settings.use_alpaca else build_entry_payload(batch_spread)
+        result = await submit_order(settings, payload, dry_run=dry_run)
+        last_result = result
+        if result.success:
+            filled += qty
+        if i < len(batches):
+            await asyncio.sleep(0.5)
+    return OrderResult(
+        success=filled > 0,
+        message=f"Short put batches: {filled}/{total_qty} contracts submitted ({len(batches)} orders)",
+        dry_run=dry_run,
+        payload={"filled_qty": filled, "total_qty": total_qty, "batches": len(batches)},
+        broker_response=last_result.broker_response,
+    )
+
+
 async def submit_entry_from_signal(
     settings: Settings,
     signal: TradingViewSignal,
@@ -1815,7 +2066,7 @@ async def submit_entry_from_signal(
     entry_credit is limit credit used for Alpaca chase scheduling.
     """
     dry_run = not settings.is_live
-    spread = build_spread(signal, settings)
+    spread = build_order_from_signal(signal, settings)
     if settings.use_alpaca:
         spread = await align_spread_to_alpaca(settings, spread, signal)
         spread = await resolve_entry_limit_credit(settings, spread, signal)
@@ -1830,13 +2081,13 @@ async def submit_entry_from_signal(
         if danger and risk_msg:
             await notify(settings, "Entry Near Danger Zone", risk_msg, "CRITICAL")
 
-    entry_payload = build_alpaca_entry_payload(spread) if settings.use_alpaca else build_entry_payload(spread)
-    logger.info("Submitting %s entry order", "Alpaca mleg" if settings.use_alpaca else "Tastytrade")
+    order_kind = "Alpaca single-leg" if spread.metadata.get("single_leg") else "Alpaca mleg"
+    logger.info("Submitting %s entry order", order_kind if settings.use_alpaca else "Tastytrade")
 
     if settings.use_alpaca and settings.auto_cancel_conflicting_orders and settings.alpaca_configured:
         leg_syms = {leg.symbol for leg in spread.legs}
         sym_canceled = await cancel_alpaca_open_orders_for_symbols(settings, leg_syms)
-        mleg_canceled = await cancel_open_mleg_orders(settings)
+        mleg_canceled = 0 if spread.metadata.get("single_leg") else await cancel_open_mleg_orders(settings)
         total = sym_canceled + mleg_canceled
         if total:
             logger.info(
@@ -1846,7 +2097,11 @@ async def submit_entry_from_signal(
                 mleg_canceled,
             )
 
-    entry = await submit_order(settings, entry_payload, dry_run=dry_run)
+    if signal.is_short_put and spread.metadata.get("entry_batch_size"):
+        entry = await submit_short_put_batches(settings, spread, signal, dry_run=dry_run)
+    else:
+        entry_payload = build_alpaca_entry_payload(spread) if settings.use_alpaca else build_entry_payload(spread)
+        entry = await submit_order(settings, entry_payload, dry_run=dry_run)
     if (
         settings.use_alpaca
         and settings.auto_cancel_conflicting_orders
@@ -1930,11 +2185,95 @@ async def process_entry_alert(settings: Settings, signal: TradingViewSignal) -> 
                         "SUCCESS",
                     )
 
-        else:
+        elif not spread.metadata.get("single_leg"):
             schedule_alpaca_exits_after_entry(settings, spread, entry, entry_credit)
     except Exception as exc:
         logger.exception("Background entry processing failed: %s", exc)
         await notify(settings, "Entry Failed", str(exc), "CRITICAL")
+
+
+async def process_conservative_close_put(settings: Settings, close_signal: ClosePutSignal) -> None:
+    """Buy back short puts in batches with limit = bid + premium (conservative close)."""
+    dry_run = not settings.is_live
+    if not settings.use_alpaca or not settings.alpaca_configured:
+        await notify(settings, "Close Put Skipped", "Alpaca not configured", "WARNING")
+        return
+
+    expiration = None
+    if close_signal.expiration:
+        expiration = resolve_dte_expiration(close_signal.expiration, close_signal.dte_filter)
+    elif close_signal.dte_filter:
+        expiration = resolve_dte_expiration("0dte", close_signal.dte_filter)
+
+    positions = await fetch_alpaca_positions(settings)
+    matches = find_short_puts_in_positions(
+        positions,
+        close_signal.ticker,
+        short_strike=close_signal.short_strike,
+        expiration=expiration,
+    )
+    if not matches:
+        await notify(
+            settings,
+            "Close Put — No Position",
+            f"No short put found for {close_signal.ticker}"
+            + (f" strike ${close_signal.short_strike}" if close_signal.short_strike else ""),
+            "WARNING",
+        )
+        return
+
+    pos = matches[0]
+    meta = pos["_meta"]
+    open_qty = int(pos["_qty"])
+    close_qty = min(close_signal.quantity or open_qty, open_qty)
+    batches = split_batches(close_qty, close_signal.batch_size)
+    sym = str(pos["symbol"])
+    put_spread = SpreadPackage(
+        qty="1",
+        legs=[SpreadLeg(symbol=sym, side="sell", position_intent="sell_to_open")],
+        metadata={
+            "underlying": close_signal.ticker,
+            "strategy": "short_put",
+            "short_strike": meta.get("strike"),
+            "expiration": meta.get("expiration"),
+            "single_leg": True,
+        },
+    )
+
+    submitted = 0
+    last_bid = 0.0
+    for i, batch_qty in enumerate(batches, start=1):
+        quotes = await fetch_option_snapshot_quotes(settings, [sym])
+        bid = quotes.get(sym.upper(), {}).get("bid", 0.0)
+        last_bid = bid
+        limit = conservative_close_limit(bid, close_signal.bid_premium)
+        batch_pkg = SpreadPackage(
+            qty=str(batch_qty),
+            legs=put_spread.legs,
+            metadata={**put_spread.metadata, "batch_index": i, "close_limit": limit},
+        )
+        payload = build_alpaca_single_leg_payload(batch_pkg, limit_price=limit, opening=False, time_in_force="day")
+        result = await submit_alpaca_order(settings, payload, dry_run=dry_run)
+        if not result.success:
+            for step in range(close_signal.max_chase_steps):
+                limit = round(limit + close_signal.chase_step, 2)
+                payload["limit_price"] = f"{limit:.2f}"
+                result = await submit_alpaca_order(settings, payload, dry_run=dry_run)
+                if result.success:
+                    break
+                await asyncio.sleep(0.3)
+        if result.success:
+            submitted += batch_qty
+        if i < len(batches):
+            await asyncio.sleep(0.5)
+
+    await notify(
+        settings,
+        "Conservative Close Complete",
+        f"{close_signal.ticker} buy-to-close: {submitted}/{close_qty} contracts "
+        f"in {len(batches)} batch(es) @ ~${conservative_close_limit(last_bid, close_signal.bid_premium):.2f}",
+        "SUCCESS" if submitted > 0 else "WARNING",
+    )
 
 
 async def process_warning_alert(
@@ -2044,8 +2383,8 @@ def coerce_signal(payload: dict, settings: Settings) -> TradingViewSignal:
 
 app = FastAPI(
     title="spy-options-bridge",
-    version="5.5.11",
-    description="TradingView → Alpaca Paper multi-leg SPY credit spreads + auto GTC exits",
+    version="5.5.12",
+    description="TradingView → Alpaca Paper credit spreads + short puts + conservative close",
 )
 
 
@@ -2056,7 +2395,7 @@ async def startup_log() -> None:
     s = get_settings()
     broker_label = "Alpaca Paper" if s.use_alpaca else "Tastytrade Cert"
     logger.info(
-        "spy-options-bridge v5.5.11 started | broker=%s (%s) | configured=%s | mode=%s | auto_tp=%s auto_sl=%s chase=%s paper_force=%s auto_cancel=%s",
+        "spy-options-bridge v5.5.12 started | broker=%s (%s) | configured=%s | mode=%s | auto_tp=%s auto_sl=%s chase=%s paper_force=%s auto_cancel=%s",
         s.broker,
         broker_label,
         s.configured,
@@ -2094,7 +2433,7 @@ async def health() -> dict[str, Any]:
     tv_pause_risk = build_tv_pause_risk(s, preflight)
     return {
         "status": "ok" if tv_pause_risk["level"] != "red" else "degraded",
-        "version": "5.5.11",
+        "version": "5.5.12",
         "burst_endpoint": "/exercise/burst",
         "auto_take_profit": str(s.auto_take_profit),
         "auto_stop_loss": str(s.auto_stop_loss),
@@ -2126,7 +2465,7 @@ async def health() -> dict[str, Any]:
 @app.get("/ping")
 async def ping() -> dict[str, str]:
     """Lightweight keep-alive for cron pings (prevents Render free-tier cold starts)."""
-    return {"status": "ok", "version": "5.5.11"}
+    return {"status": "ok", "version": "5.5.12"}
 
 
 def _burst_paper_guard(settings: Settings) -> str | None:
@@ -2197,7 +2536,7 @@ async def exercise_burst_endpoint(
 
     try:
         signal = coerce_signal(payload, settings)
-        build_spread(signal, settings)
+        build_order_from_signal(signal, settings)
     except (ValidationError, ValueError) as exc:
         return JSONResponse(
             status_code=200,
@@ -2274,7 +2613,7 @@ async def exercise_entry_endpoint(
     if burst_n > 1:
         try:
             signal = coerce_signal(payload, settings)
-            build_spread(signal, settings)
+            build_order_from_signal(signal, settings)
         except (ValidationError, ValueError) as exc:
             return JSONResponse(
                 status_code=200,
@@ -2309,7 +2648,7 @@ async def exercise_entry_endpoint(
 
     try:
         signal = coerce_signal(payload, settings)
-        build_spread(signal, settings)
+        build_order_from_signal(signal, settings)
     except (ValidationError, ValueError) as exc:
         return JSONResponse(
             status_code=200,
@@ -2398,7 +2737,7 @@ async def entry_endpoint(
             clean_payload["fillMode"] = "exercise"
             try:
                 signal = coerce_signal(clean_payload, settings)
-                build_spread(signal, settings)
+                build_order_from_signal(signal, settings)
             except (ValidationError, ValueError) as exc:
                 return JSONResponse(  # type: ignore[return-value]
                     status_code=200,
@@ -2439,7 +2778,7 @@ async def entry_endpoint(
 
     try:
         signal = coerce_signal(payload, settings)
-        build_spread(signal, settings)
+        build_order_from_signal(signal, settings)
     except (ValidationError, ValueError) as exc:
         logger.warning("Signal rejected: %s", exc)
         return JSONResponse(  # type: ignore[return-value]
@@ -2462,6 +2801,65 @@ async def entry_endpoint(
             "dry_run": dry_run,
             "processing": True,
             "notifications": {},
+        },
+    )
+
+
+@app.post("/close-put")
+async def close_put_endpoint(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    x_webhook_secret: str | None = Header(default=None, alias="X-Webhook-Secret"),
+) -> JSONResponse:
+    """
+    Conservative short-put close — batched buy-to-close with limit = bid + bidPremium.
+
+    Use templates/tradingview-short-put-conservative-close.json from TradingView.
+    """
+    settings = get_settings()
+    dry_run = not settings.is_live
+
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        return JSONResponse(
+            status_code=200,
+            content={"success": False, "message": f"Invalid JSON: {exc}", "dry_run": dry_run},
+        )
+
+    if not isinstance(payload, dict):
+        return JSONResponse(
+            status_code=200,
+            content={"success": False, "message": "Alert body must be JSON object", "dry_run": dry_run},
+        )
+
+    provided, payload = extract_webhook_secret(payload, x_webhook_secret)
+    auth_err = webhook_auth_error(provided, settings.webhook_secret)
+    if auth_err:
+        return webhook_auth_json_response(auth_err, dry_run=dry_run, kind="close-put")  # type: ignore[return-value]
+
+    try:
+        close_signal = ClosePutSignal.model_validate(payload)
+    except (ValidationError, ValueError) as exc:
+        return JSONResponse(
+            status_code=200,
+            content={"success": False, "message": f"Bad close payload: {exc}", "dry_run": dry_run},
+        )
+
+    background_tasks.add_task(process_conservative_close_put, settings, close_signal)
+    logger.info(
+        "Queued conservative close for %s qty=%s batch=%s",
+        close_signal.ticker,
+        close_signal.quantity,
+        close_signal.batch_size,
+    )
+    return JSONResponse(
+        status_code=200,
+        content={
+            "success": True,
+            "message": f"Close accepted — processing {close_signal.ticker} in batches of {close_signal.batch_size}",
+            "dry_run": dry_run,
+            "processing": True,
         },
     )
 

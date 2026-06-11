@@ -1,0 +1,12 @@
+{
+  "webhookSecret": "my-bridge-secret-2026",
+  "ticker": "{{ticker}}",
+  "short_strike": 230,
+  "dteFilter": "2026-05-15",
+  "quantity": 24,
+  "batchSize": 6,
+  "bidPremium": 0.03,
+  "chaseStep": 0.02,
+  "maxChaseSteps": 3,
+  "closeMode": "conservative"
+}
