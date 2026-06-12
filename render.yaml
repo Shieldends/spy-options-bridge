@@ -13,17 +13,25 @@ services:
       - key: APCA_API_BASE_URL
         value: https://paper-api.alpaca.markets
       - key: DEFAULT_DTE_FILTER
-        value: weekly
+        value: 0dte
       - key: DEFAULT_STRIKE_OFFSET_SHORT
-        value: "-5"
+        value: "-10"
       - key: DEFAULT_STRIKE_OFFSET_LONG
-        value: "-6"
+        value: "-15"
       - key: DEFAULT_LIMIT_CREDIT
-        value: "0.55"
+        value: "0.45"
+      - key: SPREAD_MODE_ONLY
+        value: true
+      - key: SPREAD_MIN_CREDIT
+        value: "0.40"
+      - key: SPREAD_MAX_TRADES_PER_DAY
+        value: "5"
+      - key: SPREAD_DAILY_LOSS_LIMIT
+        value: "2000"
       - key: DEFAULT_FILL_MODE
         value: exercise
       - key: PAPER_FORCE_MIN_FILL
-        value: true
+        value: false
       - key: AUTO_CHASE_ENTRY_FILL
         value: true
       - key: ENTRY_CHASE_WAIT_SECONDS
