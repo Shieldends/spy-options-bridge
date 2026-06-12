@@ -67,6 +67,9 @@ def classify_order(o: dict) -> str:
     oc = str(o.get("order_class") or "").lower()
     sym = str(o.get("symbol") or "")
     legs = o.get("legs") or []
+    lim = str(o.get("limit_price") or "")
+    if (oc == "mleg" or legs) and lim == "-0.05" and str(o.get("status")) == "canceled":
+        return "BURST-TEST"
     if oc == "mleg" or legs:
         return "SPREAD"
     if sym.startswith("SPY") and len(sym) > 10:
@@ -209,7 +212,7 @@ def build_timeline(bridge_events: list[dict], alpaca: dict) -> list[dict]:
 def render_txt(summary: list[str], timeline: list[dict], health: dict) -> str:
     now = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
     parts = [
-        "SPY BULL PUT SPREAD — ACTIVITY DIGEST",
+        "SPY BULL PUT SPREAD - ACTIVITY DIGEST",
         f"Generated: {now}",
         "=" * 60,
         "",
@@ -225,7 +228,7 @@ def render_txt(summary: list[str], timeline: list[dict], health: dict) -> str:
         f"  status={health.get('status')} tv_risk={health.get('tv_pause_risk', {}).get('level')}",
         f"  open_orders={health.get('open_order_count')} open_mleg={health.get('open_mleg_count')}",
         "",
-        "TIMELINE (oldest → newest)",
+        "TIMELINE (oldest to newest)",
         "-" * 60,
     ]
     if not timeline:
