@@ -1,5 +1,5 @@
 """
-spy-options-bridge v5.5.12 — ALPACA PAPER (default broker)
+spy-options-bridge v5.5.13 — ALPACA PAPER (default broker)
 
 TradingView webhook → Render → Alpaca multi-leg SPY put credit spreads.
 
@@ -48,6 +48,7 @@ _scripts_dir = Path(__file__).resolve().parent / "scripts"
 if _scripts_dir.is_dir() and str(_scripts_dir) not in sys.path:
     sys.path.insert(0, str(_scripts_dir))
 from team_email import bridge_notify as team_bridge_notify  # noqa: E402
+from spread_guards import check_spread_entry_allowed  # noqa: E402
 from fastapi import BackgroundTasks, FastAPI, Header, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
@@ -135,6 +136,11 @@ class Settings(BaseSettings):
     # 0 = no cap; set e.g. 10 to limit spreads per alert
     burst_max_count: int = Field(default=10, alias="BURST_MAX_COUNT")
     max_concurrent_chase_tasks: int = Field(default=2, alias="MAX_CONCURRENT_CHASE_TASKS")
+
+    spread_min_credit: float = Field(default=0.40, alias="SPREAD_MIN_CREDIT")
+    spread_max_trades_per_day: int = Field(default=5, alias="SPREAD_MAX_TRADES_PER_DAY")
+    spread_daily_loss_limit: float = Field(default=2000.0, alias="SPREAD_DAILY_LOSS_LIMIT")
+    spread_mode_only: bool = Field(default=False, alias="SPREAD_MODE_ONLY")
 
     @property
     def is_live(self) -> bool:
@@ -393,8 +399,14 @@ def resolve_dte_expiration(expiration: str, dte_filter: str | None = None, now: 
     now = now or datetime.now(tz=ET)
     spec = (dte_filter or expiration or "0dte").strip().lower()
 
-    if spec in {"0dte", "today", "+0 days", "+0 day", ""}:
+    if spec in {"0dte", "today", "+0 days", "+0 day", "1dte", ""}:
         return now.strftime("%Y-%m-%d")
+
+    if spec in {"+1dte", "+1 day", "+1 days", "2dte", "tomorrow"}:
+        return (now + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    if spec in {"+2dte", "+2 days", "+2 day"}:
+        return (now + timedelta(days=2)).strftime("%Y-%m-%d")
 
     if spec in {"weekly", "week", "+0 week", "0dte_weekly"}:
         # Nearest Friday on or after today (standard weekly options cycle)
@@ -744,8 +756,11 @@ async def resolve_entry_limit_credit(
     requested = signal.limit_credit if signal.limit_credit is not None else settings.default_limit_credit
     meta = {"fill_mode_resolved": mode, "limit_credit_requested": requested}
 
+    is_spread = spread.metadata.get("strategy") == "put_credit_spread"
+    skip_paper_force = is_spread and settings.spread_min_credit > 0
+
     # Alpaca paper: always start at minimum credit so simulator fills (user opts in via env).
-    if settings.use_alpaca and settings.is_alpaca_paper and settings.paper_force_min_fill:
+    if settings.use_alpaca and settings.is_alpaca_paper and settings.paper_force_min_fill and not skip_paper_force:
         credit = round(settings.entry_min_credit, 2)
         meta["fill_mode_resolved"] = "paper_force_min"
         meta["limit_credit_final"] = credit
@@ -776,6 +791,10 @@ async def resolve_entry_limit_credit(
     credit, qmeta = estimate_credit_from_quotes(spread, quotes, mode=mode, cap=cap)
     meta.update(qmeta)
     meta["limit_credit_final"] = credit
+    if is_spread and settings.spread_min_credit > 0 and credit < settings.spread_min_credit:
+        raise ValueError(
+            f"Estimated credit ${credit:.2f} below minimum ${settings.spread_min_credit:.2f} — skip trade"
+        )
     logger.info(
         "Fill mode %s: credit $%s (requested $%s) short_bid=%s long_ask=%s",
         mode,
@@ -2383,7 +2402,7 @@ def coerce_signal(payload: dict, settings: Settings) -> TradingViewSignal:
 
 app = FastAPI(
     title="spy-options-bridge",
-    version="5.5.12",
+    version="5.5.13",
     description="TradingView → Alpaca Paper credit spreads + short puts + conservative close",
 )
 
@@ -2433,7 +2452,7 @@ async def health() -> dict[str, Any]:
     tv_pause_risk = build_tv_pause_risk(s, preflight)
     return {
         "status": "ok" if tv_pause_risk["level"] != "red" else "degraded",
-        "version": "5.5.12",
+        "version": "5.5.13",
         "burst_endpoint": "/exercise/burst",
         "auto_take_profit": str(s.auto_take_profit),
         "auto_stop_loss": str(s.auto_stop_loss),
@@ -2465,7 +2484,7 @@ async def health() -> dict[str, Any]:
 @app.get("/ping")
 async def ping() -> dict[str, str]:
     """Lightweight keep-alive for cron pings (prevents Render free-tier cold starts)."""
-    return {"status": "ok", "version": "5.5.12"}
+    return {"status": "ok", "version": "5.5.13"}
 
 
 def _burst_paper_guard(settings: Settings) -> str | None:
@@ -2786,6 +2805,30 @@ async def entry_endpoint(
             content={
                 "success": False,
                 "message": f"Bad alert payload — check TradingView JSON: {exc}",
+                "dry_run": dry_run,
+                "notifications": {},
+            },
+        )
+
+    if settings.spread_mode_only and signal.is_short_put:
+        return JSONResponse(  # type: ignore[return-value]
+            status_code=200,
+            content={
+                "success": False,
+                "message": "SPREAD_MODE_ONLY: naked SHORT_PUT disabled — use PUT_CREDIT_SPREAD",
+                "dry_run": dry_run,
+                "notifications": {},
+            },
+        )
+
+    skip_reason = await check_spread_entry_allowed(settings, signal)
+    if skip_reason:
+        logger.warning("Entry skipped: %s", skip_reason)
+        return JSONResponse(  # type: ignore[return-value]
+            status_code=200,
+            content={
+                "success": False,
+                "message": skip_reason,
                 "dry_run": dry_run,
                 "notifications": {},
             },

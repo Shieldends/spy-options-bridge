@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import pytest
 
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 from main import (
     build_alpaca_entry_payload,
     build_alpaca_single_leg_payload,
@@ -12,6 +15,7 @@ from main import (
     conservative_close_limit,
     format_alpaca_limit_price,
     get_settings,
+    resolve_dte_expiration,
     snap_put_credit_strikes,
     split_batches,
     SpreadLeg,
@@ -123,3 +127,12 @@ def test_build_alpaca_single_leg_buy_to_close():
     assert payload["side"] == "buy"
     assert payload["limit_price"] == "0.11"
     assert payload["qty"] == "6"
+
+
+def test_resolve_dte_plus_one_and_two():
+    et = ZoneInfo("America/New_York")
+    now = datetime(2026, 6, 12, 10, 0, tzinfo=et)
+    assert resolve_dte_expiration("0dte", None, now=now) == "2026-06-12"
+    assert resolve_dte_expiration("+1dte", None, now=now) == "2026-06-13"
+    assert resolve_dte_expiration("2dte", None, now=now) == "2026-06-13"
+    assert resolve_dte_expiration("+2dte", None, now=now) == "2026-06-14"

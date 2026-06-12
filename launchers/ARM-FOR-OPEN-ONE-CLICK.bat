@@ -8,7 +8,7 @@ if not exist ".venv\Scripts\python.exe" (
   exit /b 1
 )
 REM Creates auto-arm marker on first run; 5s countdown then auto-Y
-.\.venv\Scripts\python.exe scripts\arm_for_open.py --create-auto-arm-marker %*
+.\.venv\Scripts\python.exe scripts\arm_for_open.py --yes --skip-schtask --create-auto-arm-marker %*
 set RC=%ERRORLEVEL%
 if %RC% NEQ 0 (
   echo ARM cancelled or failed — see Desktop\ARM-FOR-OPEN.log

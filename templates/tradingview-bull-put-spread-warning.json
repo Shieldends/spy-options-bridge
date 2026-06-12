@@ -1,0 +1,8 @@
+{
+  "webhookSecret": "my-bridge-secret-2026",
+  "ticker": "{{ticker}}",
+  "signalPrice": {{close}},
+  "strikeOffsetShort": -10,
+  "strikeOffsetLong": -15,
+  "overrideAutoClose": false
+}

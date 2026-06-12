@@ -31,11 +31,11 @@ ET = ZoneInfo("America/New_York")
 SCHTASK_NAME = "SPY-BURST-931-ET"
 
 
-def _safe_print(text: str) -> None:
+def _safe_print(text: str, **kwargs: object) -> None:
     try:
-        print(text)
+        print(text, **kwargs)
     except UnicodeEncodeError:
-        print(text.encode("ascii", errors="replace").decode("ascii"))
+        print(text.encode("ascii", errors="replace").decode("ascii"), **kwargs)
 
 
 def log(msg: str) -> None:
