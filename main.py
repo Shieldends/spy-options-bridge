@@ -1,5 +1,5 @@
 """
-spy-options-bridge v5.5.13 — ALPACA PAPER (default broker)
+spy-options-bridge v5.5.14 — ALPACA PAPER (default broker)
 
 TradingView webhook → Render → Alpaca multi-leg SPY put credit spreads.
 
@@ -19,6 +19,7 @@ Required Render env vars:
 
 Endpoints:
   GET  /health          — shows broker=alpaca when configured
+  GET  /activity        — today's webhook timeline (entry / warning / skips)
   POST /entry           — Alpaca mleg entry + GTC take-profit + GTC stop-loss
   POST /webhook         — alias for /entry
   POST /warning         — danger zone: notify + optional auto-close spread
@@ -33,6 +34,7 @@ import asyncio
 import logging
 import sys
 import time
+from collections import deque
 from datetime import datetime, timedelta
 from enum import Enum
 from functools import lru_cache
@@ -65,8 +67,31 @@ PREFLIGHT_CACHE_SEC = 30.0
 BURST_ATTEMPTS_RESPONSE_CAP = 5
 PREFLIGHT_TIMEOUT_SEC = 4.0
 ET = ZoneInfo("America/New_York")
+_activity_log: deque[dict[str, Any]] = deque(maxlen=250)
 CERT_URL = "https://api.cert.tastyworks.com"
 ALPACA_PAPER_URL = "https://paper-api.alpaca.markets"
+
+
+def record_activity(
+    kind: Literal["entry", "warning", "close-put"],
+    outcome: str,
+    message: str,
+    *,
+    ticker: str = "SPY",
+    extra: dict[str, Any] | None = None,
+) -> None:
+    """Ring buffer of webhook events for /activity (resets on Render restart)."""
+    row: dict[str, Any] = {
+        "ts_et": datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET"),
+        "kind": kind,
+        "outcome": outcome,
+        "message": message[:500],
+        "ticker": ticker,
+    }
+    if extra:
+        row.update(extra)
+    _activity_log.append(row)
+
 
 # ── Settings ──────────────────────────────────────────────────────────────────
 
@@ -2169,6 +2194,13 @@ async def process_entry_alert(settings: Settings, signal: TradingViewSignal) -> 
         expiration = spread.metadata["expiration"]
 
         if entry.success:
+            record_activity(
+                "entry",
+                "filled",
+                f"Order submitted exp={expiration} credit=${spread.metadata.get('limit_credit')}",
+                ticker=signal.ticker,
+                extra={"strategy": spread.metadata.get("strategy")},
+            )
             await notify(
                 settings,
                 "Entry Submitted",
@@ -2176,6 +2208,7 @@ async def process_entry_alert(settings: Settings, signal: TradingViewSignal) -> 
                 "SUCCESS" if settings.is_live else "INFO",
             )
         else:
+            record_activity("entry", "rejected", entry.message, ticker=signal.ticker)
             await notify(settings, "Entry Rejected", entry.message, "CRITICAL")
             return
 
@@ -2208,6 +2241,7 @@ async def process_entry_alert(settings: Settings, signal: TradingViewSignal) -> 
             schedule_alpaca_exits_after_entry(settings, spread, entry, entry_credit)
     except Exception as exc:
         logger.exception("Background entry processing failed: %s", exc)
+        record_activity("entry", "failed", str(exc), ticker=signal.ticker)
         await notify(settings, "Entry Failed", str(exc), "CRITICAL")
 
 
@@ -2342,6 +2376,12 @@ async def process_warning_alert(
     )
 
     if not spreads:
+        record_activity(
+            "warning",
+            "no_position",
+            f"No open spread at short ${warning.short_strike:.2f}",
+            ticker=warning.ticker,
+        )
         await notify(
             settings,
             "Warning — No Spread Found",
@@ -2402,7 +2442,7 @@ def coerce_signal(payload: dict, settings: Settings) -> TradingViewSignal:
 
 app = FastAPI(
     title="spy-options-bridge",
-    version="5.5.13",
+    version="5.5.14",
     description="TradingView → Alpaca Paper credit spreads + short puts + conservative close",
 )
 
@@ -2452,7 +2492,7 @@ async def health() -> dict[str, Any]:
     tv_pause_risk = build_tv_pause_risk(s, preflight)
     return {
         "status": "ok" if tv_pause_risk["level"] != "red" else "degraded",
-        "version": "5.5.13",
+        "version": "5.5.14",
         "burst_endpoint": "/exercise/burst",
         "auto_take_profit": str(s.auto_take_profit),
         "auto_stop_loss": str(s.auto_stop_loss),
@@ -2484,7 +2524,23 @@ async def health() -> dict[str, Any]:
 @app.get("/ping")
 async def ping() -> dict[str, str]:
     """Lightweight keep-alive for cron pings (prevents Render free-tier cold starts)."""
-    return {"status": "ok", "version": "5.5.13"}
+    return {"status": "ok", "version": "5.5.14"}
+
+
+@app.get("/activity")
+async def activity_log() -> dict[str, Any]:
+    """Today's webhook timeline — pair with Desktop SPREAD-ACTIVITY digest."""
+    today = datetime.now(ET).strftime("%Y-%m-%d")
+    events = [e for e in _activity_log if str(e.get("ts_et", "")).startswith(today)]
+    events.reverse()
+    return {
+        "status": "ok",
+        "version": "5.5.14",
+        "today": today,
+        "count": len(events),
+        "note": "In-memory log; clears on Render restart. Alpaca fills in SPREAD-ACTIVITY digest.",
+        "events": events,
+    }
 
 
 def _burst_paper_guard(settings: Settings) -> str | None:
@@ -2811,6 +2867,13 @@ async def entry_endpoint(
         )
 
     if settings.spread_mode_only and signal.is_short_put:
+        record_activity(
+            "entry",
+            "rejected",
+            "SPREAD_MODE_ONLY: naked SHORT_PUT disabled",
+            ticker=signal.ticker,
+            extra={"action": str(signal.action)},
+        )
         return JSONResponse(  # type: ignore[return-value]
             status_code=200,
             content={
@@ -2824,6 +2887,13 @@ async def entry_endpoint(
     skip_reason = await check_spread_entry_allowed(settings, signal)
     if skip_reason:
         logger.warning("Entry skipped: %s", skip_reason)
+        record_activity(
+            "entry",
+            "skipped",
+            skip_reason,
+            ticker=signal.ticker,
+            extra={"action": str(signal.action), "strategy": str(signal.strategy)},
+        )
         return JSONResponse(  # type: ignore[return-value]
             status_code=200,
             content={
@@ -2836,6 +2906,18 @@ async def entry_endpoint(
 
     background_tasks.add_task(process_entry_alert, settings, signal)
     logger.info("Queued background entry for %s qty=%s", signal.ticker, signal.quantity)
+    record_activity(
+        "entry",
+        "accepted",
+        f"Queued {signal.strategy} qty={signal.quantity}",
+        ticker=signal.ticker,
+        extra={
+            "action": str(signal.action),
+            "strategy": str(signal.strategy),
+            "dte": signal.dte_filter,
+            "limit_credit": signal.limit_credit,
+        },
+    )
     return JSONResponse(  # type: ignore[return-value]
         status_code=200,
         content={
@@ -2972,6 +3054,7 @@ async def warning_endpoint(
     )
 
     if not danger:
+        record_activity("warning", "no_danger", "Price not in danger zone", ticker=warning.ticker)
         return WarningResponse(
             danger_zone=False,
             risk_warning=None,
@@ -2983,6 +3066,7 @@ async def warning_endpoint(
         )
 
     if not msg:
+        record_activity("warning", "no_danger", "No warning message", ticker=warning.ticker)
         return WarningResponse(
             danger_zone=False,
             risk_warning=None,
@@ -3004,6 +3088,13 @@ async def warning_endpoint(
         notes_copy,
     )
     logger.info("Queued background warning for %s", warning.ticker)
+    record_activity(
+        "warning",
+        "accepted",
+        msg[:200],
+        ticker=warning.ticker,
+        extra={"survival_pct": round(survival * 100, 1)},
+    )
     return JSONResponse(  # type: ignore[return-value]
         status_code=200,
         content={
