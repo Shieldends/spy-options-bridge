@@ -23,6 +23,7 @@ RENDER = "https://spy-options-bridge.onrender.com"
 DESKTOP = Path(r"C:\Users\Shiel\Desktop")
 OUT_TXT = DESKTOP / "SPREAD-ACTIVITY-DIGEST.txt"
 OUT_HTML = DESKTOP / "SPREAD-ACTIVITY-DIGEST.html"
+OUT_SIMPLE = DESKTOP / "SPREAD-TODAY-SIMPLE.txt"
 
 
 def today_et() -> str:
@@ -214,6 +215,68 @@ def build_timeline(bridge_events: list[dict], alpaca: dict) -> list[dict]:
     return rows
 
 
+def filter_timeline(timeline: list[dict], *, hide_burst: bool = True) -> list[dict]:
+    if not hide_burst:
+        return timeline
+    return [t for t in timeline if t["kind"] != "BURST-TEST"]
+
+
+def render_plain_english(
+    timeline: list[dict],
+    health: dict,
+    acc: dict,
+    alpaca: dict,
+) -> str:
+    """Short summary Commander can read in 30 seconds."""
+    burst_n = sum(1 for t in timeline if t["kind"] == "BURST-TEST")
+    single_n = sum(1 for t in timeline if t["kind"] == "SINGLE-PUT")
+    spread_n = sum(1 for t in timeline if t["kind"] == "SPREAD")
+    bridge_rows_ = [t for t in timeline if t["source"] == "bridge"]
+    warn_n = sum(1 for t in bridge_rows_ if t["kind"] == "WARNING")
+    entry_bridge = [t for t in bridge_rows_ if t["kind"] == "ENTRY"]
+    skipped = [t for t in entry_bridge if t["outcome"] in ("skipped", "failed", "rejected")]
+    spread_fills = [t for t in timeline if t["kind"] == "SPREAD" and t["outcome"] == "filled"]
+    pos_n = len(alpaca.get("positions") or [])
+    now = datetime.now(ET).strftime("%Y-%m-%d %H:%M ET")
+
+    lines = [
+        "SPY SPREAD - TODAY IN PLAIN ENGLISH",
+        f"Updated: {now}",
+        "",
+        "BOTTOM LINE",
+    ]
+    if spread_fills:
+        lines.append(f"  You have {len(spread_fills)} bull put SPREAD fill(s) today.")
+    else:
+        lines.append("  No bull put SPREAD fills today.")
+    if pos_n:
+        lines.append(f"  Open positions now: {pos_n}")
+    else:
+        lines.append("  Account is FLAT right now.")
+    lines.append(f"  Paper equity: ${acc.get('equity', '?')}")
+    lines.append("")
+    lines.append("WHAT MATTERS FOR YOUR NEW STRATEGY")
+    if entry_bridge:
+        lines.append(f"  TV entry webhooks received: {len(entry_bridge)}")
+        for t in entry_bridge[-5:]:
+            lines.append(f"    {t['time']} -> {t['outcome']}: {t['message'][:70]}")
+    else:
+        lines.append("  No spread entry webhooks logged yet (or before bridge 5.5.14).")
+    if warn_n:
+        lines.append(f"  Warning webhooks: {warn_n}")
+    lines.append("")
+    lines.append("NOISE YOU CAN IGNORE")
+    lines.append(f"  {burst_n} burst-test cancels at 9:31 AM (automated junk - not you).")
+    lines.append(f"  {single_n} old SINGLE-PUT orders (previous strategy - not spread).")
+    lines.append("")
+    lines.append("BRIDGE")
+    lines.append(f"  Version {health.get('version', '?')} | status {health.get('status', '?')}")
+    lines.append("")
+    lines.append("MONDAY: press G before open, unpause TV alerts, press A anytime.")
+    lines.append("Full detail (optional): SPREAD-ACTIVITY-DIGEST.txt on Desktop")
+    return "\n".join(lines) + "\n"
+
+
 def render_txt(summary: list[str], timeline: list[dict], health: dict) -> str:
     now = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
     parts = [
@@ -234,12 +297,15 @@ def render_txt(summary: list[str], timeline: list[dict], health: dict) -> str:
         f"  status={health.get('status')} tv_risk={health.get('tv_pause_risk', {}).get('level')}",
         f"  open_orders={health.get('open_order_count')} open_mleg={health.get('open_mleg_count')}",
         "",
-        "TIMELINE (oldest to newest)",
+        f"BURST noise hidden ({sum(1 for t in timeline if t['kind']=='BURST-TEST')} rows) - see SIMPLE file",
+        "",
+        "TIMELINE - spread + bridge only (oldest to newest)",
         "-" * 60,
     ]
-    if not timeline:
-        parts.append("  (no events today)")
-    for t in timeline:
+    shown = filter_timeline(timeline)
+    if not shown:
+        parts.append("  (no spread/bridge events today)")
+    for t in shown:
         parts.append(
             f"  {t['time']}  [{t['source']}]  {t['kind']}/{t['outcome']}: {t['message']}"
         )
@@ -309,11 +375,13 @@ def main() -> int:
     alpaca = fetch_alpaca_today(env)
     timeline = build_timeline(bridge_events, alpaca)
     summary = summarize(timeline, bridge_meta, health, acc, alpaca)
+    simple = render_plain_english(timeline, health, acc, alpaca)
 
     DESKTOP.mkdir(parents=True, exist_ok=True)
+    OUT_SIMPLE.write_text(simple, encoding="utf-8")
     txt = render_txt(summary, timeline, health)
     OUT_TXT.write_text(txt, encoding="utf-8")
-    OUT_HTML.write_text(render_html(summary, timeline, health), encoding="utf-8")
+    OUT_HTML.write_text(render_html(summary, filter_timeline(timeline), health), encoding="utf-8")
 
     print(txt)
     print(f"Wrote {OUT_TXT}")

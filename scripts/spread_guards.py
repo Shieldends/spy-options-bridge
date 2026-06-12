@@ -11,13 +11,20 @@ import httpx
 ET = ZoneInfo("America/New_York")
 
 
+def _alpaca_headers(settings: Any) -> dict[str, str]:
+    return {
+        "Apca-Api-Key-Id": settings.alpaca_key,
+        "Apca-Api-Secret-Key": settings.alpaca_secret,
+    }
+
+
 def _today_et() -> str:
     return datetime.now(ET).strftime("%Y-%m-%d")
 
 
 async def fetch_alpaca_account(settings: Any) -> dict[str, Any]:
     base = settings.apca_api_base_url.rstrip("/")
-    headers = settings.alpaca_headers()
+    headers = _alpaca_headers(settings)
     async with httpx.AsyncClient(timeout=12.0) as client:
         r = await client.get(f"{base}/v2/account", headers=headers)
         r.raise_for_status()
@@ -27,7 +34,7 @@ async def fetch_alpaca_account(settings: Any) -> dict[str, Any]:
 async def count_today_mleg_filled_entries(settings: Any) -> int:
     """Count filled multi-leg orders submitted today (ET date on created_at)."""
     base = settings.apca_api_base_url.rstrip("/")
-    headers = settings.alpaca_headers()
+    headers = _alpaca_headers(settings)
     today = _today_et()
     async with httpx.AsyncClient(timeout=15.0) as client:
         r = await client.get(

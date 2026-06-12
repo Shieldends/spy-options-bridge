@@ -1,5 +1,5 @@
 """
-spy-options-bridge v5.5.14 — ALPACA PAPER (default broker)
+spy-options-bridge v5.5.15 — ALPACA PAPER (default broker)
 
 TradingView webhook → Render → Alpaca multi-leg SPY put credit spreads.
 
@@ -2442,7 +2442,7 @@ def coerce_signal(payload: dict, settings: Settings) -> TradingViewSignal:
 
 app = FastAPI(
     title="spy-options-bridge",
-    version="5.5.14",
+    version="5.5.15",
     description="TradingView → Alpaca Paper credit spreads + short puts + conservative close",
 )
 
@@ -2492,7 +2492,7 @@ async def health() -> dict[str, Any]:
     tv_pause_risk = build_tv_pause_risk(s, preflight)
     return {
         "status": "ok" if tv_pause_risk["level"] != "red" else "degraded",
-        "version": "5.5.14",
+        "version": "5.5.15",
         "burst_endpoint": "/exercise/burst",
         "auto_take_profit": str(s.auto_take_profit),
         "auto_stop_loss": str(s.auto_stop_loss),
@@ -2524,7 +2524,7 @@ async def health() -> dict[str, Any]:
 @app.get("/ping")
 async def ping() -> dict[str, str]:
     """Lightweight keep-alive for cron pings (prevents Render free-tier cold starts)."""
-    return {"status": "ok", "version": "5.5.14"}
+    return {"status": "ok", "version": "5.5.15"}
 
 
 @app.get("/activity")
@@ -2535,7 +2535,7 @@ async def activity_log() -> dict[str, Any]:
     events.reverse()
     return {
         "status": "ok",
-        "version": "5.5.14",
+        "version": "5.5.15",
         "today": today,
         "count": len(events),
         "note": "In-memory log; clears on Render restart. Alpaca fills in SPREAD-ACTIVITY digest.",
