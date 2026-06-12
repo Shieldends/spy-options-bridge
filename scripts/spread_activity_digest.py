@@ -178,16 +178,21 @@ def bridge_rows(events: list[dict]) -> list[dict]:
 
 
 def summarize(timeline: list[dict], bridge_meta: dict, health: dict, acc: dict, alpaca: dict) -> list[str]:
-    entry_ev = [t for t in timeline if t["kind"] in ("ENTRY", "SPREAD", "SPREAD-ATTEMPT")]
+    bridge_ev = [t for t in timeline if t["source"] == "bridge"]
+    spread_ev = [t for t in timeline if t["kind"] == "SPREAD"]
+    burst_ev = [t for t in timeline if t["kind"] == "BURST-TEST"]
+    single_ev = [t for t in timeline if t["kind"] == "SINGLE-PUT"]
     warn_ev = [t for t in timeline if t["kind"] == "WARNING"]
     skipped = [t for t in timeline if t["outcome"] in ("skipped", "failed", "rejected")]
     fills = [t for t in timeline if t["outcome"] == "filled" or t["source"] == "alpaca-fill"]
     lines = [
         "TODAY AT A GLANCE",
         f"  Bridge version: {health.get('version', bridge_meta.get('version', '?'))}",
-        f"  Webhook events (bridge log): {bridge_meta.get('count', len([t for t in timeline if t['source']=='bridge']))}",
-        f"  Entry-related rows: {len(entry_ev)}",
-        f"  Warning rows: {len(warn_ev)}",
+        f"  Bridge webhook log rows: {bridge_meta.get('count', len(bridge_ev))}",
+        f"  Spread orders (mleg): {len(spread_ev)}",
+        f"  Burst test cancels (9:31 noise): {len(burst_ev)}",
+        f"  Single-put orders (old strategy): {len(single_ev)}",
+        f"  Warning webhooks: {len(warn_ev)}",
         f"  Skipped / failed / rejected: {len(skipped)}",
         f"  Fills today: {len(fills)}",
         f"  Open orders now: {len(alpaca.get('open') or [])}",
@@ -221,6 +226,7 @@ def render_txt(summary: list[str], timeline: list[dict], health: dict) -> str:
         "  bridge / skipped / failed = no Alpaca spread (often credit below $0.40).",
         "  SPREAD + filled = real multi-leg order on Alpaca.",
         "  SINGLE-PUT = old naked-put path (not spread).",
+        "  BURST-TEST = 9:31 exercise spam (ignore).",
         "",
         *summary,
         "",
