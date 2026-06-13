@@ -26,6 +26,7 @@ Endpoints:
   POST /close-put       — conservative batched buy-to-close for short puts
   POST /exercise/entry  — sync paper fill test (exercise mode, chase fill)
   POST /exercise/burst  — paper-only N-fill burst (?count=N or burstCount)
+  POST /webhook/stx-close — STX strategy poll/evaluate/execute (Stage 2 automation)
 """
 
 from __future__ import annotations
@@ -51,6 +52,32 @@ if _scripts_dir.is_dir() and str(_scripts_dir) not in sys.path:
     sys.path.insert(0, str(_scripts_dir))
 from team_email import bridge_notify as team_bridge_notify  # noqa: E402
 from spread_guards import check_spread_entry_allowed  # noqa: E402
+
+try:
+    from dataclasses import asdict
+
+    from stx_common import (  # noqa: E402
+        MarketSnapshot,
+        Recommendation,
+        StxConfig,
+        alpaca_base,
+        alpaca_headers,
+        build_recommendation,
+        fetch_option_snapshot,
+        fetch_positions,
+        fetch_underlying_price,
+        is_paper,
+        read_state,
+        underlying_legs,
+        write_state,
+    )
+    from stx_watcher import extract_quote, midpoint_of  # noqa: E402
+
+    _STX_MODULES_OK = True
+except ImportError:
+    asdict = None  # type: ignore[assignment,misc]
+    _STX_MODULES_OK = False
+
 from fastapi import BackgroundTasks, FastAPI, Header, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
@@ -73,7 +100,7 @@ ALPACA_PAPER_URL = "https://paper-api.alpaca.markets"
 
 
 def record_activity(
-    kind: Literal["entry", "warning", "close-put"],
+    kind: Literal["entry", "warning", "close-put", "stx-close"],
     outcome: str,
     message: str,
     *,
@@ -361,6 +388,34 @@ class WarningSignal(BaseModel):
         if self.short_strike is None:
             raise ValueError("short_strike or strikeOffsetShort required for /warning")
         return self
+
+
+class StxCloseSignal(BaseModel):
+    """Inbound STX close / poll signal (TradingView or external automation)."""
+
+    underlying: str = "STX"
+    expiration: str | None = None
+    strike: float | None = None
+    option_type: str = Field(default="put", alias="type")
+    mode: Literal["poll", "evaluate", "execute"] = "evaluate"
+    confirm_close: bool = Field(default=False, alias="confirmClose")
+    prev_close_iv: float | None = Field(default=None, alias="prevCloseIv")
+    poll_seconds: int = Field(default=15, alias="pollSeconds")
+
+    model_config = {"populate_by_name": True}
+
+    @field_validator("underlying", mode="before")
+    @classmethod
+    def normalize_underlying(cls, value: str) -> str:
+        return str(value).upper().replace(" ", "")
+
+    @field_validator("option_type", mode="before")
+    @classmethod
+    def normalize_option_type(cls, value: str) -> str:
+        raw = str(value).lower().strip()
+        if raw not in ("put", "call"):
+            raise ValueError("type must be put or call")
+        return raw
 
 
 class SpreadLeg(BaseModel):
@@ -2480,6 +2535,254 @@ def extract_webhook_secret(payload: dict[str, Any], header: str | None) -> tuple
     return header or body_secret, clean
 
 
+# ── STX close webhook (Stage 2 — routes to stx_watcher / stx_kill logic) ─────
+
+
+def _stx_env_from_settings(settings: Settings) -> dict[str, str]:
+    return {
+        "APCA_API_KEY_ID": settings.alpaca_key,
+        "APCA_API_SECRET_KEY": settings.alpaca_secret,
+        "APCA_API_BASE_URL": settings.apca_api_base_url.rstrip("/"),
+    }
+
+
+def _stx_config_from_signal(signal: StxCloseSignal, state: dict[str, Any] | None) -> StxConfig:
+    if signal.expiration and signal.strike is not None:
+        return StxConfig(
+            underlying=signal.underlying,
+            expiration=signal.expiration,
+            option_type=signal.option_type,
+            strike=float(signal.strike),
+            poll_seconds=signal.poll_seconds,
+            prev_close_iv=signal.prev_close_iv,
+        )
+    if state and isinstance(state.get("config"), dict):
+        c = state["config"]
+        return StxConfig(
+            underlying=str(c.get("underlying", signal.underlying)),
+            expiration=str(c["expiration"]),
+            option_type=str(c.get("option_type", "put")),
+            strike=float(c["strike"]),
+            poll_seconds=int(c.get("poll_seconds", signal.poll_seconds)),
+            prev_close_iv=c.get("prev_close_iv"),
+        )
+    raise ValueError("expiration and strike required when no watcher state file exists")
+
+
+def _stx_short_leg_qty(legs: list[dict[str, Any]], cfg: StxConfig) -> int:
+    for leg in legs:
+        if str(leg.get("symbol", "")).upper() == cfg.short_symbol:
+            return abs(int(float(leg.get("qty", "0"))))
+    return 0
+
+
+def _stx_fresh_snapshot(
+    client: httpx.Client,
+    env: dict[str, str],
+    cfg: StxConfig,
+    *,
+    prior_move_pct: float | None,
+) -> tuple[MarketSnapshot, list[dict[str, Any]], bool]:
+    now = datetime.now(ET)
+    positions, fetch_ok = fetch_positions(client, env)
+    legs = underlying_legs(positions, cfg.underlying)
+    price = fetch_underlying_price(client, env, cfg.underlying)
+    bid, ask, iv = extract_quote(fetch_option_snapshot(client, env, cfg.short_symbol))
+    mid = midpoint_of(bid, ask)
+    spread = round(ask - bid, 4) if (bid is not None and ask is not None) else None
+    iv_delta = (
+        round((iv - cfg.prev_close_iv) * 100.0, 2)
+        if (iv is not None and cfg.prev_close_iv is not None)
+        else None
+    )
+    snap = MarketSnapshot(
+        ts=now.isoformat(timespec="seconds"),
+        underlying_price=price,
+        underlying_move_pct=prior_move_pct,
+        bid=bid,
+        ask=ask,
+        midpoint=mid,
+        spread=spread,
+        iv=iv,
+        iv_delta_points=iv_delta,
+        position_open=len(legs) > 0,
+    )
+    return snap, legs, fetch_ok
+
+
+def _stx_execute_recommendation(
+    client: httpx.Client,
+    env: dict[str, str],
+    cfg: StxConfig,
+    legs: list[dict[str, Any]],
+    rec: Recommendation,
+    *,
+    dry_run: bool,
+) -> list[dict[str, Any]]:
+    base = alpaca_base(env)
+    h = alpaca_headers(env)
+    results: list[dict[str, Any]] = []
+
+    if rec.action == "market":
+        for leg in legs:
+            sym = str(leg.get("symbol", ""))
+            if dry_run:
+                results.append({"symbol": sym, "action": "market_close", "dry_run": True})
+                continue
+            r = client.delete(f"{base}/v2/positions/{sym}", headers=h, timeout=30)
+            results.append(
+                {
+                    "symbol": sym,
+                    "action": "market_close",
+                    "http_status": r.status_code,
+                    "ok": r.is_success,
+                }
+            )
+    elif rec.action == "limit" and rec.limit_price is not None:
+        qty = _stx_short_leg_qty(legs, cfg)
+        if qty <= 0:
+            raise ValueError("short leg not found in open positions")
+        order = {
+            "symbol": cfg.short_symbol,
+            "qty": str(qty),
+            "side": "buy",
+            "type": "limit",
+            "time_in_force": "day",
+            "limit_price": str(rec.limit_price),
+            "position_intent": "buy_to_close",
+        }
+        if dry_run:
+            results.append({"symbol": cfg.short_symbol, "action": "limit_close", "order": order, "dry_run": True})
+        else:
+            r = client.post(f"{base}/v2/orders", headers=h, json=order, timeout=30)
+            results.append(
+                {
+                    "symbol": cfg.short_symbol,
+                    "action": "limit_close",
+                    "http_status": r.status_code,
+                    "ok": r.is_success,
+                }
+            )
+    return results
+
+
+def run_stx_close_evaluate(settings: Settings, signal: StxCloseSignal) -> dict[str, Any]:
+    if not _STX_MODULES_OK:
+        raise RuntimeError("STX strategy modules not available on this server")
+
+    env = _stx_env_from_settings(settings)
+    if not is_paper(env):
+        raise ValueError(f"refusing non-paper Alpaca base: {alpaca_base(env)}")
+    if not (env.get("APCA_API_KEY_ID") or env.get("ALPACA_API_SECRET_KEY")):
+        raise ValueError("Alpaca credentials missing — set APCA_API_KEY_ID and APCA_API_SECRET_KEY")
+
+    state = read_state()
+    cfg = _stx_config_from_signal(signal, state)
+    prior_move_pct: float | None = None
+    if signal.mode != "poll" and state and isinstance(state.get("snapshot"), dict):
+        raw = state["snapshot"].get("underlying_move_pct")
+        prior_move_pct = float(raw) if raw is not None else None
+
+    with httpx.Client() as client:
+        snap, legs, fetch_ok = _stx_fresh_snapshot(client, env, cfg, prior_move_pct=prior_move_pct)
+        if not fetch_ok:
+            raise RuntimeError("could not fetch Alpaca positions — aborting for safety")
+        rec = build_recommendation(snap, cfg, now_et=datetime.now(ET))
+        state_written = False
+        if signal.mode == "poll":
+            write_state(cfg, snap, rec)
+            state_written = True
+
+        watcher_rec = state.get("recommendation") if state else None
+        return {
+            "success": True,
+            "action_taken": signal.mode,
+            "symbol": cfg.short_symbol,
+            "position_open": snap.position_open,
+            "open_legs": [leg.get("symbol") for leg in legs],
+            "snapshot": asdict(snap),
+            "recommendation": asdict(rec),
+            "watcher_state_written": state_written,
+            "watcher_recommendation": watcher_rec,
+            "dry_run": not settings.is_live,
+        }
+
+
+def run_stx_close_execute(settings: Settings, signal: StxCloseSignal) -> dict[str, Any]:
+    eval_result = run_stx_close_evaluate(
+        settings,
+        StxCloseSignal(
+            underlying=signal.underlying,
+            expiration=signal.expiration,
+            strike=signal.strike,
+            option_type=signal.option_type,
+            mode="evaluate",
+            confirm_close=signal.confirm_close,
+            prev_close_iv=signal.prev_close_iv,
+            poll_seconds=signal.poll_seconds,
+        ),
+    )
+    rec_raw = eval_result.get("recommendation") or {}
+    action = str(rec_raw.get("action", "hold"))
+    if not eval_result.get("position_open") or action == "hold":
+        return {
+            **eval_result,
+            "action_taken": "no_close_needed",
+            "orders": [],
+            "message": "Position closed or HOLD — no orders sent",
+        }
+
+    env = _stx_env_from_settings(settings)
+    state = read_state()
+    cfg = _stx_config_from_signal(signal, state)
+    dry_run = not settings.is_live
+
+    with httpx.Client() as client:
+        snap, legs, fetch_ok = _stx_fresh_snapshot(
+            client,
+            env,
+            cfg,
+            prior_move_pct=(eval_result.get("snapshot") or {}).get("underlying_move_pct"),
+        )
+        if not fetch_ok:
+            raise RuntimeError("could not fetch Alpaca positions for execute")
+        rec = build_recommendation(snap, cfg, now_et=datetime.now(ET))
+        orders = _stx_execute_recommendation(client, env, cfg, legs, rec, dry_run=dry_run)
+
+    return {
+        **eval_result,
+        "action_taken": "executed" if not dry_run else "dry_run_executed",
+        "orders": orders,
+        "message": "STX close orders submitted" if not dry_run else "STX close dry-run complete",
+    }
+
+
+async def process_stx_close_execute(settings: Settings, signal: StxCloseSignal) -> None:
+    try:
+        result = await asyncio.to_thread(run_stx_close_execute, settings, signal)
+        logger.info(
+            "STX close execute complete symbol=%s action=%s orders=%s",
+            result.get("symbol"),
+            result.get("action_taken"),
+            len(result.get("orders") or []),
+        )
+        record_activity(
+            "stx-close",
+            str(result.get("action_taken", "executed")),
+            str(result.get("message", "STX close processed"))[:200],
+            ticker=signal.underlying,
+            extra={"symbol": result.get("symbol"), "orders": len(result.get("orders") or [])},
+        )
+    except Exception as exc:
+        logger.exception("STX close execute failed: %s", exc)
+        record_activity(
+            "stx-close",
+            "failed",
+            str(exc)[:200],
+            ticker=signal.underlying,
+        )
+
+
 @app.get("/health")
 async def health() -> dict[str, Any]:
     s = get_settings()
@@ -3108,3 +3411,156 @@ async def warning_endpoint(
             "notifications": {},
         },
     )
+
+
+@app.post("/webhook/stx-close")
+async def stx_close_endpoint(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    x_webhook_secret: str | None = Header(default=None, alias="X-Webhook-Secret"),
+) -> JSONResponse:
+    """
+    STX strategy webhook — poll watcher state, evaluate kill matrix, or queue close.
+
+    Modes (JSON field ``mode``):
+      - poll: one read-only watcher cycle -> writes backend-config/stx_watcher_state.json
+      - evaluate: fresh quote + recommendation (default, no orders)
+      - execute: requires confirmClose=true; queues stx_kill order logic in background
+    """
+    settings = get_settings()
+    dry_run = not settings.is_live
+
+    if not _STX_MODULES_OK:
+        logger.error("STX webhook rejected — strategy modules missing on server")
+        return JSONResponse(
+            status_code=503,
+            content={
+                "success": False,
+                "action_taken": "stx_unavailable",
+                "message": "STX strategy modules not installed on this server",
+                "dry_run": dry_run,
+            },
+        )
+
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        logger.warning("Invalid STX webhook JSON: %s", exc)
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": False,
+                "action_taken": "invalid_json",
+                "message": f"Invalid JSON body — use JSON alert message only: {exc}",
+                "dry_run": dry_run,
+            },
+        )
+
+    if not isinstance(payload, dict):
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": False,
+                "action_taken": "invalid_payload",
+                "message": "Alert body must be a JSON object",
+                "dry_run": dry_run,
+            },
+        )
+
+    provided, payload = extract_webhook_secret(payload, x_webhook_secret)
+    auth_err = webhook_auth_error(provided, settings.webhook_secret)
+    if auth_err:
+        logger.warning("STX webhook auth failed: %s", auth_err)
+        return JSONResponse(
+            status_code=401,
+            content={
+                "success": False,
+                "action_taken": "auth_failed",
+                "message": auth_err,
+                "dry_run": dry_run,
+            },
+        )
+
+    try:
+        signal = StxCloseSignal.model_validate(payload)
+    except ValidationError as exc:
+        logger.warning("STX signal rejected: %s", exc)
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": False,
+                "action_taken": "invalid_signal",
+                "message": f"Bad STX payload: {exc}",
+                "dry_run": dry_run,
+            },
+        )
+
+    if signal.mode == "execute":
+        if not signal.confirm_close:
+            record_activity(
+                "stx-close",
+                "confirm_required",
+                "execute mode requires confirmClose=true",
+                ticker=signal.underlying,
+            )
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "success": False,
+                    "action_taken": "confirm_required",
+                    "message": "execute mode requires confirmClose=true in JSON payload",
+                    "dry_run": dry_run,
+                },
+            )
+        background_tasks.add_task(process_stx_close_execute, settings, signal)
+        logger.info("Queued background STX close execute for %s", signal.underlying)
+        record_activity(
+            "stx-close",
+            "accepted",
+            f"execute queued ({signal.underlying})",
+            ticker=signal.underlying,
+            extra={"mode": signal.mode},
+        )
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": True,
+                "action_taken": "accepted",
+                "message": "STX close signal accepted — processing in background",
+                "mode": signal.mode,
+                "processing": True,
+                "dry_run": dry_run,
+            },
+        )
+
+    try:
+        result = await asyncio.to_thread(run_stx_close_evaluate, settings, signal)
+    except Exception as exc:
+        logger.exception("STX close evaluate failed: %s", exc)
+        record_activity("stx-close", "failed", str(exc)[:200], ticker=signal.underlying)
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": False,
+                "action_taken": "failed",
+                "message": str(exc),
+                "dry_run": dry_run,
+            },
+        )
+
+    rec = result.get("recommendation") or {}
+    record_activity(
+        "stx-close",
+        str(result.get("action_taken", signal.mode)),
+        f"{rec.get('action', 'hold')} limit={rec.get('limit_price')}",
+        ticker=signal.underlying,
+        extra={"symbol": result.get("symbol")},
+    )
+    logger.info(
+        "STX %s complete %s rec=%s",
+        signal.mode,
+        result.get("symbol"),
+        rec.get("action"),
+    )
+    return JSONResponse(status_code=200, content=result)
+
