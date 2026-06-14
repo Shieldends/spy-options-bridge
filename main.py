@@ -151,16 +151,16 @@ class Settings(BaseSettings):
     auto_close_on_warning: bool = Field(default=True, alias="AUTO_CLOSE_ON_WARNING")
     warning_close_multiplier: float = Field(default=1.2, alias="WARNING_CLOSE_MULTIPLIER")
     warning_cancel_resting_exits: bool = Field(default=True, alias="WARNING_CANCEL_RESTING_EXITS")
-    default_dte_filter: str = Field(default="weekly", alias="DEFAULT_DTE_FILTER")
+    default_dte_filter: str = Field(default="0dte", alias="DEFAULT_DTE_FILTER")
     alpaca_exit_fill_timeout: int = Field(default=600, alias="ALPACA_EXIT_FILL_TIMEOUT")
     alpaca_exit_poll_seconds: float = Field(default=3.0, alias="ALPACA_EXIT_POLL_SECONDS")
     auto_chase_entry_fill: bool = Field(default=True, alias="AUTO_CHASE_ENTRY_FILL")
-    entry_chase_wait_seconds: float = Field(default=2.0, alias="ENTRY_CHASE_WAIT_SECONDS")
+    entry_chase_wait_seconds: float = Field(default=4.0, alias="ENTRY_CHASE_WAIT_SECONDS")
     entry_chase_poll_seconds: float = Field(default=1.5, alias="ENTRY_CHASE_POLL_SECONDS")
-    entry_chase_max_attempts: int = Field(default=20, alias="ENTRY_CHASE_MAX_ATTEMPTS")
-    entry_chase_floor_extra_polls: int = Field(default=12, alias="ENTRY_CHASE_FLOOR_EXTRA_POLLS")
-    entry_min_credit: float = Field(default=0.05, alias="ENTRY_MIN_CREDIT")
-    paper_force_min_fill: bool = Field(default=True, alias="PAPER_FORCE_MIN_FILL")
+    entry_chase_max_attempts: int = Field(default=25, alias="ENTRY_CHASE_MAX_ATTEMPTS")
+    entry_chase_floor_extra_polls: int = Field(default=15, alias="ENTRY_CHASE_FLOOR_EXTRA_POLLS")
+    entry_min_credit: float = Field(default=0.01, alias="ENTRY_MIN_CREDIT")
+    paper_force_min_fill: bool = Field(default=False, alias="PAPER_FORCE_MIN_FILL")
     auto_cancel_conflicting_orders: bool = Field(
         default=True, alias="AUTO_CANCEL_CONFLICTING_ORDERS"
     )
@@ -179,9 +179,9 @@ class Settings(BaseSettings):
 
     default_underlying: str = Field(default="SPY", alias="DEFAULT_UNDERLYING")
     default_quantity: int = Field(default=1, alias="DEFAULT_QUANTITY")
-    default_strike_offset_short: int = Field(default=-5, alias="DEFAULT_STRIKE_OFFSET_SHORT")
-    default_strike_offset_long: int = Field(default=-8, alias="DEFAULT_STRIKE_OFFSET_LONG")
-    default_limit_credit: float = Field(default=0.35, alias="DEFAULT_LIMIT_CREDIT")
+    default_strike_offset_short: int = Field(default=-10, alias="DEFAULT_STRIKE_OFFSET_SHORT")
+    default_strike_offset_long: int = Field(default=-15, alias="DEFAULT_STRIKE_OFFSET_LONG")
+    default_limit_credit: float = Field(default=0.45, alias="DEFAULT_LIMIT_CREDIT")
     default_fill_mode: str = Field(default="exercise", alias="DEFAULT_FILL_MODE")
     # fixed | auto | aggressive | exercise | fill — exercise/fill lean low for paper fills
     max_quantity: int = Field(default=0, alias="MAX_QUANTITY")
@@ -192,7 +192,7 @@ class Settings(BaseSettings):
     spread_min_credit: float = Field(default=0.40, alias="SPREAD_MIN_CREDIT")
     spread_max_trades_per_day: int = Field(default=5, alias="SPREAD_MAX_TRADES_PER_DAY")
     spread_daily_loss_limit: float = Field(default=2000.0, alias="SPREAD_DAILY_LOSS_LIMIT")
-    spread_mode_only: bool = Field(default=False, alias="SPREAD_MODE_ONLY")
+    spread_mode_only: bool = Field(default=True, alias="SPREAD_MODE_ONLY")
 
     @property
     def is_live(self) -> bool:
@@ -263,8 +263,8 @@ class TradingViewSignal(BaseModel):
     strategy: SpreadStrategy | None = None
     signal_price: float | None = Field(default=None, alias="signalPrice")
     quantity: int = 1
-    strike_offset_short: int = Field(default=-5, alias="strikeOffsetShort")
-    strike_offset_long: int = Field(default=-8, alias="strikeOffsetLong")
+    strike_offset_short: int = Field(default=-10, alias="strikeOffsetShort")
+    strike_offset_long: int = Field(default=-15, alias="strikeOffsetLong")
     short_strike: float | None = Field(default=None, alias="short_strike")
     long_strike: float | None = Field(default=None, alias="long_strike")
     limit_credit: float | None = Field(default=None, alias="limitCredit")
@@ -2808,6 +2808,11 @@ async def health() -> dict[str, Any]:
         "email_enabled": s.email_enabled,
         "api": s.apca_api_base_url if s.use_alpaca else s.tastytrade_api_base_url,
         "dte_filter_default": s.default_dte_filter,
+        "spread_mode_only": str(s.spread_mode_only),
+        "default_strike_offset_short": str(s.default_strike_offset_short),
+        "default_strike_offset_long": str(s.default_strike_offset_long),
+        "default_limit_credit": str(s.default_limit_credit),
+        "spread_min_credit": str(s.spread_min_credit),
         "auto_close_on_warning": str(s.auto_close_on_warning),
         "warning_close_multiplier": str(s.warning_close_multiplier),
         "default_fill_mode": s.default_fill_mode,
