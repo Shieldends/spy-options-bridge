@@ -33,14 +33,20 @@ async def fetch_alpaca_account(settings: Any) -> dict[str, Any]:
 
 def _mleg_order_filled(o: dict[str, Any]) -> bool:
     """True only when Alpaca reports a real fill (not resting/canceled 0/1)."""
-    if str(o.get("order_class") or "").lower() != "mleg":
-        return False
-    if str(o.get("status") or "").lower() == "filled":
-        return True
-    try:
-        return float(o.get("filled_qty") or 0) > 0
-    except (TypeError, ValueError):
-        return False
+    if str(o.get("order_class") or "").lower() == "mleg":
+        if str(o.get("status") or "").lower() == "filled":
+            return True
+        try:
+            return float(o.get("filled_qty") or 0) > 0
+        except (TypeError, ValueError):
+            return False
+    # Paper spread legs: two simple orders — count short-leg sell fills as spread entry
+    if str(o.get("order_class") or "").lower() == "simple" and str(o.get("side") or "").lower() == "sell":
+        try:
+            return float(o.get("filled_qty") or 0) > 0
+        except (TypeError, ValueError):
+            return False
+    return False
 
 
 async def count_today_mleg_filled_entries(settings: Any) -> int:

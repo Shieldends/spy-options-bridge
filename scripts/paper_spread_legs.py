@@ -17,11 +17,12 @@ PAPER_CLOSE_CHASE_STEP = 0.02
 
 
 def should_use_paper_spread_legs(settings: Any, spread: Any) -> bool:
+    """Alpaca paper never fills mleg — any 2-leg spread uses single-leg orders."""
     return bool(
         settings.use_alpaca
         and settings.is_alpaca_paper
-        and spread.metadata.get("strategy") == "put_credit_spread"
         and not spread.metadata.get("single_leg")
+        and len(getattr(spread, "legs", []) or []) >= 2
     )
 
 
@@ -111,7 +112,16 @@ async def submit_paper_spread_entry(settings: Any, spread: Any, *, dry_run: bool
     filled_short = await wait_order_filled(settings, short_id)
     if not filled_short:
         await _cancel_order(settings, short_id)
-        return False, "Short leg did not fill on Alpaca paper", {"short_order_id": short_id}
+        market_short = {**short_payload, "type": "market"}
+        market_short.pop("limit_price", None)
+        ok_ms, body_ms, msg_ms = await _post_order(settings, market_short)
+        if not ok_ms:
+            return False, f"Short leg limit+market failed: {msg_ms}", {"short_order_id": short_id}
+        short_id = str(body_ms.get("id", ""))
+        filled_short = await wait_order_filled(settings, short_id, max_wait_sec=35.0)
+        if not filled_short:
+            await _cancel_order(settings, short_id)
+            return False, "Short leg did not fill on Alpaca paper (limit or market)", {"short_order_id": short_id}
 
     long_payload = {
         "symbol": long_sym,
@@ -249,7 +259,27 @@ async def open_crush_it_short_put(
     filled = await wait_order_filled(settings, oid)
     if not filled:
         await _cancel_order(settings, oid)
-        return False, f"Crush-It open did not fill: {sym}", {"order_id": oid}
+        market_payload = {
+            "symbol": sym,
+            "qty": str(quantity),
+            "side": "sell",
+            "type": "market",
+            "time_in_force": "day",
+        }
+        ok_m, body_m, msg_m = await _post_order(settings, market_payload)
+        if not ok_m:
+            return False, f"Crush-It open limit+market failed: {sym} ({msg_m})", {"order_id": oid}
+        oid = str(body_m.get("id", ""))
+        filled = await wait_order_filled(settings, oid, max_wait_sec=35.0)
+        if not filled:
+            await _cancel_order(settings, oid)
+            return False, f"Crush-It open did not fill (limit or market): {sym}", {"order_id": oid}
+        return True, f"Crush-It short opened {sym} @ market (limit ${PAPER_SELL_LIMIT:.2f} missed)", {
+            "order_id": oid,
+            "symbol": sym,
+            "filled": True,
+            "fill_mode": "market_fallback",
+        }
 
     return True, f"Crush-It short opened {sym} @ paper limit ${PAPER_SELL_LIMIT:.2f}", {
         "order_id": oid,

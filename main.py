@@ -1,5 +1,5 @@
 """
-spy-options-bridge v5.5.18 — ALPACA PAPER (default broker)
+spy-options-bridge v5.5.19 — ALPACA PAPER (default broker)
 
 TradingView webhook → Render → Alpaca multi-leg SPY put credit spreads.
 
@@ -32,6 +32,7 @@ Endpoints:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sys
 import time
@@ -101,6 +102,7 @@ BURST_ATTEMPTS_RESPONSE_CAP = 5
 PREFLIGHT_TIMEOUT_SEC = 4.0
 ET = ZoneInfo("America/New_York")
 _activity_log: deque[dict[str, Any]] = deque(maxlen=250)
+_ACTIVITY_LOG_PATH = Path(__file__).resolve().parent / "logs" / "activity.jsonl"
 CERT_URL = "https://api.cert.tastyworks.com"
 ALPACA_PAPER_URL = "https://paper-api.alpaca.markets"
 
@@ -113,7 +115,7 @@ def record_activity(
     ticker: str = "SPY",
     extra: dict[str, Any] | None = None,
 ) -> None:
-    """Ring buffer of webhook events for /activity (resets on Render restart)."""
+    """Ring buffer + append-only file for /activity (file survives Render restart)."""
     row: dict[str, Any] = {
         "ts_et": datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET"),
         "kind": kind,
@@ -124,6 +126,12 @@ def record_activity(
     if extra:
         row.update(extra)
     _activity_log.append(row)
+    try:
+        _ACTIVITY_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with _ACTIVITY_LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, default=str) + "\n")
+    except Exception as exc:
+        logger.debug("activity file append skipped: %s", exc)
 
 
 # ── Settings ──────────────────────────────────────────────────────────────────
@@ -166,7 +174,7 @@ class Settings(BaseSettings):
     entry_chase_max_attempts: int = Field(default=25, alias="ENTRY_CHASE_MAX_ATTEMPTS")
     entry_chase_floor_extra_polls: int = Field(default=15, alias="ENTRY_CHASE_FLOOR_EXTRA_POLLS")
     entry_min_credit: float = Field(default=0.01, alias="ENTRY_MIN_CREDIT")
-    paper_force_min_fill: bool = Field(default=False, alias="PAPER_FORCE_MIN_FILL")
+    paper_force_min_fill: bool = Field(default=True, alias="PAPER_FORCE_MIN_FILL")
     auto_cancel_conflicting_orders: bool = Field(
         default=True, alias="AUTO_CANCEL_CONFLICTING_ORDERS"
     )
@@ -1634,6 +1642,14 @@ async def submit_alpaca_order(settings: Settings, payload: dict, *, dry_run: boo
             payload=clean,
         )
 
+    if settings.is_alpaca_paper and str(clean.get("order_class", "")).lower() == "mleg":
+        return OrderResult(
+            success=False,
+            message="Alpaca paper blocks mleg — use paper spread legs (single-leg path)",
+            dry_run=False,
+            payload=clean,
+        )
+
     if not settings.alpaca_configured:
         return OrderResult(
             success=False,
@@ -2021,7 +2037,17 @@ async def submit_entry_sync_chase(
             "limit_credit": spread.metadata.get("limit_credit"),
         }
 
-    order_id = str((entry.broker_response or {}).get("id") or "")
+    meta = entry.broker_response or entry.payload or {}
+    if spread.metadata.get("paper_spread_legs") or meta.get("paper_spread_legs"):
+        return {
+            "filled": True,
+            "order_id": meta.get("short_order_id") or meta.get("order_id"),
+            "status": "filled",
+            "message": entry.message,
+            "limit_credit": meta.get("net_credit_estimate") or spread.metadata.get("limit_credit"),
+        }
+
+    order_id = str(meta.get("id") or "")
     if not order_id:
         return {
             "filled": False,
@@ -2228,6 +2254,7 @@ async def submit_entry_from_signal(
     if signal.is_short_put and spread.metadata.get("entry_batch_size"):
         entry = await submit_short_put_batches(settings, spread, signal, dry_run=dry_run)
     elif should_use_paper_spread_legs(settings, spread):
+        logger.info("Alpaca paper: using leg-by-leg spread entry (no mleg)")
         ok, msg, meta = await submit_paper_spread_entry(settings, spread, dry_run=dry_run)
         spread.metadata["paper_spread_legs"] = True
         if meta.get("net_credit_estimate") is not None:
@@ -2238,6 +2265,13 @@ async def submit_entry_from_signal(
             dry_run=dry_run,
             payload=meta,
             broker_response=meta,
+        )
+    elif settings.is_alpaca_paper and len(spread.legs) >= 2 and not spread.metadata.get("single_leg"):
+        logger.error("Alpaca paper 2-leg spread reached mleg path — blocked")
+        entry = OrderResult(
+            success=False,
+            message="Alpaca paper requires leg-by-leg spread entry",
+            dry_run=dry_run,
         )
     else:
         entry_payload = build_alpaca_entry_payload(spread) if settings.use_alpaca else build_entry_payload(spread)
@@ -2303,12 +2337,13 @@ async def process_entry_alert(settings: Settings, signal: TradingViewSignal) -> 
         expiration = spread.metadata["expiration"]
 
         if entry.success:
+            outcome = "filled" if spread.metadata.get("paper_spread_legs") else "submitted"
             record_activity(
                 "entry",
-                "filled",
-                f"Order submitted exp={expiration} credit=${spread.metadata.get('limit_credit')}",
+                outcome,
+                f"{'Legs filled' if outcome == 'filled' else 'Order submitted (mleg)'} exp={expiration} credit=${spread.metadata.get('limit_credit')}",
                 ticker=signal.ticker,
-                extra={"strategy": spread.metadata.get("strategy")},
+                extra={"strategy": spread.metadata.get("strategy"), "paper_spread_legs": spread.metadata.get("paper_spread_legs")},
             )
             await notify(
                 settings,
@@ -2570,7 +2605,7 @@ def coerce_signal(payload: dict, settings: Settings) -> TradingViewSignal:
 
 app = FastAPI(
     title="spy-options-bridge",
-    version="5.5.18",
+    version="5.5.19",
     description="TradingView → Alpaca Paper credit spreads + short puts + conservative close",
 )
 
@@ -2883,6 +2918,16 @@ async def process_stx_open_execute(settings: Settings, signal: StxCloseSignal) -
     try:
         if not signal.expiration or signal.strike is None:
             raise ValueError("open mode requires expiration and strike in JSON")
+        try:
+            exp_date = datetime.strptime(signal.expiration[:10], "%Y-%m-%d").date()
+            if exp_date < datetime.now(ET).date():
+                raise ValueError(
+                    f"expiration {signal.expiration} is in the past — update TV JSON to a live put"
+                )
+        except ValueError as exc:
+            if "past" in str(exc):
+                raise
+            raise ValueError(f"invalid expiration format: {signal.expiration}") from exc
         dry_run = not settings.is_live
         ok, msg, meta = await open_crush_it_short_put(
             settings,
@@ -2947,7 +2992,7 @@ async def health() -> dict[str, Any]:
     tv_pause_risk = build_tv_pause_risk(s, preflight)
     return {
         "status": "ok" if tv_pause_risk["level"] != "red" else "degraded",
-        "version": "5.5.18",
+        "version": "5.5.19",
         "burst_endpoint": "/exercise/burst",
         "auto_take_profit": str(s.auto_take_profit),
         "auto_stop_loss": str(s.auto_stop_loss),
@@ -2984,21 +3029,44 @@ async def health() -> dict[str, Any]:
 @app.get("/ping")
 async def ping() -> dict[str, str]:
     """Lightweight keep-alive for cron pings (prevents Render free-tier cold starts)."""
-    return {"status": "ok", "version": "5.5.18"}
+    return {"status": "ok", "version": "5.5.19"}
 
 
 @app.get("/activity")
 async def activity_log() -> dict[str, Any]:
-    """Today's webhook timeline — pair with Desktop SPREAD-ACTIVITY digest."""
+    """Today's webhook timeline — merges memory + logs/activity.jsonl on disk."""
     today = datetime.now(ET).strftime("%Y-%m-%d")
-    events = [e for e in _activity_log if str(e.get("ts_et", "")).startswith(today)]
-    events.reverse()
+    events: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def _add(row: dict[str, Any]) -> None:
+        ts = str(row.get("ts_et", ""))
+        if not ts.startswith(today):
+            return
+        key = f"{ts}|{row.get('kind')}|{row.get('outcome')}|{row.get('message', '')[:80]}"
+        if key in seen:
+            return
+        seen.add(key)
+        events.append(row)
+
+    for e in _activity_log:
+        _add(e)
+    if _ACTIVITY_LOG_PATH.is_file():
+        try:
+            for line in _ACTIVITY_LOG_PATH.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                _add(json.loads(line))
+        except Exception as exc:
+            logger.debug("activity file read skipped: %s", exc)
+    events.sort(key=lambda r: str(r.get("ts_et", "")), reverse=True)
     return {
         "status": "ok",
-        "version": "5.5.18",
+        "version": "5.5.19",
         "today": today,
         "count": len(events),
-        "note": "In-memory log; clears on Render restart. Alpaca fills in SPREAD-ACTIVITY digest.",
+        "note": "Memory + logs/activity.jsonl. Alpaca proof = Activities tab fills.",
         "events": events,
     }
 
