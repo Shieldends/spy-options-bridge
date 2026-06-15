@@ -8,5 +8,5 @@
   "strikeOffsetLong": -15,
   "quantity": 1,
   "limitCredit": 0.45,
-  "fillMode": "aggressive"
+  "fillMode": "exercise"
 }

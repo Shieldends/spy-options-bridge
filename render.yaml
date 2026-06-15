@@ -25,13 +25,13 @@ services:
       - key: SPREAD_MIN_CREDIT
         value: "0.40"
       - key: SPREAD_MAX_TRADES_PER_DAY
-        value: "5"
+        value: "0"
       - key: SPREAD_DAILY_LOSS_LIMIT
         value: "2000"
       - key: DEFAULT_FILL_MODE
         value: exercise
       - key: PAPER_FORCE_MIN_FILL
-        value: false
+        value: true
       - key: AUTO_CHASE_ENTRY_FILL
         value: true
       - key: ENTRY_CHASE_WAIT_SECONDS

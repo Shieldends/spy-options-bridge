@@ -31,8 +31,20 @@ async def fetch_alpaca_account(settings: Any) -> dict[str, Any]:
         return r.json()
 
 
+def _mleg_order_filled(o: dict[str, Any]) -> bool:
+    """True only when Alpaca reports a real fill (not resting/canceled 0/1)."""
+    if str(o.get("order_class") or "").lower() != "mleg":
+        return False
+    if str(o.get("status") or "").lower() == "filled":
+        return True
+    try:
+        return float(o.get("filled_qty") or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
 async def count_today_mleg_filled_entries(settings: Any) -> int:
-    """Count filled multi-leg orders submitted today (ET date on created_at)."""
+    """Count multi-leg spread orders that actually filled today (ET created_at)."""
     base = settings.apca_api_base_url.rstrip("/")
     headers = _alpaca_headers(settings)
     today = _today_et()
@@ -49,7 +61,7 @@ async def count_today_mleg_filled_entries(settings: Any) -> int:
             created = str(o.get("created_at") or "")[:10]
             if created != today:
                 continue
-            if str(o.get("order_class") or "").lower() == "mleg" and o.get("filled_qty"):
+            if _mleg_order_filled(o):
                 n += 1
         return n
 
@@ -73,7 +85,7 @@ async def check_spread_entry_allowed(settings: Any, signal: Any) -> str | None:
         try:
             taken = await count_today_mleg_filled_entries(settings)
             if taken >= max_trades:
-                return f"Skip: max spread entries for today ({taken}/{max_trades})"
+                return f"Skip: max filled spreads for today ({taken}/{max_trades})"
         except Exception as exc:
             return f"Skip: could not verify daily trade count ({type(exc).__name__})"
 
