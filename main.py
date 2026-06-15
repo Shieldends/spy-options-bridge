@@ -1,5 +1,5 @@
 """
-spy-options-bridge v5.5.19 — ALPACA PAPER (default broker)
+spy-options-bridge v5.5.20 — ALPACA PAPER (default broker)
 
 TradingView webhook → Render → Alpaca multi-leg SPY put credit spreads.
 
@@ -410,6 +410,7 @@ class StxCloseSignal(BaseModel):
     underlying: str = "STX"
     expiration: str | None = None
     strike: float | None = None
+    dte_filter: str | None = Field(default=None, alias="dteFilter")
     option_type: str = Field(default="put", alias="type")
     mode: Literal["poll", "evaluate", "execute", "open"] = "evaluate"
     confirm_close: bool = Field(default=False, alias="confirmClose")
@@ -2605,7 +2606,7 @@ def coerce_signal(payload: dict, settings: Settings) -> TradingViewSignal:
 
 app = FastAPI(
     title="spy-options-bridge",
-    version="5.5.19",
+    version="5.5.20",
     description="TradingView → Alpaca Paper credit spreads + short puts + conservative close",
 )
 
@@ -2654,11 +2655,62 @@ def _stx_env_from_settings(settings: Settings) -> dict[str, str]:
     }
 
 
+def _resolve_stx_expiration(signal: StxCloseSignal) -> str:
+    """Auto-roll weekly/0dte like SPY — no manual YYYY-MM-DD in TV unless you want a fixed contract."""
+    raw = (signal.expiration or signal.dte_filter or "weekly").strip()
+    dte = signal.dte_filter
+    if dte or raw.lower() in {
+        "0dte", "today", "weekly", "week", "+0 week", "0dte_weekly",
+        "+1dte", "tomorrow", "+2dte",
+    }:
+        return resolve_dte_expiration(raw, dte or raw)
+    return resolve_dte_expiration(raw, dte)
+
+
+def _stx_config_from_open_position(
+    settings: Settings,
+    signal: StxCloseSignal,
+) -> StxConfig | None:
+    """Close uses the put you actually hold — not a stale JSON date."""
+    import httpx
+
+    base = settings.apca_api_base_url.rstrip("/")
+    headers = _alpaca_headers(settings)
+    try:
+        with httpx.Client(timeout=20.0) as client:
+            r = client.get(f"{base}/v2/positions", headers=headers)
+        if not r.is_success:
+            return None
+        for pos in r.json():
+            sym = str(pos.get("symbol", ""))
+            parsed = parse_occ_symbol(sym)
+            if not parsed:
+                continue
+            if parsed["underlying"] != signal.underlying.upper():
+                continue
+            if parsed["option_type"] != signal.option_type:
+                continue
+            qty = float(pos.get("qty") or 0)
+            if qty >= 0:
+                continue
+            return StxConfig(
+                underlying=signal.underlying,
+                expiration=parsed["expiration"],
+                option_type=parsed["option_type"],
+                strike=float(parsed["strike"]),
+                poll_seconds=signal.poll_seconds,
+                prev_close_iv=signal.prev_close_iv,
+            )
+    except Exception as exc:
+        logger.warning("STX position lookup failed: %s", exc)
+    return None
+
+
 def _stx_config_from_signal(signal: StxCloseSignal, state: dict[str, Any] | None) -> StxConfig:
-    if signal.expiration and signal.strike is not None:
+    if signal.strike is not None:
         return StxConfig(
             underlying=signal.underlying,
-            expiration=signal.expiration,
+            expiration=_resolve_stx_expiration(signal),
             option_type=signal.option_type,
             strike=float(signal.strike),
             poll_seconds=signal.poll_seconds,
@@ -2891,7 +2943,7 @@ def run_stx_close_execute(settings: Settings, signal: StxCloseSignal) -> dict[st
 
     env = _stx_env_from_settings(settings)
     state = read_state()
-    cfg = _stx_config_from_signal(signal, state)
+    cfg = _stx_config_from_open_position(settings, signal) or _stx_config_from_signal(signal, state)
     dry_run = not settings.is_live
 
     with httpx.Client() as client:
@@ -2916,23 +2968,17 @@ def run_stx_close_execute(settings: Settings, signal: StxCloseSignal) -> dict[st
 
 async def process_stx_open_execute(settings: Settings, signal: StxCloseSignal) -> None:
     try:
-        if not signal.expiration or signal.strike is None:
-            raise ValueError("open mode requires expiration and strike in JSON")
-        try:
-            exp_date = datetime.strptime(signal.expiration[:10], "%Y-%m-%d").date()
-            if exp_date < datetime.now(ET).date():
-                raise ValueError(
-                    f"expiration {signal.expiration} is in the past — update TV JSON to a live put"
-                )
-        except ValueError as exc:
-            if "past" in str(exc):
-                raise
-            raise ValueError(f"invalid expiration format: {signal.expiration}") from exc
+        if signal.strike is None:
+            raise ValueError("open mode requires strike in JSON")
+        expiration = _resolve_stx_expiration(signal)
+        exp_date = datetime.strptime(expiration[:10], "%Y-%m-%d").date()
+        if exp_date < datetime.now(ET).date():
+            raise ValueError(f"resolved expiration {expiration} is in the past")
         dry_run = not settings.is_live
         ok, msg, meta = await open_crush_it_short_put(
             settings,
             underlying=signal.underlying,
-            expiration=signal.expiration,
+            expiration=expiration,
             strike=float(signal.strike),
             option_type=signal.option_type,
             quantity=signal.quantity,
@@ -2992,7 +3038,7 @@ async def health() -> dict[str, Any]:
     tv_pause_risk = build_tv_pause_risk(s, preflight)
     return {
         "status": "ok" if tv_pause_risk["level"] != "red" else "degraded",
-        "version": "5.5.19",
+        "version": "5.5.20",
         "burst_endpoint": "/exercise/burst",
         "auto_take_profit": str(s.auto_take_profit),
         "auto_stop_loss": str(s.auto_stop_loss),
@@ -3029,7 +3075,7 @@ async def health() -> dict[str, Any]:
 @app.get("/ping")
 async def ping() -> dict[str, str]:
     """Lightweight keep-alive for cron pings (prevents Render free-tier cold starts)."""
-    return {"status": "ok", "version": "5.5.19"}
+    return {"status": "ok", "version": "5.5.20"}
 
 
 @app.get("/activity")
@@ -3063,7 +3109,7 @@ async def activity_log() -> dict[str, Any]:
     events.sort(key=lambda r: str(r.get("ts_et", "")), reverse=True)
     return {
         "status": "ok",
-        "version": "5.5.19",
+        "version": "5.5.20",
         "today": today,
         "count": len(events),
         "note": "Memory + logs/activity.jsonl. Alpaca proof = Activities tab fills.",
