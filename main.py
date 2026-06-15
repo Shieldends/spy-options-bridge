@@ -1,5 +1,5 @@
 """
-spy-options-bridge v5.5.17 — ALPACA PAPER (default broker)
+spy-options-bridge v5.5.18 — ALPACA PAPER (default broker)
 
 TradingView webhook → Render → Alpaca multi-leg SPY put credit spreads.
 
@@ -52,6 +52,12 @@ if _scripts_dir.is_dir() and str(_scripts_dir) not in sys.path:
     sys.path.insert(0, str(_scripts_dir))
 from team_email import bridge_notify as team_bridge_notify  # noqa: E402
 from spread_guards import check_spread_entry_allowed  # noqa: E402
+from paper_spread_legs import (  # noqa: E402
+    close_paper_spread_legs,
+    open_crush_it_short_put,
+    should_use_paper_spread_legs,
+    submit_paper_spread_entry,
+)
 
 try:
     from dataclasses import asdict
@@ -397,8 +403,10 @@ class StxCloseSignal(BaseModel):
     expiration: str | None = None
     strike: float | None = None
     option_type: str = Field(default="put", alias="type")
-    mode: Literal["poll", "evaluate", "execute"] = "evaluate"
+    mode: Literal["poll", "evaluate", "execute", "open"] = "evaluate"
     confirm_close: bool = Field(default=False, alias="confirmClose")
+    confirm_open: bool = Field(default=False, alias="confirmOpen")
+    quantity: int = Field(default=1, ge=1)
     prev_close_iv: float | None = Field(default=None, alias="prevCloseIv")
     poll_seconds: int = Field(default=15, alias="pollSeconds")
 
@@ -840,12 +848,16 @@ async def resolve_entry_limit_credit(
     pin_paper_credit = (
         settings.use_alpaca
         and settings.is_alpaca_paper
-        and (settings.paper_force_min_fill or is_spread)
+        and (
+            settings.paper_force_min_fill
+            or is_spread
+            or spread.metadata.get("strategy") == "short_put"
+        )
     )
 
-    # Alpaca paper: pin to entry_min_credit so simulator fills (spreads always).
+    # Alpaca paper: pin to low limit so simulator fills (spreads + crush-it shorts).
     if pin_paper_credit:
-        credit = round(settings.entry_min_credit, 2)
+        credit = round(max(settings.entry_min_credit, 0.05), 2)
         meta["fill_mode_resolved"] = "paper_force_min"
         meta["limit_credit_final"] = credit
         logger.info("Paper force fill: entry credit pinned to $%s", credit)
@@ -2215,6 +2227,18 @@ async def submit_entry_from_signal(
 
     if signal.is_short_put and spread.metadata.get("entry_batch_size"):
         entry = await submit_short_put_batches(settings, spread, signal, dry_run=dry_run)
+    elif should_use_paper_spread_legs(settings, spread):
+        ok, msg, meta = await submit_paper_spread_entry(settings, spread, dry_run=dry_run)
+        spread.metadata["paper_spread_legs"] = True
+        if meta.get("net_credit_estimate") is not None:
+            spread.metadata["limit_credit"] = meta["net_credit_estimate"]
+        entry = OrderResult(
+            success=ok,
+            message=msg,
+            dry_run=dry_run,
+            payload=meta,
+            broker_response=meta,
+        )
     else:
         entry_payload = build_alpaca_entry_payload(spread) if settings.use_alpaca else build_entry_payload(spread)
         entry = await submit_order(settings, entry_payload, dry_run=dry_run)
@@ -2256,6 +2280,19 @@ def schedule_alpaca_exits_after_entry(
     )
     logger.info("Alpaca: scheduled auto GTC exits after fill for order %s", order_id)
     return str(order_id)
+
+
+async def place_paper_spread_exits(settings: Settings, spread: SpreadPackage) -> None:
+    """Paper spreads: legs are open; notify — warning alert handles emergency close."""
+    ticker = str(spread.metadata.get("underlying", "SPY"))
+    credit = spread.metadata.get("limit_credit", "?")
+    await notify(
+        settings,
+        "Paper Spread Position Open",
+        f"{ticker} put credit spread legs filled (~${credit} net). "
+        f"Warning alert auto-closes on danger. Check Alpaca Positions.",
+        "SUCCESS",
+    )
 
 
 async def process_entry_alert(settings: Settings, signal: TradingViewSignal) -> None:
@@ -2309,6 +2346,9 @@ async def process_entry_alert(settings: Settings, signal: TradingViewSignal) -> 
                         "SUCCESS",
                     )
 
+        elif spread.metadata.get("paper_spread_legs"):
+            if settings.auto_take_profit or settings.auto_stop_loss:
+                asyncio.create_task(place_paper_spread_exits(settings, spread))
         elif not spread.metadata.get("single_leg"):
             schedule_alpaca_exits_after_entry(settings, spread, entry, entry_credit)
     except Exception as exc:
@@ -2484,9 +2524,25 @@ async def process_warning_alert(
     await notify(
         settings,
         "Warning — Auto-Close Submitting",
-        f"{msg}\nClosing spread at ${close_debit:.2f} debit (multi-leg). Survival odds were {survival * 100:.1f}%.",
+        f"{msg}\nClosing spread at ${close_debit:.2f} debit. Survival odds were {survival * 100:.1f}%.",
         "CRITICAL",
     )
+
+    if settings.is_alpaca_paper:
+        ok, msg = await close_paper_spread_legs(settings, spread, dry_run=dry_run)
+        record_activity(
+            "warning",
+            "closed" if ok else "failed",
+            msg[:200],
+            ticker=warning.ticker,
+        )
+        await notify(
+            settings,
+            "Warning — Spread Closed" if ok else "Warning — Close Failed",
+            f"{msg}\nSurvival odds were {survival * 100:.1f}%.",
+            "SUCCESS" if ok else "CRITICAL",
+        )
+        return
 
     close_order = await submit_alpaca_order(settings, close_payload, dry_run=dry_run)
     if not close_order.success:
@@ -2514,7 +2570,7 @@ def coerce_signal(payload: dict, settings: Settings) -> TradingViewSignal:
 
 app = FastAPI(
     title="spy-options-bridge",
-    version="5.5.17",
+    version="5.5.18",
     description="TradingView → Alpaca Paper credit spreads + short puts + conservative close",
 )
 
@@ -2627,6 +2683,32 @@ def _stx_fresh_snapshot(
     return snap, legs, fetch_ok
 
 
+def _stx_poll_order_filled(
+    client: httpx.Client,
+    base: str,
+    h: dict[str, str],
+    order_id: str,
+    *,
+    timeout_sec: float = 22.0,
+    poll_sec: float = 1.5,
+) -> bool:
+    import time
+
+    deadline = time.time() + timeout_sec
+    terminal = {"canceled", "expired", "rejected", "failed", "done_for_day"}
+    while time.time() < deadline:
+        r = client.get(f"{base}/v2/orders/{order_id}", headers=h, timeout=20)
+        if r.is_success:
+            o = r.json()
+            status = str(o.get("status", "")).lower()
+            if status == "filled" or float(o.get("filled_qty") or 0) > 0:
+                return True
+            if status in terminal:
+                return False
+        time.sleep(poll_sec)
+    return False
+
+
 def _stx_execute_recommendation(
     client: httpx.Client,
     env: dict[str, str],
@@ -2672,14 +2754,37 @@ def _stx_execute_recommendation(
             results.append({"symbol": cfg.short_symbol, "action": "limit_close", "order": order, "dry_run": True})
         else:
             r = client.post(f"{base}/v2/orders", headers=h, json=order, timeout=30)
-            results.append(
-                {
-                    "symbol": cfg.short_symbol,
-                    "action": "limit_close",
-                    "http_status": r.status_code,
-                    "ok": r.is_success,
-                }
-            )
+            ok = r.is_success
+            oid = ""
+            if ok:
+                try:
+                    oid = str(r.json().get("id", ""))
+                except Exception:
+                    oid = ""
+            filled = bool(oid) and _stx_poll_order_filled(client, base, h, oid)
+            if ok and not filled and oid:
+                client.delete(f"{base}/v2/orders/{oid}", headers=h, timeout=20)
+                mr = client.delete(f"{base}/v2/positions/{cfg.short_symbol}", headers=h, timeout=30)
+                results.append(
+                    {
+                        "symbol": cfg.short_symbol,
+                        "action": "limit_close_then_market",
+                        "http_status": mr.status_code,
+                        "ok": mr.is_success,
+                        "filled": mr.is_success,
+                    }
+                )
+            else:
+                results.append(
+                    {
+                        "symbol": cfg.short_symbol,
+                        "action": "limit_close",
+                        "http_status": r.status_code,
+                        "ok": ok and filled,
+                        "filled": filled,
+                        "order_id": oid[:8] if oid else None,
+                    }
+                )
     return results
 
 
@@ -2774,6 +2879,36 @@ def run_stx_close_execute(settings: Settings, signal: StxCloseSignal) -> dict[st
     }
 
 
+async def process_stx_open_execute(settings: Settings, signal: StxCloseSignal) -> None:
+    try:
+        if not signal.expiration or signal.strike is None:
+            raise ValueError("open mode requires expiration and strike in JSON")
+        dry_run = not settings.is_live
+        ok, msg, meta = await open_crush_it_short_put(
+            settings,
+            underlying=signal.underlying,
+            expiration=signal.expiration,
+            strike=float(signal.strike),
+            option_type=signal.option_type,
+            quantity=signal.quantity,
+            dry_run=dry_run,
+        )
+        record_activity(
+            "stx-close",
+            "opened" if ok else "failed",
+            msg[:200],
+            ticker=signal.underlying,
+            extra=meta,
+        )
+        if ok:
+            await notify(settings, "Crush-It Open", msg, "SUCCESS")
+        else:
+            await notify(settings, "Crush-It Open Failed", msg, "CRITICAL")
+    except Exception as exc:
+        logger.exception("STX open failed: %s", exc)
+        record_activity("stx-close", "failed", str(exc)[:200], ticker=signal.underlying)
+
+
 async def process_stx_close_execute(settings: Settings, signal: StxCloseSignal) -> None:
     try:
         result = await asyncio.to_thread(run_stx_close_execute, settings, signal)
@@ -2812,7 +2947,7 @@ async def health() -> dict[str, Any]:
     tv_pause_risk = build_tv_pause_risk(s, preflight)
     return {
         "status": "ok" if tv_pause_risk["level"] != "red" else "degraded",
-        "version": "5.5.17",
+        "version": "5.5.18",
         "burst_endpoint": "/exercise/burst",
         "auto_take_profit": str(s.auto_take_profit),
         "auto_stop_loss": str(s.auto_stop_loss),
@@ -2849,7 +2984,7 @@ async def health() -> dict[str, Any]:
 @app.get("/ping")
 async def ping() -> dict[str, str]:
     """Lightweight keep-alive for cron pings (prevents Render free-tier cold starts)."""
-    return {"status": "ok", "version": "5.5.17"}
+    return {"status": "ok", "version": "5.5.18"}
 
 
 @app.get("/activity")
@@ -2860,7 +2995,7 @@ async def activity_log() -> dict[str, Any]:
     events.reverse()
     return {
         "status": "ok",
-        "version": "5.5.17",
+        "version": "5.5.18",
         "today": today,
         "count": len(events),
         "note": "In-memory log; clears on Render restart. Alpaca fills in SPREAD-ACTIVITY digest.",
@@ -3191,11 +3326,11 @@ async def entry_endpoint(
             },
         )
 
-    if settings.spread_mode_only and signal.is_short_put:
+    if settings.spread_mode_only and signal.is_short_put and signal.ticker.upper() == "SPY":
         record_activity(
             "entry",
             "rejected",
-            "SPREAD_MODE_ONLY: naked SHORT_PUT disabled",
+            "SPREAD_MODE_ONLY: naked SHORT_PUT disabled on SPY — use PUT_CREDIT_SPREAD",
             ticker=signal.ticker,
             extra={"action": str(signal.action)},
         )
@@ -3203,11 +3338,14 @@ async def entry_endpoint(
             status_code=200,
             content={
                 "success": False,
-                "message": "SPREAD_MODE_ONLY: naked SHORT_PUT disabled — use PUT_CREDIT_SPREAD",
+                "message": "SPREAD_MODE_ONLY: naked SHORT_PUT disabled on SPY — use PUT_CREDIT_SPREAD",
                 "dry_run": dry_run,
                 "notifications": {},
             },
         )
+
+    if settings.spread_mode_only and signal.is_short_put and signal.ticker.upper() != "SPY":
+        logger.info("Crush-It lane: allowing SHORT_PUT on %s (non-SPY)", signal.ticker)
 
     skip_reason = await check_spread_entry_allowed(settings, signal)
     if skip_reason:
@@ -3514,6 +3652,42 @@ async def stx_close_endpoint(
                 "action_taken": "invalid_signal",
                 "message": f"Bad STX payload: {exc}",
                 "dry_run": dry_run,
+            },
+        )
+
+    if signal.mode == "open":
+        if not signal.confirm_open:
+            record_activity(
+                "stx-close",
+                "confirm_required",
+                "open mode requires confirmOpen=true",
+                ticker=signal.underlying,
+            )
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "success": False,
+                    "action_taken": "confirm_required",
+                    "message": "open mode requires confirmOpen=true in JSON payload",
+                    "dry_run": dry_run,
+                },
+            )
+        background_tasks.add_task(process_stx_open_execute, settings, signal)
+        logger.info("Queued background STX open for %s", signal.underlying)
+        record_activity(
+            "stx-close",
+            "accepted",
+            f"Queued open {signal.underlying} put",
+            ticker=signal.underlying,
+        )
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": True,
+                "action_taken": "accepted",
+                "message": "STX open signal accepted — processing in background",
+                "dry_run": dry_run,
+                "processing": True,
             },
         )
 
