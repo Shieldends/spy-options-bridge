@@ -1,5 +1,5 @@
 """
-spy-options-bridge v5.5.16 — ALPACA PAPER (default broker)
+spy-options-bridge v5.5.17 — ALPACA PAPER (default broker)
 
 TradingView webhook → Render → Alpaca multi-leg SPY put credit spreads.
 
@@ -837,9 +837,14 @@ async def resolve_entry_limit_credit(
     meta = {"fill_mode_resolved": mode, "limit_credit_requested": requested}
 
     is_spread = spread.metadata.get("strategy") == "put_credit_spread"
+    pin_paper_credit = (
+        settings.use_alpaca
+        and settings.is_alpaca_paper
+        and (settings.paper_force_min_fill or is_spread)
+    )
 
-    # Alpaca paper: pin to entry_min_credit so simulator fills (spreads included).
-    if settings.use_alpaca and settings.is_alpaca_paper and settings.paper_force_min_fill:
+    # Alpaca paper: pin to entry_min_credit so simulator fills (spreads always).
+    if pin_paper_credit:
         credit = round(settings.entry_min_credit, 2)
         meta["fill_mode_resolved"] = "paper_force_min"
         meta["limit_credit_final"] = credit
@@ -855,7 +860,7 @@ async def resolve_entry_limit_credit(
 
     if mode == "fixed" or not settings.use_alpaca:
         credit = float(requested)
-        if settings.use_alpaca and settings.is_alpaca_paper and settings.paper_force_min_fill and is_spread:
+        if pin_paper_credit and is_spread:
             credit = round(settings.entry_min_credit, 2)
             meta["fill_mode_resolved"] = "paper_force_min"
         meta["limit_credit_final"] = credit
@@ -2509,7 +2514,7 @@ def coerce_signal(payload: dict, settings: Settings) -> TradingViewSignal:
 
 app = FastAPI(
     title="spy-options-bridge",
-    version="5.5.16",
+    version="5.5.17",
     description="TradingView → Alpaca Paper credit spreads + short puts + conservative close",
 )
 
@@ -2807,7 +2812,7 @@ async def health() -> dict[str, Any]:
     tv_pause_risk = build_tv_pause_risk(s, preflight)
     return {
         "status": "ok" if tv_pause_risk["level"] != "red" else "degraded",
-        "version": "5.5.16",
+        "version": "5.5.17",
         "burst_endpoint": "/exercise/burst",
         "auto_take_profit": str(s.auto_take_profit),
         "auto_stop_loss": str(s.auto_stop_loss),
@@ -2844,7 +2849,7 @@ async def health() -> dict[str, Any]:
 @app.get("/ping")
 async def ping() -> dict[str, str]:
     """Lightweight keep-alive for cron pings (prevents Render free-tier cold starts)."""
-    return {"status": "ok", "version": "5.5.16"}
+    return {"status": "ok", "version": "5.5.17"}
 
 
 @app.get("/activity")
@@ -2855,7 +2860,7 @@ async def activity_log() -> dict[str, Any]:
     events.reverse()
     return {
         "status": "ok",
-        "version": "5.5.16",
+        "version": "5.5.17",
         "today": today,
         "count": len(events),
         "note": "In-memory log; clears on Render restart. Alpaca fills in SPREAD-ACTIVITY digest.",
