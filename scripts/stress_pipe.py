@@ -328,7 +328,20 @@ def main() -> int:
     print(f"\nRESULT: {total_filled}/{total_open_attempts} opens filled")
     print(f"Equity: {eq_start} -> {eq_end}")
     print(f"Log: {log_file}")
-    print("Run SPREAD-ACTIVITY.bat for digest.")
+    try:
+        import subprocess
+
+        digest = ROOT / "scripts" / "spread_activity_digest.py"
+        if digest.is_file():
+            print("Running spread activity digest…")
+            subprocess.run(
+                [sys.executable, str(digest)],
+                cwd=str(ROOT),
+                check=False,
+                timeout=120,
+            )
+    except Exception as exc:
+        print(f"Digest skip: {exc}")
     return 0 if total_filled > 0 else 1
 
 
