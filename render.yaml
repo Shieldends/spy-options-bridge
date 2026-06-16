@@ -23,11 +23,11 @@ services:
       - key: SPREAD_MODE_ONLY
         value: true
       - key: SPREAD_MIN_CREDIT
-        value: "0.40"
+        value: "0"  # 0 = off (paper stress / min skip guard)
       - key: SPREAD_MAX_TRADES_PER_DAY
         value: "0"  # 0 = off (no daily entry cap)
       - key: SPREAD_DAILY_LOSS_LIMIT
-        value: "2000"
+        value: "0"  # 0 = off (paper — no daily loss block)
       - key: DEFAULT_FILL_MODE
         value: exercise
       - key: PAPER_FORCE_MIN_FILL
