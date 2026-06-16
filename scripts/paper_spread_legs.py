@@ -48,7 +48,8 @@ async def _post_order(settings: Any, payload: dict[str, Any]) -> tuple[bool, dic
         body = {"raw": r.text[:300]}
     if r.is_success:
         return True, body, "ok"
-    return False, body, f"Alpaca rejected ({r.status_code})"
+    msg = body.get("message") if isinstance(body, dict) else None
+    return False, body, str(msg or f"Alpaca rejected ({r.status_code})")
 
 
 async def _delete_position(settings: Any, symbol: str) -> tuple[bool, int]:

@@ -1,5 +1,5 @@
 """
-spy-options-bridge v5.5.23 — ALPACA PAPER (default broker)
+spy-options-bridge v5.5.24 — ALPACA PAPER (default broker)
 
 TradingView webhook → Render → Alpaca multi-leg SPY put credit spreads.
 
@@ -37,7 +37,7 @@ import logging
 import sys
 import time
 from collections import deque
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from enum import Enum
 from functools import lru_cache
 from math import floor
@@ -410,6 +410,8 @@ class StxCloseSignal(BaseModel):
     underlying: str = "STX"
     expiration: str | None = None
     strike: float | None = None
+    strike_offset: float | None = Field(default=None, alias="strikeOffset")
+    signal_price: float | None = Field(default=None, alias="signalPrice")
     dte_filter: str | None = Field(default=None, alias="dteFilter")
     option_type: str = Field(default="put", alias="type")
     mode: Literal["poll", "evaluate", "execute", "open"] = "evaluate"
@@ -676,6 +678,183 @@ async def fetch_alpaca_option_strikes(
         if strike is not None:
             strikes.append(float(strike))
     return sorted(set(strikes))
+
+
+async def fetch_alpaca_underlying_price(settings: Settings, underlying: str) -> float | None:
+    """Latest trade price from Alpaca data API."""
+    headers = {
+        "Apca-Api-Key-Id": settings.alpaca_key,
+        "Apca-Api-Secret-Key": settings.alpaca_secret,
+    }
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        r = await client.get(
+            f"https://data.alpaca.markets/v2/stocks/{underlying.upper()}/trades/latest",
+            headers=headers,
+        )
+    if not r.is_success:
+        return None
+    p = r.json().get("trade", {}).get("p")
+    return float(p) if p is not None else None
+
+
+async def fetch_alpaca_nearest_option_expiry(
+    settings: Settings,
+    underlying: str,
+    option_type: str,
+) -> str | None:
+    """Nearest future expiration Alpaca actually lists (not calendar Friday guess)."""
+    base = settings.apca_api_base_url.rstrip("/")
+    headers = {
+        "Apca-Api-Key-Id": settings.alpaca_key,
+        "Apca-Api-Secret-Key": settings.alpaca_secret,
+    }
+    params = {
+        "underlying_symbols": underlying.upper(),
+        "status": "active",
+        "type": option_type,
+        "limit": 500,
+    }
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.get(f"{base}/v2/options/contracts", headers=headers, params=params)
+    if not r.is_success:
+        return None
+
+    today = datetime.now(tz=ET).date()
+    expiries: set[date] = set()
+    for row in r.json().get("option_contracts") or []:
+        raw = str(row.get("expiration_date") or row.get("expiration") or "")[:10]
+        if not raw:
+            continue
+        exp = datetime.strptime(raw, "%Y-%m-%d").date()
+        if exp >= today:
+            expiries.add(exp)
+    if not expiries:
+        return None
+    return min(expiries).strftime("%Y-%m-%d")
+
+
+async def fetch_alpaca_options_buying_power(settings: Settings) -> float | None:
+    base = settings.apca_api_base_url.rstrip("/")
+    headers = {
+        "Apca-Api-Key-Id": settings.alpaca_key,
+        "Apca-Api-Secret-Key": settings.alpaca_secret,
+    }
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        r = await client.get(f"{base}/v2/account", headers=headers)
+    if not r.is_success:
+        return None
+    raw = r.json().get("options_buying_power") or r.json().get("buying_power")
+    try:
+        return float(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def cap_put_strike_for_buying_power(
+    strike: float,
+    available: list[float],
+    options_buying_power: float,
+    quantity: int,
+) -> tuple[float, bool]:
+    """Cash-secured put collateral ≈ strike × 100 × qty — pick highest listed strike that fits."""
+    if options_buying_power <= 0 or quantity < 1:
+        return strike, False
+    max_strike = floor(options_buying_power / (100 * quantity)) - 5.0
+    if strike <= max_strike:
+        return strike, False
+    fits = [s for s in available if s <= max_strike]
+    if not fits:
+        raise ValueError(
+            f"No STX put strike within options buying power "
+            f"(${options_buying_power:,.0f} — need strike ≤ ${max_strike:,.0f})"
+        )
+    return max(fits), True
+
+
+async def verify_alpaca_option_contract(settings: Settings, symbol: str) -> bool:
+    base = settings.apca_api_base_url.rstrip("/")
+    headers = {
+        "Apca-Api-Key-Id": settings.alpaca_key,
+        "Apca-Api-Secret-Key": settings.alpaca_secret,
+    }
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        r = await client.get(f"{base}/v2/options/contracts/{symbol}", headers=headers)
+    return r.is_success
+
+
+async def resolve_stx_open_contract(settings: Settings, signal: StxCloseSignal) -> dict[str, Any]:
+    """
+    Map Crush-It open to a real Alpaca-listed contract.
+
+    Uses Alpaca's nearest expiry + snaps strike to the chain. Ignores stale JSON
+    strikes (e.g. 230 when STX trades ~1000+). Prefer strikeOffset + signalPrice.
+    """
+    underlying = signal.underlying.upper()
+    option_type = signal.option_type
+
+    expiration = await fetch_alpaca_nearest_option_expiry(settings, underlying, option_type)
+    if not expiration:
+        expiration = _resolve_stx_expiration(signal)
+        logger.warning("STX: Alpaca expiry lookup empty — fallback %s", expiration)
+
+    available = await fetch_alpaca_option_strikes(settings, underlying, expiration, option_type)
+    if not available:
+        raise ValueError(f"No Alpaca {option_type} strikes for {underlying} exp {expiration}")
+
+    ref_price = signal.signal_price
+    if ref_price is None:
+        ref_price = await fetch_alpaca_underlying_price(settings, underlying)
+    if ref_price is None:
+        ref_price = available[len(available) // 2]
+
+    meta: dict[str, Any] = {
+        "underlying_price": ref_price,
+        "expiration_resolved": expiration,
+        "strikes_available": len(available),
+    }
+
+    default_otm = -10.0
+    if signal.strike_offset is not None:
+        target = _round_strike(float(ref_price) + float(signal.strike_offset))
+        meta["strike_source"] = "strikeOffset"
+    elif signal.strike is not None:
+        target = float(signal.strike)
+        meta["strike_source"] = "json_strike"
+        if ref_price and abs(target - ref_price) / ref_price > 0.25:
+            target = _round_strike(float(ref_price) + default_otm)
+            meta["strike_source"] = "json_strike_stale_ignored"
+            logger.warning(
+                "STX strike %.2f ignored (ref %.2f) — using OTM %.2f",
+                signal.strike,
+                ref_price,
+                target,
+            )
+    else:
+        target = _round_strike(float(ref_price) + default_otm)
+        meta["strike_source"] = "default_otm"
+
+    meta["strike_target"] = target
+    if option_type == "put":
+        strike = snap_short_put_strike(target, available)
+        obp = await fetch_alpaca_options_buying_power(settings)
+        if obp:
+            meta["options_buying_power"] = obp
+            strike, capped = cap_put_strike_for_buying_power(strike, available, obp, signal.quantity)
+            if capped:
+                meta["strike_capped_for_buying_power"] = True
+                logger.info("STX strike capped to %.2f (options BP $%.0f)", strike, obp)
+    else:
+        above = [s for s in available if s >= target]
+        strike = min(above) if above else min(available, key=lambda s: abs(s - target))
+
+    symbol = format_occ_symbol(underlying, expiration, option_type, strike)
+    meta["symbol"] = symbol
+    meta["strike_snapped"] = strike
+
+    if not await verify_alpaca_option_contract(settings, symbol):
+        raise ValueError(f"Alpaca contract not found after snap: {symbol}")
+
+    return {"expiration": expiration, "strike": strike, "symbol": symbol, "meta": meta}
 
 
 def snap_put_credit_strikes(short_target: float, long_target: float, available: list[float]) -> tuple[float, float]:
@@ -2606,7 +2785,7 @@ def coerce_signal(payload: dict, settings: Settings) -> TradingViewSignal:
 
 app = FastAPI(
     title="spy-options-bridge",
-    version="5.5.23",
+    version="5.5.24",
     description="TradingView → Alpaca Paper credit spreads + short puts + conservative close",
 )
 
@@ -2968,9 +3147,10 @@ def run_stx_close_execute(settings: Settings, signal: StxCloseSignal) -> dict[st
 
 async def process_stx_open_execute(settings: Settings, signal: StxCloseSignal) -> None:
     try:
-        if signal.strike is None:
-            raise ValueError("open mode requires strike in JSON")
-        expiration = _resolve_stx_expiration(signal)
+        resolved = await resolve_stx_open_contract(settings, signal)
+        expiration = resolved["expiration"]
+        strike = float(resolved["strike"])
+        contract_meta = resolved.get("meta") or {}
         exp_date = datetime.strptime(expiration[:10], "%Y-%m-%d").date()
         if exp_date < datetime.now(ET).date():
             raise ValueError(f"resolved expiration {expiration} is in the past")
@@ -2979,11 +3159,15 @@ async def process_stx_open_execute(settings: Settings, signal: StxCloseSignal) -
             settings,
             underlying=signal.underlying,
             expiration=expiration,
-            strike=float(signal.strike),
+            strike=strike,
             option_type=signal.option_type,
             quantity=signal.quantity,
             dry_run=dry_run,
         )
+        if isinstance(meta, dict):
+            meta = {**contract_meta, **meta}
+        else:
+            meta = contract_meta
         record_activity(
             "stx-close",
             "opened" if ok else "failed",
@@ -3038,7 +3222,7 @@ async def health() -> dict[str, Any]:
     tv_pause_risk = build_tv_pause_risk(s, preflight)
     return {
         "status": "ok" if tv_pause_risk["level"] != "red" else "degraded",
-        "version": "5.5.23",
+        "version": "5.5.24",
         "spread_max_trades_per_day": str(s.spread_max_trades_per_day),
         "spread_daily_loss_limit": str(s.spread_daily_loss_limit),
         "burst_endpoint": "/exercise/burst",
@@ -3077,7 +3261,7 @@ async def health() -> dict[str, Any]:
 @app.get("/ping")
 async def ping() -> dict[str, str]:
     """Lightweight keep-alive for cron pings (prevents Render free-tier cold starts)."""
-    return {"status": "ok", "version": "5.5.23"}
+    return {"status": "ok", "version": "5.5.24"}
 
 
 @app.get("/activity")
@@ -3111,7 +3295,7 @@ async def activity_log() -> dict[str, Any]:
     events.sort(key=lambda r: str(r.get("ts_et", "")), reverse=True)
     return {
         "status": "ok",
-        "version": "5.5.23",
+        "version": "5.5.24",
         "today": today,
         "count": len(events),
         "note": "Memory + logs/activity.jsonl. Alpaca proof = Activities tab fills.",
