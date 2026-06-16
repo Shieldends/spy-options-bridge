@@ -15,17 +15,17 @@ services:
       - key: DEFAULT_DTE_FILTER
         value: 0dte
       - key: DEFAULT_STRIKE_OFFSET_SHORT
-        value: "-10"
+        value: "-5"
       - key: DEFAULT_STRIKE_OFFSET_LONG
-        value: "-15"
+        value: "-6"
       - key: DEFAULT_LIMIT_CREDIT
-        value: "0.45"
+        value: "0.55"
       - key: SPREAD_MODE_ONLY
         value: true
       - key: SPREAD_MIN_CREDIT
         value: "0.40"
       - key: SPREAD_MAX_TRADES_PER_DAY
-        value: "0"
+        value: "0"  # 0 = off (no daily entry cap)
       - key: SPREAD_DAILY_LOSS_LIMIT
         value: "2000"
       - key: DEFAULT_FILL_MODE
