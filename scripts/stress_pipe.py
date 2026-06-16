@@ -138,14 +138,12 @@ def run_open(base_url: str, secret: str, spy: float, timeout: float) -> dict:
 
 
 def run_close(base_url: str, secret: str, spy: float, timeout: float) -> dict:
-    short_s = float(round(spy) - 10)
-    long_s = float(round(spy) - 15)
     body = {
         "webhookSecret": secret,
         "ticker": "SPY",
-        "signalPrice": spy * 0.999,
-        "short_strike": short_s,
-        "long_strike": long_s,
+        "signalPrice": spy,
+        "strikeOffsetShort": -10,
+        "strikeOffsetLong": -15,
         "forceAutoClose": True,
     }
     r = httpx.post(f"{base_url}/warning", json=body, timeout=timeout)
@@ -208,14 +206,19 @@ def close_phase(
         spy = latest_spy(env)
         data = run_close(base_url, secret, spy, timeout)
         action = data.get("action_taken") or data.get("message") or "?"
-        ok = action in {"auto_close_submitted", "closed", "accepted"}
+        ok = action in {
+            "auto_close_submitted",
+            "closed",
+            "accepted",
+            "auto_close_submitted_async",
+        }
         if ok:
             closed += 1
         log_line(
             f"C{cycle} CLOSE try #{attempt} legs_before={legs} action={action}",
             log_file,
         )
-        time.sleep(max(interval, 4.0))
+        time.sleep(max(interval, 12.0))
         if count_spy_option_legs(env) == 0:
             log_line(f"C{cycle} CLOSE flat after try #{attempt}", log_file)
             break

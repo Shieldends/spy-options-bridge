@@ -1,5 +1,5 @@
 """
-spy-options-bridge v5.5.22 — ALPACA PAPER (default broker)
+spy-options-bridge v5.5.23 — ALPACA PAPER (default broker)
 
 TradingView webhook → Render → Alpaca multi-leg SPY put credit spreads.
 
@@ -2606,7 +2606,7 @@ def coerce_signal(payload: dict, settings: Settings) -> TradingViewSignal:
 
 app = FastAPI(
     title="spy-options-bridge",
-    version="5.5.22",
+    version="5.5.23",
     description="TradingView → Alpaca Paper credit spreads + short puts + conservative close",
 )
 
@@ -3038,7 +3038,7 @@ async def health() -> dict[str, Any]:
     tv_pause_risk = build_tv_pause_risk(s, preflight)
     return {
         "status": "ok" if tv_pause_risk["level"] != "red" else "degraded",
-        "version": "5.5.22",
+        "version": "5.5.23",
         "spread_max_trades_per_day": str(s.spread_max_trades_per_day),
         "spread_daily_loss_limit": str(s.spread_daily_loss_limit),
         "burst_endpoint": "/exercise/burst",
@@ -3077,7 +3077,7 @@ async def health() -> dict[str, Any]:
 @app.get("/ping")
 async def ping() -> dict[str, str]:
     """Lightweight keep-alive for cron pings (prevents Render free-tier cold starts)."""
-    return {"status": "ok", "version": "5.5.22"}
+    return {"status": "ok", "version": "5.5.23"}
 
 
 @app.get("/activity")
@@ -3111,7 +3111,7 @@ async def activity_log() -> dict[str, Any]:
     events.sort(key=lambda r: str(r.get("ts_et", "")), reverse=True)
     return {
         "status": "ok",
-        "version": "5.5.22",
+        "version": "5.5.23",
         "today": today,
         "count": len(events),
         "note": "Memory + logs/activity.jsonl. Alpaca proof = Activities tab fills.",
@@ -3632,7 +3632,7 @@ async def warning_endpoint(
         danger_pct=settings.danger_zone_pct,
     )
 
-    if not danger:
+    if not danger and not warning.force_auto_close:
         record_activity("warning", "no_danger", "Price not in danger zone", ticker=warning.ticker)
         return WarningResponse(
             danger_zone=False,
@@ -3643,6 +3643,10 @@ async def warning_endpoint(
             protocol_notes=protocol_notes,
             notifications={},
         )
+
+    if warning.force_auto_close and not danger:
+        danger = True
+        msg = msg or f"Forced close ({warning.ticker}) — stress / forceAutoClose"
 
     if not msg:
         record_activity("warning", "no_danger", "No warning message", ticker=warning.ticker)
