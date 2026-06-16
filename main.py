@@ -1,5 +1,5 @@
 """
-spy-options-bridge v5.5.24 — ALPACA PAPER (default broker)
+spy-options-bridge v5.5.26 — ALPACA PAPER (default broker)
 
 TradingView webhook → Render → Alpaca multi-leg SPY put credit spreads.
 
@@ -108,7 +108,7 @@ ALPACA_PAPER_URL = "https://paper-api.alpaca.markets"
 
 
 def record_activity(
-    kind: Literal["entry", "warning", "close-put", "stx-close"],
+    kind: Literal["entry", "warning", "close-put", "stx-close", "sniper-grid"],
     outcome: str,
     message: str,
     *,
@@ -207,6 +207,11 @@ class Settings(BaseSettings):
     spread_max_trades_per_day: int = Field(default=0, alias="SPREAD_MAX_TRADES_PER_DAY")
     spread_daily_loss_limit: float = Field(default=0.0, alias="SPREAD_DAILY_LOSS_LIMIT")
     spread_mode_only: bool = Field(default=True, alias="SPREAD_MODE_ONLY")
+
+    stx_sniper_grid_enabled: bool = Field(default=True, alias="STX_SNIPER_GRID_ENABLED")
+    stx_hedge_strike_offset: float = Field(default=-10.0, alias="STX_HEDGE_STRIKE_OFFSET")
+    sniper_marinate_step: float = Field(default=0.01, alias="SNIPER_MARINATE_STEP")
+    sniper_chase_seconds: float = Field(default=15.0, alias="SNIPER_CHASE_SECONDS")
 
     @property
     def is_live(self) -> bool:
@@ -412,6 +417,9 @@ class StxCloseSignal(BaseModel):
     strike: float | None = None
     strike_offset: float | None = Field(default=None, alias="strikeOffset")
     signal_price: float | None = Field(default=None, alias="signalPrice")
+    hedge_strike_offset: float | None = Field(default=None, alias="hedgeStrikeOffset")
+    enable_put_walker: bool | None = Field(default=None, alias="enablePutWalker")
+    enable_sniper_grid: bool | None = Field(default=None, alias="enableSniperGrid")
     dte_filter: str | None = Field(default=None, alias="dteFilter")
     option_type: str = Field(default="put", alias="type")
     mode: Literal["poll", "evaluate", "execute", "open"] = "evaluate"
@@ -1912,6 +1920,362 @@ async def replace_alpaca_order_limit(settings: Settings, order_id: str, credit: 
     return False
 
 
+async def replace_alpaca_order_limit_price(settings: Settings, order_id: str, limit_price: float) -> bool:
+    """PATCH resting single-leg limit (sniper grid marination / chase)."""
+    base = settings.apca_api_base_url.rstrip("/")
+    payload = {"limit_price": f"{round(limit_price, 2):.2f}"}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.patch(f"{base}/v2/orders/{order_id}", headers=_alpaca_headers(settings), json=payload)
+    if r.is_success:
+        logger.info("Sniper grid: order %s limit -> $%s", order_id, limit_price)
+        return True
+    logger.warning("Sniper grid replace failed (%s): %s", r.status_code, r.text[:200])
+    return False
+
+
+async def alpaca_market_is_open(settings: Settings) -> bool:
+    base = settings.apca_api_base_url.rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            r = await client.get(f"{base}/v2/clock", headers=_alpaca_headers(settings))
+        if r.is_success:
+            return bool(r.json().get("is_open"))
+    except Exception as exc:
+        logger.debug("Alpaca clock lookup skipped: %s", exc)
+    now = datetime.now(ET)
+    return now.weekday() < 5 and (now.hour > 9 or (now.hour == 9 and now.minute >= 30)) and now.hour < 16
+
+
+async def resolve_hedge_put_contract(
+    settings: Settings,
+    *,
+    underlying: str,
+    expiration: str,
+    short_strike: float,
+    hedge_offset: float,
+    option_type: str = "put",
+) -> dict[str, Any]:
+    """Long protective leg: short_strike + hedge_offset (e.g. -10 for bull put spread)."""
+    target = _round_strike(short_strike + hedge_offset)
+    available = await fetch_alpaca_option_strikes(settings, underlying, expiration, option_type)
+    if not available:
+        raise ValueError(f"No Alpaca {option_type} strikes for hedge {underlying} {expiration}")
+
+    if option_type == "put":
+        strike = snap_short_put_strike(target, available)
+    else:
+        above = [s for s in available if s >= target]
+        strike = min(above) if above else min(available, key=lambda s: abs(s - target))
+
+    symbol = format_occ_symbol(underlying, expiration, option_type, strike)
+    if not await verify_alpaca_option_contract(settings, symbol):
+        raise ValueError(f"Hedge contract not listed: {symbol}")
+
+    return {
+        "underlying": underlying.upper(),
+        "expiration": expiration,
+        "short_strike": short_strike,
+        "hedge_strike": strike,
+        "hedge_offset": hedge_offset,
+        "symbol": symbol,
+        "option_type": option_type,
+    }
+
+
+# Multi-strike adaptive sniper grid trap definitions (offsets from short strike).
+SNIPER_TRAP_SPECS: tuple[tuple[str, float, float], ...] = (
+    ("A", -10.0, 0.08),  # Premium pocket
+    ("B", -15.0, 0.04),  # Deep vacuum
+    ("C", -20.0, 0.02),  # Stub floor
+)
+
+
+def passive_interval_seconds(now: datetime | None = None) -> float:
+    """EST/ET marination cadence before force-fill phase."""
+    now = now or datetime.now(ET)
+    minutes = now.hour * 60 + now.minute
+    if minutes < 11 * 60 + 30:
+        return 1200.0  # 20 min — morning spread
+    if minutes < 14 * 60:
+        return 600.0  # 10 min — midday drift
+    return 600.0  # pre-chase fallback on non-expiration days
+
+
+def is_expiration_day(expiration: str, now: datetime | None = None) -> bool:
+    now = now or datetime.now(ET)
+    try:
+        exp_date = datetime.strptime(expiration[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return False
+    return now.date() == exp_date
+
+
+def is_force_fill_phase(expiration: str, now: datetime | None = None) -> bool:
+    """After 14:00 ET on contract expiration day (< 2 hours to 16:00 close)."""
+    now = now or datetime.now(ET)
+    if not is_expiration_day(expiration, now):
+        return False
+    return now.hour >= 14
+
+
+async def fetch_hedge_chase_limit(settings: Settings, symbol: str, fallback: float) -> float:
+    """Live ask, else bid/ask midpoint, else fallback."""
+    quotes = await fetch_option_snapshot_quotes(settings, [symbol])
+    q = quotes.get(symbol.upper(), {})
+    bid = float(q.get("bid") or 0.0)
+    ask = float(q.get("ask") or 0.0)
+    if ask > 0:
+        return round(ask, 2)
+    if bid > 0 and ask > 0:
+        return round((bid + ask) / 2.0, 2)
+    if bid > 0:
+        return round(bid + 0.01, 2)
+    return round(fallback, 2)
+
+
+async def _submit_sniper_trap_leg(
+    settings: Settings,
+    *,
+    underlying: str,
+    expiration: str,
+    short_strike: float,
+    quantity: int,
+    leg: str,
+    hedge_offset: float,
+    start_limit: float,
+    option_type: str,
+    dry_run: bool,
+) -> dict[str, Any] | None:
+    try:
+        hedge = await resolve_hedge_put_contract(
+            settings,
+            underlying=underlying,
+            expiration=expiration,
+            short_strike=short_strike,
+            hedge_offset=hedge_offset,
+            option_type=option_type,
+        )
+    except Exception as exc:
+        logger.warning("Sniper trap %s resolve failed: %s", leg, exc)
+        return None
+
+    payload = {
+        "symbol": hedge["symbol"],
+        "qty": str(quantity),
+        "side": "buy",
+        "type": "limit",
+        "limit_price": f"{start_limit:.2f}",
+        "time_in_force": "gtc",
+    }
+    result = await submit_order(settings, payload, dry_run=dry_run)
+    if not result.success:
+        logger.warning("Sniper trap %s submit failed: %s", leg, result.message)
+        return None
+
+    order_id = str((result.broker_response or {}).get("id", ""))
+    if not order_id:
+        return None
+
+    return {
+        "leg": leg,
+        "order_id": order_id,
+        "symbol": hedge["symbol"],
+        "hedge_strike": hedge["hedge_strike"],
+        "hedge_offset": hedge_offset,
+        "limit_price": start_limit,
+        "filled": False,
+    }
+
+
+async def _trap_order_open(settings: Settings, trap: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+    """Return (still_open, order_dict)."""
+    terminal = {"canceled", "expired", "rejected", "failed", "done_for_day", "filled"}
+    order = await fetch_alpaca_order(settings, trap["order_id"])
+    status = str(order.get("status", "")).lower()
+    filled_qty = float(order.get("filled_qty") or 0)
+    if status == "filled" or filled_qty > 0:
+        trap["filled"] = True
+        trap["filled_avg_price"] = order.get("filled_avg_price")
+        return False, order
+    if status in terminal:
+        return False, order
+    if order.get("limit_price") is not None:
+        try:
+            trap["limit_price"] = float(order["limit_price"])
+        except (TypeError, ValueError):
+            pass
+    return True, order
+
+
+async def _cancel_open_traps(settings: Settings, traps: list[dict[str, Any]], *, skip_legs: set[str] | None = None) -> None:
+    skip = skip_legs or set()
+    for trap in traps:
+        if trap.get("filled") or trap["leg"] in skip:
+            continue
+        await cancel_alpaca_order(settings, trap["order_id"])
+
+
+async def run_sniper_grid_loop(
+    settings: Settings,
+    *,
+    underlying: str,
+    expiration: str,
+    short_strike: float,
+    quantity: int,
+    option_type: str = "put",
+) -> None:
+    """
+    Multi-strike adaptive sniper grid after verified short entry.
+
+    Dispatches trap legs A/B/C (GTC), passive +$0.01 marination, 14:00 exp-day chase.
+    """
+    dry_run = not settings.is_live
+    step = round(settings.sniper_marinate_step, 2)
+    chase_sec = settings.sniper_chase_seconds
+
+    traps: list[dict[str, Any]] = []
+    for leg, offset, start_limit in SNIPER_TRAP_SPECS:
+        trap = await _submit_sniper_trap_leg(
+            settings,
+            underlying=underlying,
+            expiration=expiration,
+            short_strike=short_strike,
+            quantity=quantity,
+            leg=leg,
+            hedge_offset=offset,
+            start_limit=start_limit,
+            option_type=option_type,
+            dry_run=dry_run,
+        )
+        if trap:
+            traps.append(trap)
+
+    if not traps:
+        record_activity("sniper-grid", "failed", "No trap legs submitted", ticker=underlying)
+        return
+
+    record_activity(
+        "sniper-grid",
+        "started",
+        f"Net deployed {len(traps)} traps short={short_strike} exp={expiration}",
+        ticker=underlying,
+        extra={"traps": [t["leg"] for t in traps], "short_strike": short_strike, "expiration": expiration},
+    )
+    logger.info("Sniper grid started %s — %s trap legs", underlying, len(traps))
+
+    last_marinade = time.monotonic()
+    force_phase_active = False
+
+    while True:
+        if not await alpaca_market_is_open(settings):
+            record_activity("sniper-grid", "market_close", "Grid paused — market closed", ticker=underlying)
+            return
+
+        open_traps: list[dict[str, Any]] = []
+        filled_traps: list[dict[str, Any]] = []
+        for trap in traps:
+            still_open, _order = await _trap_order_open(settings, trap)
+            if trap.get("filled"):
+                filled_traps.append(trap)
+            elif still_open:
+                open_traps.append(trap)
+
+        if filled_traps:
+            await _cancel_open_traps(
+                settings,
+                traps,
+                skip_legs={t["leg"] for t in filled_traps},
+            )
+            ft = filled_traps[0]
+            record_activity(
+                "sniper-grid",
+                "filled",
+                f"Trap {ft['leg']} filled {ft['symbol']} @ {ft.get('filled_avg_price')}",
+                ticker=underlying,
+                extra=ft,
+            )
+            await notify(
+                settings,
+                "Sniper Grid Filled",
+                f"Trap {ft['leg']} {ft['symbol']} @ ${ft.get('filled_avg_price')}",
+                "SUCCESS",
+            )
+            return
+
+        if not open_traps:
+            record_activity("sniper-grid", "stopped", "All traps terminal — none filled", ticker=underlying)
+            return
+
+        now = datetime.now(ET)
+        if is_force_fill_phase(expiration, now):
+            if not force_phase_active:
+                await _cancel_open_traps(settings, traps, skip_legs={"A"})
+                force_phase_active = True
+                record_activity(
+                    "sniper-grid",
+                    "force_chase",
+                    "14:00 exp-day — canceled B/C, chasing trap A",
+                    ticker=underlying,
+                )
+
+            leg_a = next((t for t in open_traps if t["leg"] == "A"), None)
+            if leg_a is None:
+                record_activity("sniper-grid", "stopped", "Force phase — trap A not open", ticker=underlying)
+                return
+
+            chase_limit = await fetch_hedge_chase_limit(
+                settings,
+                leg_a["symbol"],
+                float(leg_a.get("limit_price") or 0.08),
+            )
+            await replace_alpaca_order_limit_price(settings, leg_a["order_id"], chase_limit)
+            leg_a["limit_price"] = chase_limit
+            await asyncio.sleep(chase_sec)
+            continue
+
+        interval = passive_interval_seconds(now)
+        if time.monotonic() - last_marinade >= interval:
+            for trap in open_traps:
+                new_limit = round(float(trap.get("limit_price") or 0.0) + step, 2)
+                if await replace_alpaca_order_limit_price(settings, trap["order_id"], new_limit):
+                    trap["limit_price"] = new_limit
+            last_marinade = time.monotonic()
+            logger.info(
+                "Sniper grid marinated %s open traps +$%s (interval %.0fs)",
+                len(open_traps),
+                step,
+                interval,
+            )
+
+        sleep_for = min(30.0, max(1.0, interval - (time.monotonic() - last_marinade)))
+        await asyncio.sleep(sleep_for)
+
+
+def spawn_sniper_grid_after_entry(
+    settings: Settings,
+    signal: StxCloseSignal,
+    *,
+    expiration: str,
+    short_strike: float,
+) -> None:
+    """Non-blocking sniper grid — STX crush-it shorts only (SPY unchanged)."""
+    if signal.enable_sniper_grid is False or signal.enable_put_walker is False:
+        return
+    if not settings.stx_sniper_grid_enabled:
+        return
+    asyncio.create_task(
+        run_sniper_grid_loop(
+            settings,
+            underlying=signal.underlying,
+            expiration=expiration,
+            short_strike=short_strike,
+            quantity=signal.quantity,
+            option_type=signal.option_type,
+        )
+    )
+    logger.info("Sniper grid spawned for %s short %.2f exp %s", signal.underlying, short_strike, expiration)
+
+
 async def wait_and_chase_alpaca_entry_fill(
     settings: Settings,
     order_id: str,
@@ -2785,7 +3149,7 @@ def coerce_signal(payload: dict, settings: Settings) -> TradingViewSignal:
 
 app = FastAPI(
     title="spy-options-bridge",
-    version="5.5.24",
+    version="5.5.26",
     description="TradingView → Alpaca Paper credit spreads + short puts + conservative close",
 )
 
@@ -3177,6 +3541,12 @@ async def process_stx_open_execute(settings: Settings, signal: StxCloseSignal) -
         )
         if ok:
             await notify(settings, "Crush-It Open", msg, "SUCCESS")
+            spawn_sniper_grid_after_entry(
+                settings,
+                signal,
+                expiration=expiration,
+                short_strike=strike,
+            )
         else:
             await notify(settings, "Crush-It Open Failed", msg, "CRITICAL")
     except Exception as exc:
@@ -3222,7 +3592,7 @@ async def health() -> dict[str, Any]:
     tv_pause_risk = build_tv_pause_risk(s, preflight)
     return {
         "status": "ok" if tv_pause_risk["level"] != "red" else "degraded",
-        "version": "5.5.24",
+        "version": "5.5.26",
         "spread_max_trades_per_day": str(s.spread_max_trades_per_day),
         "spread_daily_loss_limit": str(s.spread_daily_loss_limit),
         "burst_endpoint": "/exercise/burst",
@@ -3261,7 +3631,7 @@ async def health() -> dict[str, Any]:
 @app.get("/ping")
 async def ping() -> dict[str, str]:
     """Lightweight keep-alive for cron pings (prevents Render free-tier cold starts)."""
-    return {"status": "ok", "version": "5.5.24"}
+    return {"status": "ok", "version": "5.5.26"}
 
 
 @app.get("/activity")
@@ -3295,7 +3665,7 @@ async def activity_log() -> dict[str, Any]:
     events.sort(key=lambda r: str(r.get("ts_et", "")), reverse=True)
     return {
         "status": "ok",
-        "version": "5.5.24",
+        "version": "5.5.26",
         "today": today,
         "count": len(events),
         "note": "Memory + logs/activity.jsonl. Alpaca proof = Activities tab fills.",
