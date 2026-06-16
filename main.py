@@ -1,5 +1,5 @@
 """
-spy-options-bridge v5.5.26 — ALPACA PAPER (default broker)
+spy-options-bridge v5.5.27 — ALPACA PAPER (default broker)
 
 TradingView webhook → Render → Alpaca multi-leg SPY put credit spreads.
 
@@ -2134,8 +2134,8 @@ async def run_sniper_grid_loop(
     chase_sec = settings.sniper_chase_seconds
 
     traps: list[dict[str, Any]] = []
-    for leg, offset, start_limit in SNIPER_TRAP_SPECS:
-        trap = await _submit_sniper_trap_leg(
+    trap_tasks = [
+        _submit_sniper_trap_leg(
             settings,
             underlying=underlying,
             expiration=expiration,
@@ -2147,8 +2147,10 @@ async def run_sniper_grid_loop(
             option_type=option_type,
             dry_run=dry_run,
         )
-        if trap:
-            traps.append(trap)
+        for leg, offset, start_limit in SNIPER_TRAP_SPECS
+    ]
+    trap_results = await asyncio.gather(*trap_tasks)
+    traps = [t for t in trap_results if t]
 
     if not traps:
         record_activity("sniper-grid", "failed", "No trap legs submitted", ticker=underlying)
@@ -2218,7 +2220,33 @@ async def run_sniper_grid_loop(
                     ticker=underlying,
                 )
 
-            leg_a = next((t for t in open_traps if t["leg"] == "A"), None)
+            open_traps = []
+            for trap in traps:
+                still_open, _ = await _trap_order_open(settings, trap)
+                if trap.get("filled"):
+                    filled_traps = [trap]
+                    break
+                if still_open and trap["leg"] == "A":
+                    open_traps.append(trap)
+            if filled_traps:
+                await _cancel_open_traps(settings, traps, skip_legs={filled_traps[0]["leg"]})
+                ft = filled_traps[0]
+                record_activity(
+                    "sniper-grid",
+                    "filled",
+                    f"Trap {ft['leg']} filled {ft['symbol']} @ {ft.get('filled_avg_price')}",
+                    ticker=underlying,
+                    extra=ft,
+                )
+                await notify(
+                    settings,
+                    "Sniper Grid Filled",
+                    f"Trap {ft['leg']} {ft['symbol']} @ ${ft.get('filled_avg_price')}",
+                    "SUCCESS",
+                )
+                return
+
+            leg_a = open_traps[0] if open_traps else None
             if leg_a is None:
                 record_activity("sniper-grid", "stopped", "Force phase — trap A not open", ticker=underlying)
                 return
@@ -2251,6 +2279,36 @@ async def run_sniper_grid_loop(
         await asyncio.sleep(sleep_for)
 
 
+def spawn_sniper_grid_after_short_fill(
+    settings: Settings,
+    *,
+    underlying: str,
+    expiration: str,
+    short_strike: float,
+    quantity: int,
+    option_type: str = "put",
+) -> None:
+    """Spawn adaptive sniper grid after verified short entry (non-blocking)."""
+    if not settings.stx_sniper_grid_enabled:
+        return
+    asyncio.create_task(
+        run_sniper_grid_loop(
+            settings,
+            underlying=underlying,
+            expiration=expiration,
+            short_strike=short_strike,
+            quantity=quantity,
+            option_type=option_type,
+        )
+    )
+    logger.info(
+        "Sniper grid spawned %s short %.2f exp %s",
+        underlying,
+        short_strike,
+        expiration,
+    )
+
+
 def spawn_sniper_grid_after_entry(
     settings: Settings,
     signal: StxCloseSignal,
@@ -2258,22 +2316,17 @@ def spawn_sniper_grid_after_entry(
     expiration: str,
     short_strike: float,
 ) -> None:
-    """Non-blocking sniper grid — STX crush-it shorts only (SPY unchanged)."""
+    """STX webhook lane — respects per-signal disable flags."""
     if signal.enable_sniper_grid is False or signal.enable_put_walker is False:
         return
-    if not settings.stx_sniper_grid_enabled:
-        return
-    asyncio.create_task(
-        run_sniper_grid_loop(
-            settings,
-            underlying=signal.underlying,
-            expiration=expiration,
-            short_strike=short_strike,
-            quantity=signal.quantity,
-            option_type=signal.option_type,
-        )
+    spawn_sniper_grid_after_short_fill(
+        settings,
+        underlying=signal.underlying,
+        expiration=expiration,
+        short_strike=short_strike,
+        quantity=signal.quantity,
+        option_type=signal.option_type,
     )
-    logger.info("Sniper grid spawned for %s short %.2f exp %s", signal.underlying, short_strike, expiration)
 
 
 async def wait_and_chase_alpaca_entry_fill(
@@ -2895,6 +2948,19 @@ async def process_entry_alert(settings: Settings, signal: TradingViewSignal) -> 
                 f"{signal.ticker} {spread.metadata['strategy']} exp={expiration} credit=${spread.metadata['limit_credit']}",
                 "SUCCESS" if settings.is_live else "INFO",
             )
+            # Sniper grid — Crush-It single short puts after entry.success (SPY spreads unchanged).
+            if (
+                spread.metadata.get("single_leg")
+                and spread.metadata.get("strategy") == "short_put"
+                and signal.ticker.upper() != "SPY"
+            ):
+                spawn_sniper_grid_after_short_fill(
+                    settings,
+                    underlying=signal.ticker,
+                    expiration=str(spread.metadata["expiration"]),
+                    short_strike=float(spread.metadata["short_strike"]),
+                    quantity=int(signal.quantity),
+                )
         else:
             record_activity("entry", "rejected", entry.message, ticker=signal.ticker)
             await notify(settings, "Entry Rejected", entry.message, "CRITICAL")
@@ -3149,7 +3215,7 @@ def coerce_signal(payload: dict, settings: Settings) -> TradingViewSignal:
 
 app = FastAPI(
     title="spy-options-bridge",
-    version="5.5.26",
+    version="5.5.27",
     description="TradingView → Alpaca Paper credit spreads + short puts + conservative close",
 )
 
@@ -3592,7 +3658,7 @@ async def health() -> dict[str, Any]:
     tv_pause_risk = build_tv_pause_risk(s, preflight)
     return {
         "status": "ok" if tv_pause_risk["level"] != "red" else "degraded",
-        "version": "5.5.26",
+        "version": "5.5.27",
         "spread_max_trades_per_day": str(s.spread_max_trades_per_day),
         "spread_daily_loss_limit": str(s.spread_daily_loss_limit),
         "burst_endpoint": "/exercise/burst",
@@ -3631,7 +3697,7 @@ async def health() -> dict[str, Any]:
 @app.get("/ping")
 async def ping() -> dict[str, str]:
     """Lightweight keep-alive for cron pings (prevents Render free-tier cold starts)."""
-    return {"status": "ok", "version": "5.5.26"}
+    return {"status": "ok", "version": "5.5.27"}
 
 
 @app.get("/activity")
@@ -3665,7 +3731,7 @@ async def activity_log() -> dict[str, Any]:
     events.sort(key=lambda r: str(r.get("ts_et", "")), reverse=True)
     return {
         "status": "ok",
-        "version": "5.5.26",
+        "version": "5.5.27",
         "today": today,
         "count": len(events),
         "note": "Memory + logs/activity.jsonl. Alpaca proof = Activities tab fills.",
