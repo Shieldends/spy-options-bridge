@@ -1,5 +1,5 @@
 """
-spy-options-bridge v5.5.27 — ALPACA PAPER (default broker)
+spy-options-bridge v5.5.28 — ALPACA PAPER (default broker)
 
 TradingView webhook → Render → Alpaca multi-leg SPY put credit spreads.
 
@@ -100,7 +100,43 @@ _chase_semaphore: asyncio.Semaphore | None = None
 PREFLIGHT_CACHE_SEC = 30.0
 BURST_ATTEMPTS_RESPONSE_CAP = 5
 PREFLIGHT_TIMEOUT_SEC = 4.0
-ET = ZoneInfo("America/New_York")
+EXCHANGE_TZ = ZoneInfo("America/New_York")
+ET = EXCHANGE_TZ  # backward-compatible alias for tests and imports
+
+
+def now_exchange() -> datetime:
+    """Current US equity session clock (America/New_York), always timezone-aware."""
+    return datetime.now(EXCHANGE_TZ)
+
+
+def as_exchange_time(when: datetime | None = None) -> datetime:
+    """
+    Normalize any clock input to America/New_York for market-time logic.
+
+    Naive datetimes are treated as workstation local wall time, then converted to ET.
+    Aware datetimes are converted to ET regardless of source zone.
+    """
+    if when is None:
+        return now_exchange()
+    if when.tzinfo is None:
+        local_tz = datetime.now().astimezone().tzinfo
+        return when.replace(tzinfo=local_tz).astimezone(EXCHANGE_TZ)
+    return when.astimezone(EXCHANGE_TZ)
+
+
+def log_timezone_audit() -> None:
+    """Boot audit: workstation local vs exchange (America/New_York) clock."""
+    local_now = datetime.now().astimezone()
+    exchange_now = now_exchange()
+    logger.info(
+        "TIMEZONE AUDIT | workstation_local=%s (%s) | exchange_America/New_York=%s (%s)",
+        local_now.strftime("%Y-%m-%d %H:%M:%S"),
+        local_now.tzname() or str(local_now.tzinfo),
+        exchange_now.strftime("%Y-%m-%d %H:%M:%S"),
+        exchange_now.tzname() or "America/New_York",
+    )
+
+
 _activity_log: deque[dict[str, Any]] = deque(maxlen=250)
 _ACTIVITY_LOG_PATH = Path(__file__).resolve().parent / "logs" / "activity.jsonl"
 CERT_URL = "https://api.cert.tastyworks.com"
@@ -117,7 +153,7 @@ def record_activity(
 ) -> None:
     """Ring buffer + append-only file for /activity (file survives Render restart)."""
     row: dict[str, Any] = {
-        "ts_et": datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET"),
+        "ts_et": now_exchange().strftime("%Y-%m-%d %H:%M:%S ET"),
         "kind": kind,
         "outcome": outcome,
         "message": message[:500],
@@ -132,6 +168,67 @@ def record_activity(
             fh.write(json.dumps(row, default=str) + "\n")
     except Exception as exc:
         logger.debug("activity file append skipped: %s", exc)
+
+
+SNIPER_LEG_TELEMETRY_MAP: dict[str, str] = {"A": "leg_a", "B": "leg_b", "C": "leg_c"}
+
+
+def build_sniper_signal_id(underlying: str, expiration: str, short_strike: float) -> str:
+    """Stable id for backend reconciler hydration (underlying + exp + strike + deploy time ET)."""
+    ts = now_exchange().strftime("%Y%m%dT%H%M%S")
+    return f"{underlying.upper()}|{expiration}|{short_strike:.2f}|{ts}"
+
+
+def protective_hedge_telemetry_from_traps(traps: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Map trap legs A/B/C to reconciler protective_hedge leg_a/leg_b/leg_c keys."""
+    by_leg = {str(t.get("leg", "")).upper(): t for t in traps}
+    out: dict[str, dict[str, Any]] = {}
+    for leg_code, key in SNIPER_LEG_TELEMETRY_MAP.items():
+        trap = by_leg.get(leg_code)
+        if trap and trap.get("order_id"):
+            strike_raw = trap.get("hedge_strike")
+            out[key] = {
+                "order_id": str(trap["order_id"]),
+                "strike": float(strike_raw) if strike_raw is not None else None,
+                "status": "pending",
+            }
+        else:
+            out[key] = {"order_id": None, "strike": None, "status": "failed"}
+    return out
+
+
+def append_activity_telemetry(row: dict[str, Any]) -> None:
+    """Append reconciler-facing JSON line to logs/activity.jsonl."""
+    try:
+        _ACTIVITY_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with _ACTIVITY_LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, default=str) + "\n")
+    except Exception as exc:
+        logger.warning("activity telemetry append failed: %s", exc)
+
+
+def record_protective_hedge_telemetry(
+    traps: list[dict[str, Any]],
+    *,
+    underlying: str,
+    expiration: str,
+    short_strike: float,
+    signal_id: str | None = None,
+) -> str:
+    """
+    Log protective hedge deploy row for backend startup reconciler (PR #51 schema).
+
+    Written immediately after Legs A/B/C asyncio.gather completes.
+    """
+    sid = signal_id or build_sniper_signal_id(underlying, expiration, short_strike)
+    row = {
+        "timestamp": now_exchange().isoformat(timespec="seconds"),
+        "signal_id": sid,
+        "protective_hedge": protective_hedge_telemetry_from_traps(traps),
+    }
+    append_activity_telemetry(row)
+    logger.info("Protective hedge telemetry logged signal_id=%s", sid)
+    return sid
 
 
 # ── Settings ──────────────────────────────────────────────────────────────────
@@ -503,7 +600,7 @@ def resolve_dte_expiration(expiration: str, dte_filter: str | None = None, now: 
       weekly, week, +0 week     → nearest Friday on/after today
       YYYY-MM-DD or YYMMDD      → explicit expiration
     """
-    now = now or datetime.now(tz=ET)
+    now = as_exchange_time(now)
     spec = (dte_filter or expiration or "0dte").strip().lower()
 
     if spec in {"0dte", "today", "+0 days", "+0 day", "1dte", ""}:
@@ -727,7 +824,7 @@ async def fetch_alpaca_nearest_option_expiry(
     if not r.is_success:
         return None
 
-    today = datetime.now(tz=ET).date()
+    today = now_exchange().date()
     expiries: set[date] = set()
     for row in r.json().get("option_contracts") or []:
         raw = str(row.get("expiration_date") or row.get("expiration") or "")[:10]
@@ -1942,7 +2039,7 @@ async def alpaca_market_is_open(settings: Settings) -> bool:
             return bool(r.json().get("is_open"))
     except Exception as exc:
         logger.debug("Alpaca clock lookup skipped: %s", exc)
-    now = datetime.now(ET)
+    now = now_exchange()
     return now.weekday() < 5 and (now.hour > 9 or (now.hour == 9 and now.minute >= 30)) and now.hour < 16
 
 
@@ -1991,9 +2088,9 @@ SNIPER_TRAP_SPECS: tuple[tuple[str, float, float], ...] = (
 
 
 def passive_interval_seconds(now: datetime | None = None) -> float:
-    """EST/ET marination cadence before force-fill phase."""
-    now = now or datetime.now(ET)
-    minutes = now.hour * 60 + now.minute
+    """America/New_York marination cadence before force-fill phase."""
+    now_et = as_exchange_time(now)
+    minutes = now_et.hour * 60 + now_et.minute
     if minutes < 11 * 60 + 30:
         return 1200.0  # 20 min — morning spread
     if minutes < 14 * 60:
@@ -2002,20 +2099,20 @@ def passive_interval_seconds(now: datetime | None = None) -> float:
 
 
 def is_expiration_day(expiration: str, now: datetime | None = None) -> bool:
-    now = now or datetime.now(ET)
+    now_et = as_exchange_time(now)
     try:
         exp_date = datetime.strptime(expiration[:10], "%Y-%m-%d").date()
     except ValueError:
         return False
-    return now.date() == exp_date
+    return now_et.date() == exp_date
 
 
 def is_force_fill_phase(expiration: str, now: datetime | None = None) -> bool:
-    """After 14:00 ET on contract expiration day (< 2 hours to 16:00 close)."""
-    now = now or datetime.now(ET)
-    if not is_expiration_day(expiration, now):
+    """After 14:00 America/New_York on contract expiration day (< 2 hours to 16:00 close)."""
+    now_et = as_exchange_time(now)
+    if not is_expiration_day(expiration, now_et):
         return False
-    return now.hour >= 14
+    return now_et.hour >= 14
 
 
 async def fetch_hedge_chase_limit(settings: Settings, symbol: str, fallback: float) -> float:
@@ -2123,6 +2220,7 @@ async def run_sniper_grid_loop(
     short_strike: float,
     quantity: int,
     option_type: str = "put",
+    signal_id: str | None = None,
 ) -> None:
     """
     Multi-strike adaptive sniper grid after verified short entry.
@@ -2156,6 +2254,13 @@ async def run_sniper_grid_loop(
         record_activity("sniper-grid", "failed", "No trap legs submitted", ticker=underlying)
         return
 
+    record_protective_hedge_telemetry(
+        traps,
+        underlying=underlying,
+        expiration=expiration,
+        short_strike=short_strike,
+        signal_id=signal_id,
+    )
     record_activity(
         "sniper-grid",
         "started",
@@ -2208,7 +2313,7 @@ async def run_sniper_grid_loop(
             record_activity("sniper-grid", "stopped", "All traps terminal — none filled", ticker=underlying)
             return
 
-        now = datetime.now(ET)
+        now = now_exchange()
         if is_force_fill_phase(expiration, now):
             if not force_phase_active:
                 await _cancel_open_traps(settings, traps, skip_legs={"A"})
@@ -2287,6 +2392,7 @@ def spawn_sniper_grid_after_short_fill(
     short_strike: float,
     quantity: int,
     option_type: str = "put",
+    signal_id: str | None = None,
 ) -> None:
     """Spawn adaptive sniper grid after verified short entry (non-blocking)."""
     if not settings.stx_sniper_grid_enabled:
@@ -2299,6 +2405,7 @@ def spawn_sniper_grid_after_short_fill(
             short_strike=short_strike,
             quantity=quantity,
             option_type=option_type,
+            signal_id=signal_id,
         )
     )
     logger.info(
@@ -2881,7 +2988,22 @@ async def submit_entry_from_signal(
     ):
         mleg_canceled = await cancel_open_mleg_orders(settings)
         logger.warning("Entry rejected 403 — canceled %s open mleg order(s), retrying once", mleg_canceled)
-        entry = await submit_order(settings, entry_payload, dry_run=dry_run)
+        if signal.is_short_put and spread.metadata.get("entry_batch_size"):
+            entry = await submit_short_put_batches(settings, spread, signal, dry_run=dry_run)
+        elif should_use_paper_spread_legs(settings, spread):
+            ok, msg, meta = await submit_paper_spread_entry(settings, spread, dry_run=dry_run)
+            entry = OrderResult(
+                success=ok,
+                message=msg,
+                dry_run=dry_run,
+                payload=meta,
+                broker_response=meta,
+            )
+        else:
+            retry_payload = (
+                build_alpaca_entry_payload(spread) if settings.use_alpaca else build_entry_payload(spread)
+            )
+            entry = await submit_order(settings, retry_payload, dry_run=dry_run)
 
     entry_credit = float(spread.metadata["limit_credit"]) if settings.use_alpaca else None
     return spread, entry, entry_credit
@@ -3215,7 +3337,7 @@ def coerce_signal(payload: dict, settings: Settings) -> TradingViewSignal:
 
 app = FastAPI(
     title="spy-options-bridge",
-    version="5.5.27",
+    version="5.5.28",
     description="TradingView → Alpaca Paper credit spreads + short puts + conservative close",
 )
 
@@ -3224,6 +3346,7 @@ app = FastAPI(
 async def startup_log() -> None:
     global _app_started_mono
     _app_started_mono = time.monotonic()
+    log_timezone_audit()
     s = get_settings()
     broker_label = "Alpaca Paper" if s.use_alpaca else "Tastytrade Cert"
     logger.info(
@@ -3352,7 +3475,7 @@ def _stx_fresh_snapshot(
     *,
     prior_move_pct: float | None,
 ) -> tuple[MarketSnapshot, list[dict[str, Any]], bool]:
-    now = datetime.now(ET)
+    now = now_exchange()
     positions, fetch_ok = fetch_positions(client, env)
     legs = underlying_legs(positions, cfg.underlying)
     price = fetch_underlying_price(client, env, cfg.underlying)
@@ -3505,7 +3628,7 @@ def run_stx_close_evaluate(settings: Settings, signal: StxCloseSignal) -> dict[s
         snap, legs, fetch_ok = _stx_fresh_snapshot(client, env, cfg, prior_move_pct=prior_move_pct)
         if not fetch_ok:
             raise RuntimeError("could not fetch Alpaca positions — aborting for safety")
-        rec = build_recommendation(snap, cfg, now_et=datetime.now(ET))
+        rec = build_recommendation(snap, cfg, now_et=now_exchange())
         state_written = False
         if signal.mode == "poll":
             write_state(cfg, snap, rec)
@@ -3564,7 +3687,7 @@ def run_stx_close_execute(settings: Settings, signal: StxCloseSignal) -> dict[st
         )
         if not fetch_ok:
             raise RuntimeError("could not fetch Alpaca positions for execute")
-        rec = build_recommendation(snap, cfg, now_et=datetime.now(ET))
+        rec = build_recommendation(snap, cfg, now_et=now_exchange())
         orders = _stx_execute_recommendation(client, env, cfg, legs, rec, dry_run=dry_run)
 
     return {
@@ -3582,7 +3705,7 @@ async def process_stx_open_execute(settings: Settings, signal: StxCloseSignal) -
         strike = float(resolved["strike"])
         contract_meta = resolved.get("meta") or {}
         exp_date = datetime.strptime(expiration[:10], "%Y-%m-%d").date()
-        if exp_date < datetime.now(ET).date():
+        if exp_date < now_exchange().date():
             raise ValueError(f"resolved expiration {expiration} is in the past")
         dry_run = not settings.is_live
         ok, msg, meta = await open_crush_it_short_put(
@@ -3658,7 +3781,7 @@ async def health() -> dict[str, Any]:
     tv_pause_risk = build_tv_pause_risk(s, preflight)
     return {
         "status": "ok" if tv_pause_risk["level"] != "red" else "degraded",
-        "version": "5.5.27",
+        "version": "5.5.28",
         "spread_max_trades_per_day": str(s.spread_max_trades_per_day),
         "spread_daily_loss_limit": str(s.spread_daily_loss_limit),
         "burst_endpoint": "/exercise/burst",
@@ -3697,13 +3820,13 @@ async def health() -> dict[str, Any]:
 @app.get("/ping")
 async def ping() -> dict[str, str]:
     """Lightweight keep-alive for cron pings (prevents Render free-tier cold starts)."""
-    return {"status": "ok", "version": "5.5.27"}
+    return {"status": "ok", "version": "5.5.28"}
 
 
 @app.get("/activity")
 async def activity_log() -> dict[str, Any]:
     """Today's webhook timeline — merges memory + logs/activity.jsonl on disk."""
-    today = datetime.now(ET).strftime("%Y-%m-%d")
+    today = now_exchange().strftime("%Y-%m-%d")
     events: list[dict[str, Any]] = []
     seen: set[str] = set()
 
@@ -3731,7 +3854,7 @@ async def activity_log() -> dict[str, Any]:
     events.sort(key=lambda r: str(r.get("ts_et", "")), reverse=True)
     return {
         "status": "ok",
-        "version": "5.5.27",
+        "version": "5.5.28",
         "today": today,
         "count": len(events),
         "note": "Memory + logs/activity.jsonl. Alpaca proof = Activities tab fills.",

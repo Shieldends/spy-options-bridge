@@ -29,6 +29,7 @@ async def test_stale_strike_ignored_uses_otm(settings):
         patch("main.fetch_alpaca_nearest_option_expiry", AsyncMock(return_value="2026-06-18")),
         patch("main.fetch_alpaca_option_strikes", AsyncMock(return_value=[1030.0, 1035.0, 1040.0, 1045.0])),
         patch("main.fetch_alpaca_underlying_price", AsyncMock(return_value=1043.95)),
+        patch("main.fetch_alpaca_options_buying_power", AsyncMock(return_value=200_000.0)),
         patch("main.verify_alpaca_option_contract", AsyncMock(return_value=True)),
     ):
         out = await resolve_stx_open_contract(settings, signal)
@@ -51,6 +52,7 @@ async def test_strike_offset_from_signal_price(settings):
     with (
         patch("main.fetch_alpaca_nearest_option_expiry", AsyncMock(return_value="2026-06-18")),
         patch("main.fetch_alpaca_option_strikes", AsyncMock(return_value=[1020.0, 1030.0, 1040.0])),
+        patch("main.fetch_alpaca_options_buying_power", AsyncMock(return_value=200_000.0)),
         patch("main.verify_alpaca_option_contract", AsyncMock(return_value=True)),
     ):
         out = await resolve_stx_open_contract(settings, signal)

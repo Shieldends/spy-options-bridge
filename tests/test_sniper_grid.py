@@ -1,6 +1,7 @@
 """Multi-strike sniper grid tests."""
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
@@ -11,6 +12,8 @@ from main import (
     Settings,
     is_force_fill_phase,
     passive_interval_seconds,
+    protective_hedge_telemetry_from_traps,
+    record_protective_hedge_telemetry,
     resolve_hedge_put_contract,
     run_sniper_grid_loop,
 )
@@ -51,6 +54,50 @@ async def test_resolve_three_trap_offsets():
     assert a["hedge_strike"] == 975.0
     assert b["hedge_strike"] == 970.0
     assert c["hedge_strike"] == 965.0
+
+
+def test_protective_hedge_telemetry_schema():
+    traps = [
+        {"leg": "A", "order_id": "oid-a", "hedge_strike": 975.0},
+        {"leg": "B", "order_id": "oid-b", "hedge_strike": 970.0},
+        {"leg": "C", "order_id": "oid-c", "hedge_strike": 965.0},
+    ]
+    ph = protective_hedge_telemetry_from_traps(traps)
+    assert ph["leg_a"] == {"order_id": "oid-a", "strike": 975.0, "status": "pending"}
+    assert ph["leg_b"] == {"order_id": "oid-b", "strike": 970.0, "status": "pending"}
+    assert ph["leg_c"] == {"order_id": "oid-c", "strike": 965.0, "status": "pending"}
+
+
+def test_protective_hedge_telemetry_failed_leg():
+    traps = [{"leg": "A", "order_id": "oid-a", "hedge_strike": 975.0}]
+    ph = protective_hedge_telemetry_from_traps(traps)
+    assert ph["leg_a"]["status"] == "pending"
+    assert ph["leg_b"]["status"] == "failed"
+    assert ph["leg_c"]["status"] == "failed"
+
+
+def test_record_protective_hedge_telemetry_writes_jsonl(tmp_path):
+    log_path = tmp_path / "activity.jsonl"
+    traps = [
+        {"leg": "A", "order_id": "a1", "hedge_strike": 975.0},
+        {"leg": "B", "order_id": "b1", "hedge_strike": 970.0},
+        {"leg": "C", "order_id": "c1", "hedge_strike": 965.0},
+    ]
+    with patch("main._ACTIVITY_LOG_PATH", log_path):
+        sid = record_protective_hedge_telemetry(
+            traps,
+            underlying="STX",
+            expiration="2026-06-18",
+            short_strike=985.0,
+            signal_id="STX|2026-06-18|985.00|test",
+        )
+    assert sid == "STX|2026-06-18|985.00|test"
+    row = json.loads(log_path.read_text(encoding="utf-8").strip())
+    assert row["signal_id"] == sid
+    assert row["protective_hedge"]["leg_a"]["order_id"] == "a1"
+    assert row["protective_hedge"]["leg_b"]["strike"] == 970.0
+    assert row["protective_hedge"]["leg_c"]["status"] == "pending"
+    assert row["timestamp"].endswith("-04:00") or row["timestamp"].endswith("-05:00")
 
 
 @pytest.mark.asyncio
