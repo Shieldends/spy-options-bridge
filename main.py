@@ -2447,6 +2447,9 @@ async def run_sniper_grid_loop(
 
         while True:
             if not await alpaca_market_is_open(settings):
+                if existing_traps is not None:
+                    await asyncio.sleep(60)
+                    continue
                 record_activity("sniper-grid", "market_close", "Grid paused — market closed", ticker=underlying)
                 return
 
@@ -3957,7 +3960,7 @@ async def health() -> dict[str, Any]:
     tv_pause_risk = build_tv_pause_risk(s, preflight)
     return {
         "status": "ok" if tv_pause_risk["level"] != "red" else "degraded",
-        "version": "5.5.29",
+        "version": app.version,
         "spread_max_trades_per_day": str(s.spread_max_trades_per_day),
         "spread_daily_loss_limit": str(s.spread_daily_loss_limit),
         "burst_endpoint": "/exercise/burst",
@@ -3996,7 +3999,7 @@ async def health() -> dict[str, Any]:
 @app.get("/ping")
 async def ping() -> dict[str, str]:
     """Lightweight keep-alive for cron pings (prevents Render free-tier cold starts)."""
-    return {"status": "ok", "version": "5.5.29"}
+    return {"status": "ok", "version": app.version}
 
 
 @app.get("/activity")
@@ -4030,7 +4033,7 @@ async def activity_log() -> dict[str, Any]:
     events.sort(key=lambda r: str(r.get("ts_et", "")), reverse=True)
     return {
         "status": "ok",
-        "version": "5.5.29",
+        "version": app.version,
         "today": today,
         "count": len(events),
         "note": "Memory + logs/activity.jsonl. Alpaca proof = Activities tab fills.",
