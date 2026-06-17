@@ -1,16 +1,24 @@
-# Render keep-alive (free tier)
+# Render keep-alive
 
-`GET /ping` returns `{"status":"ok","version":"..."}` — lightweight; use for cron.
+`GET /ping` returns `{"status":"ok","version":"..."}` — lightweight health probe.
 
-## Local (user leaves terminal open)
+## Paid Starter instance (recommended)
+
+Starter (or higher) on `spy-options-bridge` stays always-on — no cold sleep. **K / Guardian optional** as backup only.
+
+## Local Guardian (G starts this automatically)
+
+`GO-TOMORROW-ONE-CLICK.bat` starts **Live Session Guardian**, which restarts `bridge_keepalive.py` if it dies.
+
+Manual keepalive window (only if Guardian is off):
 
 ```text
-C:\Users\Shiel\Desktop\BRIDGE-KEEPALIVE.bat
+C:\Users\Shiel\spy-options-bridge\launchers\START-BRIDGE-KEEPALIVE.bat
 ```
 
-Runs `scripts/bridge_keepalive.py` — pings every **60 seconds during RTH** (9:30–16:00 ET Mon–Fri) and **5 minutes** off-hours, weekdays.
+Runs `scripts/bridge_keepalive.py` — pings every **60 seconds during RTH** and **5 minutes** off-hours, weekdays.
 
-## External cron (optional)
+## External cron (optional backup)
 
 Point any free cron (e.g. cron-job.org) at:
 

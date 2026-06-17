@@ -16,6 +16,10 @@ if errorlevel 1 (
 
 call "C:\Users\Shiel\spy-options-bridge\launchers\ARM-FOR-OPEN-ONE-CLICK.bat" --skip-schtask
 echo.
-echo DONE. Leave TradingView open with both alerts ACTIVE.
+echo Starting Live Session Guardian (keepalive babysitter, no window)...
+call "C:\Users\Shiel\spy-options-bridge\launchers\START-GUARDIAN.bat"
+echo.
+echo DONE. Guardian runs headless until market close.
+echo Leave TradingView open with alerts ACTIVE when you unpause.
 echo Watch Alpaca Paper - Activities during session.
 timeout /t 10

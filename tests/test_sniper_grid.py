@@ -10,15 +10,80 @@ import pytest
 
 from main import (
     Settings,
+    discover_sniper_grid_resumes,
+    expected_hedge_strike,
+    hydrate_traps_for_short_put,
     is_force_fill_phase,
     passive_interval_seconds,
     protective_hedge_telemetry_from_traps,
     record_protective_hedge_telemetry,
     resolve_hedge_put_contract,
     run_sniper_grid_loop,
+    sniper_grid_session_key,
 )
 
 ET = ZoneInfo("America/New_York")
+
+
+def test_expected_hedge_strike_offsets():
+    assert expected_hedge_strike(970.0, -10.0) == 960.0
+    assert expected_hedge_strike(970.0, -15.0) == 955.0
+
+
+@pytest.mark.asyncio
+async def test_hydrate_traps_from_open_orders():
+    orders = [
+        {
+            "id": "a1",
+            "side": "buy",
+            "symbol": "STX260618P00960000",
+            "limit_price": "0.09",
+            "order_class": "simple",
+        },
+        {
+            "id": "b1",
+            "side": "buy",
+            "symbol": "STX260618P00955000",
+            "limit_price": "0.05",
+            "order_class": "simple",
+        },
+        {
+            "id": "c1",
+            "side": "buy",
+            "symbol": "STX260618P00950000",
+            "limit_price": "0.03",
+            "order_class": "simple",
+        },
+    ]
+    traps = await hydrate_traps_for_short_put(
+        underlying="STX",
+        expiration="2026-06-18",
+        short_strike=970.0,
+        open_orders=orders,
+    )
+    assert len(traps) == 3
+    assert traps[0]["leg"] == "A"
+    assert traps[0]["order_id"] == "a1"
+    assert traps[1]["hedge_strike"] == 955.0
+
+
+@pytest.mark.asyncio
+async def test_discover_sniper_grid_resumes_stx_short():
+    settings = Settings(STX_SNIPER_GRID_ENABLED=True)
+    positions = [{"symbol": "STX260618P00970000", "qty": "-1"}]
+    orders = [
+        {"id": "a1", "side": "buy", "symbol": "STX260618P00960000", "limit_price": "0.09"},
+        {"id": "b1", "side": "buy", "symbol": "STX260618P00955000", "limit_price": "0.05"},
+    ]
+    with (
+        patch("main.fetch_alpaca_positions", AsyncMock(return_value=positions)),
+        patch("main.fetch_alpaca_open_orders", AsyncMock(return_value=orders)),
+    ):
+        sessions = await discover_sniper_grid_resumes(settings)
+    assert len(sessions) == 1
+    assert sessions[0]["short_strike"] == 970.0
+    assert len(sessions[0]["traps"]) == 2
+    assert sniper_grid_session_key("STX", "2026-06-18", 970.0) in sessions[0]["signal_id"]
 
 
 def test_passive_interval_morning():
