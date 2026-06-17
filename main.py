@@ -1,5 +1,5 @@
 """
-spy-options-bridge v5.5.28 — ALPACA PAPER (default broker)
+spy-options-bridge v5.5.29 — ALPACA PAPER (default broker)
 
 TradingView webhook → Render → Alpaca multi-leg SPY put credit spreads.
 
@@ -1287,6 +1287,10 @@ async def align_spread_to_alpaca(settings: Settings, spread: SpreadPackage, sign
 
     short_sym = format_occ_symbol(underlying, expiration, option_type, short_strike)
     long_sym = format_occ_symbol(underlying, expiration, option_type, long_strike)
+    if underlying.upper() == "SPY":
+        for sym in (short_sym, long_sym):
+            if not await verify_alpaca_option_contract(settings, sym):
+                raise ValueError(f"Alpaca SPY contract not found: {sym} (expiration={expiration})")
     return SpreadPackage(
         qty=spread.qty,
         legs=[
@@ -3337,7 +3341,7 @@ def coerce_signal(payload: dict, settings: Settings) -> TradingViewSignal:
 
 app = FastAPI(
     title="spy-options-bridge",
-    version="5.5.28",
+    version="5.5.29",
     description="TradingView → Alpaca Paper credit spreads + short puts + conservative close",
 )
 
@@ -3781,7 +3785,7 @@ async def health() -> dict[str, Any]:
     tv_pause_risk = build_tv_pause_risk(s, preflight)
     return {
         "status": "ok" if tv_pause_risk["level"] != "red" else "degraded",
-        "version": "5.5.28",
+        "version": "5.5.29",
         "spread_max_trades_per_day": str(s.spread_max_trades_per_day),
         "spread_daily_loss_limit": str(s.spread_daily_loss_limit),
         "burst_endpoint": "/exercise/burst",
@@ -3820,7 +3824,7 @@ async def health() -> dict[str, Any]:
 @app.get("/ping")
 async def ping() -> dict[str, str]:
     """Lightweight keep-alive for cron pings (prevents Render free-tier cold starts)."""
-    return {"status": "ok", "version": "5.5.28"}
+    return {"status": "ok", "version": "5.5.29"}
 
 
 @app.get("/activity")
@@ -3854,7 +3858,7 @@ async def activity_log() -> dict[str, Any]:
     events.sort(key=lambda r: str(r.get("ts_et", "")), reverse=True)
     return {
         "status": "ok",
-        "version": "5.5.28",
+        "version": "5.5.29",
         "today": today,
         "count": len(events),
         "note": "Memory + logs/activity.jsonl. Alpaca proof = Activities tab fills.",

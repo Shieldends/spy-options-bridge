@@ -46,6 +46,40 @@ def test_should_not_use_paper_spread_legs_single_leg(monkeypatch):
     assert should_use_paper_spread_legs(settings, spread) is False
 
 
+def test_submit_paper_spread_entry_long_before_short(monkeypatch):
+    import asyncio
+    from unittest.mock import patch
+
+    monkeypatch.setenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
+    monkeypatch.setenv("APCA_API_KEY_ID", "key")
+    monkeypatch.setenv("APCA_API_SECRET_KEY", "secret")
+    monkeypatch.setenv("EXECUTION_MODE", "production")
+    get_settings.cache_clear()
+
+    order_log: list[str] = []
+
+    async def fake_post(_s, payload):
+        order_log.append(f"{payload['side']}:{payload['symbol']}")
+        return True, {"id": f"oid-{len(order_log)}"}, "ok"
+
+    async def fake_wait(_s, oid, **_k):
+        return {"id": oid, "status": "filled", "filled_qty": "1"}
+
+    from paper_spread_legs import submit_paper_spread_entry
+
+    settings = get_settings()
+    spread = _two_leg_spread()
+    with (
+        patch("paper_spread_legs._post_order", fake_post),
+        patch("paper_spread_legs.wait_order_filled", fake_wait),
+    ):
+        ok, msg, meta = asyncio.run(submit_paper_spread_entry(settings, spread, dry_run=False))
+    assert ok is True
+    assert meta.get("leg_sequence") == "long_first"
+    assert order_log[0].startswith("buy:")
+    assert order_log[1].startswith("sell:")
+
+
 def test_submit_alpaca_blocks_mleg_on_paper(monkeypatch):
     import asyncio
 

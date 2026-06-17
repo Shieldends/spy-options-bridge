@@ -89,40 +89,13 @@ async def wait_order_filled(
 
 
 async def submit_paper_spread_entry(settings: Any, spread: Any, *, dry_run: bool) -> tuple[bool, str, dict[str, Any]]:
-    """Sell short put then buy long put — both single-leg limits tuned for paper fills."""
+    """Buy long put first, then sell short put — avoids naked CSP margin on Alpaca paper."""
     if dry_run:
         return True, "Paper spread legs packaged (dry-run)", {"dry_run": True}
 
     short_sym = spread.legs[0].symbol
     long_sym = spread.legs[1].symbol
     qty = str(spread.qty)
-
-    short_payload = {
-        "symbol": short_sym,
-        "qty": qty,
-        "side": "sell",
-        "type": "limit",
-        "limit_price": f"{PAPER_SELL_LIMIT:.2f}",
-        "time_in_force": "day",
-    }
-    ok, body, msg = await _post_order(settings, short_payload)
-    if not ok:
-        return False, f"Short leg rejected: {msg}", body
-
-    short_id = str(body.get("id", ""))
-    filled_short = await wait_order_filled(settings, short_id)
-    if not filled_short:
-        await _cancel_order(settings, short_id)
-        market_short = {**short_payload, "type": "market"}
-        market_short.pop("limit_price", None)
-        ok_ms, body_ms, msg_ms = await _post_order(settings, market_short)
-        if not ok_ms:
-            return False, f"Short leg limit+market failed: {msg_ms}", {"short_order_id": short_id}
-        short_id = str(body_ms.get("id", ""))
-        filled_short = await wait_order_filled(settings, short_id, max_wait_sec=35.0)
-        if not filled_short:
-            await _cancel_order(settings, short_id)
-            return False, "Short leg did not fill on Alpaca paper (limit or market)", {"short_order_id": short_id}
 
     long_payload = {
         "symbol": long_sym,
@@ -132,21 +105,59 @@ async def submit_paper_spread_entry(settings: Any, spread: Any, *, dry_run: bool
         "limit_price": f"{PAPER_BUY_LONG_LIMIT:.2f}",
         "time_in_force": "day",
     }
-    ok2, body2, msg2 = await _post_order(settings, long_payload)
-    if not ok2:
-        await _delete_position(settings, short_sym)
-        return False, f"Long leg rejected after short filled — unwound short: {msg2}", body2
+    ok, body, msg = await _post_order(settings, long_payload)
+    if not ok:
+        return False, f"Long leg rejected: {msg}", body
 
-    long_id = str(body2.get("id", ""))
+    long_id = str(body.get("id", ""))
     filled_long = await wait_order_filled(settings, long_id)
     if not filled_long:
         await _cancel_order(settings, long_id)
-        await _delete_position(settings, short_sym)
-        return False, "Long leg did not fill — unwound short leg", {"long_order_id": long_id}
+        market_long = {**long_payload, "type": "market"}
+        market_long.pop("limit_price", None)
+        ok_ml, body_ml, msg_ml = await _post_order(settings, market_long)
+        if not ok_ml:
+            return False, f"Long leg limit+market failed: {msg_ml}", {"long_order_id": long_id}
+        long_id = str(body_ml.get("id", ""))
+        filled_long = await wait_order_filled(settings, long_id, max_wait_sec=35.0)
+        if not filled_long:
+            await _cancel_order(settings, long_id)
+            return False, "Long leg did not fill on Alpaca paper (limit or market)", {"long_order_id": long_id}
+
+    short_payload = {
+        "symbol": short_sym,
+        "qty": qty,
+        "side": "sell",
+        "type": "limit",
+        "limit_price": f"{PAPER_SELL_LIMIT:.2f}",
+        "time_in_force": "day",
+    }
+    ok2, body2, msg2 = await _post_order(settings, short_payload)
+    if not ok2:
+        await _delete_position(settings, long_sym)
+        return False, f"Short leg rejected after long filled — unwound long: {msg2}", body2
+
+    short_id = str(body2.get("id", ""))
+    filled_short = await wait_order_filled(settings, short_id)
+    if not filled_short:
+        await _cancel_order(settings, short_id)
+        market_short = {**short_payload, "type": "market"}
+        market_short.pop("limit_price", None)
+        ok_ms, body_ms, msg_ms = await _post_order(settings, market_short)
+        if not ok_ms:
+            await _delete_position(settings, long_sym)
+            return False, f"Short leg limit+market failed — unwound long: {msg_ms}", {"short_order_id": short_id}
+        short_id = str(body_ms.get("id", ""))
+        filled_short = await wait_order_filled(settings, short_id, max_wait_sec=35.0)
+        if not filled_short:
+            await _cancel_order(settings, short_id)
+            await _delete_position(settings, long_sym)
+            return False, "Short leg did not fill — unwound long leg", {"short_order_id": short_id}
 
     net_credit = round(PAPER_SELL_LIMIT - PAPER_BUY_LONG_LIMIT, 2)
-    return True, f"Paper spread legs filled (net ~${net_credit:.2f})", {
+    return True, f"Paper spread legs filled (long-first, net ~${net_credit:.2f})", {
         "paper_spread_legs": True,
+        "leg_sequence": "long_first",
         "short_order_id": short_id,
         "long_order_id": long_id,
         "net_credit_estimate": net_credit,
